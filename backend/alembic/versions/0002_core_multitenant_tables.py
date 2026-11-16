@@ -79,7 +79,8 @@ def upgrade() -> None:
     """)
 
 def downgrade() -> None:
-    op.execute('DROP VIEW IF EXISTS public.v_org_users CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.organization_memberships CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.global_users CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.organizations CASCADE;')
+    # Explicit dependency-ordered drops (H7)
+    op.execute('DROP VIEW IF EXISTS public.v_org_users;')
+    op.execute('DROP TABLE IF EXISTS public.organization_memberships;')
+    op.execute('DROP TABLE IF EXISTS public.global_users;')
+    op.execute('DROP TABLE IF EXISTS public.organizations;')

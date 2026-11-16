@@ -8,17 +8,23 @@ app = FastAPI(
     description="Autonomous Financial Intelligence Platform for Indian MSMEs"
 )
 
+# CORS restricted to configured frontend origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "project": settings.PROJECT_NAME, "version": settings.VERSION}
+    return {
+        "status": "ok", 
+        "project": settings.PROJECT_NAME, 
+        "version": settings.VERSION,
+        "environment": settings.ENVIRONMENT
+    }
 
 @app.get("/")
 def root():

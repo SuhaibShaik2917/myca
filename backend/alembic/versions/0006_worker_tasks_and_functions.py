@@ -158,7 +158,7 @@ def upgrade() -> None:
     GRANT EXECUTE ON FUNCTION public.reap_expired_tasks(uuid, int) TO platform_admin;
     """)
 
-    # 5. claim_task Function
+    # 5. claim_task Function with Strict Retry Limit Check (C4)
     op.execute("""
     CREATE OR REPLACE FUNCTION public.claim_task(
         p_org uuid,
@@ -195,11 +195,12 @@ def upgrade() -> None:
 
         v_now := clock_timestamp();
 
+        -- C4 Fix: Ensure attempts < max_attempts for both queued and in_progress claims
         SELECT id INTO v_task_id
         FROM public.worker_tasks
         WHERE org_id = p_org
           AND (
-              (status = 'queued' AND locked_by IS NULL)
+              (status = 'queued' AND locked_by IS NULL AND attempts < max_attempts)
               OR (status = 'in_progress' AND lease_expire <= v_now AND attempts < max_attempts)
           )
         ORDER BY created_at ASC
@@ -309,7 +310,7 @@ def upgrade() -> None:
     GRANT EXECUTE ON FUNCTION public.complete_task(uuid, text, jsonb) TO worker_owner, platform_admin;
     """)
 
-    # 7. renew_task_lease Function
+    # 7. renew_task_lease Function with NULL Validation (H1)
     op.execute("""
     CREATE OR REPLACE FUNCTION public.renew_task_lease(
         p_task_id uuid,
@@ -335,7 +336,9 @@ def upgrade() -> None:
         IF p_lease_token IS NULL OR trim(p_lease_token) = '' THEN
             RAISE EXCEPTION 'Lease token is required';
         END IF;
-        IF p_lease_minutes <= 0 OR p_lease_minutes > 60 THEN
+        
+        -- H1 Fix: Explicitly reject NULL or out-of-range lease minutes
+        IF p_lease_minutes IS NULL OR p_lease_minutes <= 0 OR p_lease_minutes > 60 THEN
             RAISE EXCEPTION 'Invalid lease minutes: % (must be between 1 and 60)', p_lease_minutes;
         END IF;
 
@@ -469,7 +472,7 @@ def upgrade() -> None:
     GRANT EXECUTE ON FUNCTION public.fail_task(uuid, text, text) TO worker_owner, platform_admin;
     """)
 
-    # 9. release_task Function
+    # 9. release_task Function with Retry Limit Exhaustion Enforcement (C4)
     op.execute("""
     CREATE OR REPLACE FUNCTION public.release_task(
         p_task_id uuid,
@@ -524,14 +527,27 @@ def upgrade() -> None:
             RAISE EXCEPTION 'Invalid lease token for task %', p_task_id;
         END IF;
 
-        UPDATE public.worker_tasks
-        SET status = 'queued',
-            locked_by = NULL,
-            locked_at = NULL,
-            lease_expire = NULL,
-            lease_token_hash = NULL,
-            updated_at = v_now
-        WHERE id = p_task_id;
+        -- C4 Fix: If attempts already reached or exceeded max_attempts, transition to failed
+        IF v_task.attempts >= v_task.max_attempts THEN
+            UPDATE public.worker_tasks
+            SET status = 'failed',
+                error_message = 'Task released with maximum retry attempts exhausted',
+                locked_by = NULL,
+                locked_at = NULL,
+                lease_expire = NULL,
+                lease_token_hash = NULL,
+                updated_at = v_now
+            WHERE id = p_task_id;
+        ELSE
+            UPDATE public.worker_tasks
+            SET status = 'queued',
+                locked_by = NULL,
+                locked_at = NULL,
+                lease_expire = NULL,
+                lease_token_hash = NULL,
+                updated_at = v_now
+            WHERE id = p_task_id;
+        END IF;
     END;
     $$;
 
@@ -541,6 +557,7 @@ def upgrade() -> None:
     """)
 
 def downgrade() -> None:
+    # Explicit dependency-ordered drops (H7)
     op.execute('DROP FUNCTION IF EXISTS public.release_task(uuid, text);')
     op.execute('DROP FUNCTION IF EXISTS public.fail_task(uuid, text, text);')
     op.execute('DROP FUNCTION IF EXISTS public.renew_task_lease(uuid, text, int);')
@@ -548,5 +565,5 @@ def downgrade() -> None:
     op.execute('DROP FUNCTION IF EXISTS public.claim_task(uuid, text);')
     op.execute('DROP FUNCTION IF EXISTS public.reap_expired_tasks(uuid, int);')
     op.execute('DROP FUNCTION IF EXISTS public.is_worker_authorized(uuid);')
-    op.execute('DROP TABLE IF EXISTS public.worker_service_authorizations CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.worker_tasks CASCADE;')
+    op.execute('DROP TABLE IF EXISTS public.worker_service_authorizations;')
+    op.execute('DROP TABLE IF EXISTS public.worker_tasks;')

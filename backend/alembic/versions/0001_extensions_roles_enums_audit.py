@@ -1,4 +1,4 @@
-"""Extensions, Roles, Enums, and Audit Subsystem
+"""Extensions, Roles, Enums, and Hardened Audit Subsystem with Recursive Redaction
 
 Revision ID: 0001_init_core
 Revises: None
@@ -126,7 +126,52 @@ def upgrade() -> None:
     );
     """)
 
-    # 5. Security Definer Logging Function
+    # 5. Recursive JSON Redaction Function (H3)
+    op.execute("""
+    CREATE OR REPLACE FUNCTION audit.redact_sensitive_keys(p_data jsonb)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    IMMUTABLE
+    AS $$
+    DECLARE
+        v_key text;
+        v_val jsonb;
+        v_result jsonb := '{}'::jsonb;
+        v_elem jsonb;
+        v_arr jsonb := '[]'::jsonb;
+    BEGIN
+        IF p_data IS NULL THEN
+            RETURN NULL;
+        END IF;
+
+        IF jsonb_typeof(p_data) = 'object' THEN
+            FOR v_key, v_val IN SELECT * FROM jsonb_each(p_data) LOOP
+                IF lower(v_key) ~* '(password|secret|token|pan|aadhaar|bank_account|account_number|key|credentials|auth|private_key|jwt)' THEN
+                    v_result := jsonb_set(v_result, ARRAY[v_key], '"[REDACTED]"'::jsonb);
+                ELSIF jsonb_typeof(v_val) IN ('object', 'array') THEN
+                    v_result := jsonb_set(v_result, ARRAY[v_key], audit.redact_sensitive_keys(v_val));
+                ELSE
+                    v_result := jsonb_set(v_result, ARRAY[v_key], v_val);
+                END IF;
+            END LOOP;
+            RETURN v_result;
+        ELSIF jsonb_typeof(p_data) = 'array' THEN
+            FOR v_elem IN SELECT * FROM jsonb_array_elements(p_data) LOOP
+                IF jsonb_typeof(v_elem) IN ('object', 'array') THEN
+                    v_arr := v_arr || jsonb_build_array(audit.redact_sensitive_keys(v_elem));
+                ELSE
+                    v_arr := v_arr || jsonb_build_array(v_elem);
+                END IF;
+            END LOOP;
+            RETURN v_arr;
+        ELSE
+            RETURN p_data;
+        END IF;
+    END;
+    $$;
+    """)
+
+    # 6. Hardened Security Definer Logging Function with Redaction (H3) and USAGE Grant (H2)
     op.execute("""
     CREATE OR REPLACE FUNCTION audit.log_audit_event(
         p_org_id uuid,
@@ -154,7 +199,10 @@ def upgrade() -> None:
         )
         VALUES (
             p_org_id, p_entity_name, p_entity_id, p_action, session_user, v_actor_user,
-            p_previous_state, p_new_state, p_metadata, clock_timestamp()
+            audit.redact_sensitive_keys(p_previous_state),
+            audit.redact_sensitive_keys(p_new_state),
+            audit.redact_sensitive_keys(p_metadata),
+            clock_timestamp()
         )
         RETURNING id INTO v_audit_id;
         
@@ -162,12 +210,30 @@ def upgrade() -> None:
     END;
     $$;
 
+    ALTER FUNCTION audit.redact_sensitive_keys(jsonb) OWNER TO audit_func_owner;
     ALTER FUNCTION audit.log_audit_event(uuid, text, text, audit_action, jsonb, jsonb, jsonb) OWNER TO audit_func_owner;
+    
+    REVOKE ALL ON FUNCTION audit.redact_sensitive_keys(jsonb) FROM PUBLIC;
     REVOKE ALL ON FUNCTION audit.log_audit_event(uuid, text, text, audit_action, jsonb, jsonb, jsonb) FROM PUBLIC;
+    
+    GRANT EXECUTE ON FUNCTION audit.redact_sensitive_keys(jsonb) TO app_user, worker_owner, platform_admin;
     GRANT EXECUTE ON FUNCTION audit.log_audit_event(uuid, text, text, audit_action, jsonb, jsonb, jsonb) TO app_user, worker_owner, platform_admin;
+    
+    -- Grant USAGE on audit schema (H2)
+    GRANT USAGE ON SCHEMA audit TO app_user, worker_owner, platform_admin, audit_func_owner, audit_reader, system_auditor;
     """)
 
 def downgrade() -> None:
+    # Explicit dependency-ordered drops (H7)
     op.execute('DROP FUNCTION IF EXISTS audit.log_audit_event(uuid, text, text, audit_action, jsonb, jsonb, jsonb);')
-    op.execute('DROP TABLE IF EXISTS audit.audit_logs CASCADE;')
-    op.execute('DROP SCHEMA IF EXISTS audit CASCADE;')
+    op.execute('DROP FUNCTION IF EXISTS audit.redact_sensitive_keys(jsonb);')
+    op.execute('DROP TABLE IF EXISTS audit.audit_logs;')
+    op.execute('DROP SCHEMA IF EXISTS audit;')
+    
+    # Clean enum drops
+    enums = [
+        'scheme_category', 'audit_action', 'task_status', 'gst_filing_status',
+        'invoice_status', 'document_type', 'membership_status', 'org_role'
+    ]
+    for e in enums:
+        op.execute(f"DROP TYPE IF EXISTS public.{e};")

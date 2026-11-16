@@ -101,23 +101,42 @@ def upgrade() -> None:
     CREATE INDEX IF NOT EXISTS idx_fin_summaries_org ON public.financial_summaries(org_id);
     """)
 
-    # 6. Financial Provenance Junction Table
+    # 6. Financial Provenance Junction Table (Enforced Immutability: H4)
     op.execute("""
     CREATE TABLE IF NOT EXISTS public.summary_transactions (
         summary_id uuid NOT NULL,
         transaction_id uuid NOT NULL,
         org_id uuid NOT NULL,
         PRIMARY KEY (summary_id, transaction_id, org_id),
-        FOREIGN KEY (summary_id, org_id) REFERENCES public.financial_summaries(id, org_id) ON DELETE CASCADE,
-        FOREIGN KEY (transaction_id, org_id) REFERENCES public.financial_transactions(id, org_id) ON DELETE CASCADE
+        FOREIGN KEY (summary_id, org_id) REFERENCES public.financial_summaries(id, org_id) ON DELETE RESTRICT,
+        FOREIGN KEY (transaction_id, org_id) REFERENCES public.financial_transactions(id, org_id) ON DELETE RESTRICT
     );
     CREATE INDEX IF NOT EXISTS idx_summary_tx_org ON public.summary_transactions(org_id);
+
+    -- Database trigger enforcing strict immutability (H4)
+    CREATE OR REPLACE FUNCTION public.prevent_summary_transactions_mutation()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+        RAISE EXCEPTION 'summary_transactions is strictly immutable: modifications and deletions are prohibited (42501)';
+    END;
+    $$;
+
+    DROP TRIGGER IF EXISTS trg_summary_transactions_immutable ON public.summary_transactions;
+    CREATE TRIGGER trg_summary_transactions_immutable
+        BEFORE UPDATE OR DELETE ON public.summary_transactions
+        FOR EACH ROW
+        EXECUTE FUNCTION public.prevent_summary_transactions_mutation();
     """)
 
 def downgrade() -> None:
-    op.execute('DROP TABLE IF EXISTS public.summary_transactions CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.financial_summaries CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.financial_transactions CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.gst_records CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.documents CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.business_profiles CASCADE;')
+    # Explicit dependency-ordered drops (H7)
+    op.execute('DROP TRIGGER IF EXISTS trg_summary_transactions_immutable ON public.summary_transactions;')
+    op.execute('DROP FUNCTION IF EXISTS public.prevent_summary_transactions_mutation();')
+    op.execute('DROP TABLE IF EXISTS public.summary_transactions;')
+    op.execute('DROP TABLE IF EXISTS public.financial_summaries;')
+    op.execute('DROP TABLE IF EXISTS public.financial_transactions;')
+    op.execute('DROP TABLE IF EXISTS public.gst_records;')
+    op.execute('DROP TABLE IF EXISTS public.documents;')
+    op.execute('DROP TABLE IF EXISTS public.business_profiles;')

@@ -64,6 +64,7 @@ def upgrade() -> None:
     """)
 
 def downgrade() -> None:
-    op.execute('DROP TABLE IF EXISTS public.scheme_matches CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.scheme_eligibility_rules CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.government_schemes CASCADE;')
+    # Explicit dependency-ordered drops (H7)
+    op.execute('DROP TABLE IF EXISTS public.scheme_matches;')
+    op.execute('DROP TABLE IF EXISTS public.scheme_eligibility_rules;')
+    op.execute('DROP TABLE IF EXISTS public.government_schemes;')

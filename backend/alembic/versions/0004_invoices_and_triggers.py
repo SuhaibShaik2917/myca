@@ -1,4 +1,4 @@
-"""Invoices, Line Items, Transition Rules, and Integrity Triggers
+"""Invoices, Line Items, Transition Rules, and Hardened Integrity Triggers
 
 Revision ID: 0004_invoices_and_triggers
 Revises: 0003_financial_tables
@@ -36,7 +36,7 @@ def upgrade() -> None:
     ON CONFLICT DO NOTHING;
     """)
 
-    # 2. Invoices Table
+    # 2. Invoices Table with Composite Document FK (C2)
     op.execute("""
     CREATE TABLE IF NOT EXISTS public.invoices (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -55,7 +55,7 @@ def upgrade() -> None:
         currency text NOT NULL DEFAULT 'INR',
         status invoice_status NOT NULL DEFAULT 'uploaded',
         rejection_reason text,
-        document_id uuid REFERENCES public.documents(id) ON DELETE SET NULL,
+        document_id uuid,
         approved_by uuid REFERENCES public.global_users(id) ON DELETE SET NULL,
         approved_at timestamptz,
         export_ready_at timestamptz,
@@ -63,9 +63,11 @@ def upgrade() -> None:
         updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
         CONSTRAINT uq_invoices_id_org UNIQUE (id, org_id),
         CONSTRAINT uq_invoices_org_number UNIQUE (org_id, invoice_number),
-        FOREIGN KEY (profile_id, org_id) REFERENCES public.business_profiles(id, org_id) ON DELETE CASCADE
+        FOREIGN KEY (profile_id, org_id) REFERENCES public.business_profiles(id, org_id) ON DELETE CASCADE,
+        FOREIGN KEY (document_id, org_id) REFERENCES public.documents(id, org_id) ON DELETE SET NULL
     );
     CREATE INDEX IF NOT EXISTS idx_invoices_org_status ON public.invoices(org_id, status);
+    CREATE INDEX IF NOT EXISTS idx_invoices_doc_org ON public.invoices(document_id, org_id);
     """)
 
     # 3. Invoice Line Items
@@ -91,7 +93,7 @@ def upgrade() -> None:
     CREATE INDEX IF NOT EXISTS idx_invoice_lines_inv_org ON public.invoice_line_items(invoice_id, org_id);
     """)
 
-    # 4. Trigger Functions
+    # 4. Hardened Trigger Functions (C1)
     op.execute("""
     CREATE OR REPLACE FUNCTION public.enforce_invoice_insert_status()
     RETURNS trigger
@@ -108,25 +110,51 @@ def upgrade() -> None:
     CREATE OR REPLACE FUNCTION public.enforce_invoice_update_status()
     RETURNS trigger
     LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = public, pg_temp
     AS $$
     DECLARE
         v_req_role text;
         v_user_id uuid;
         v_user_role public.org_role;
+        v_financial_changed boolean;
     BEGIN
-        -- No status change: allow but block tampering of financial figures on approved/export_ready invoices
-        IF OLD.status = NEW.status THEN
-            IF OLD.status IN ('approved', 'export_ready') THEN
-                IF (OLD.total_taxable_amount <> NEW.total_taxable_amount OR
-                    OLD.total_amount <> NEW.total_amount OR
-                    OLD.invoice_number <> NEW.invoice_number) THEN
-                    RAISE EXCEPTION 'Cannot modify financial data on approved/export-ready invoice %', OLD.id;
-                END IF;
+        -- Detect whether any protected financial or identifying fields were changed (NULL-safe IS DISTINCT FROM)
+        v_financial_changed := (
+            OLD.total_taxable_amount IS DISTINCT FROM NEW.total_taxable_amount OR
+            OLD.cgst_amount IS DISTINCT FROM NEW.cgst_amount OR
+            OLD.sgst_amount IS DISTINCT FROM NEW.sgst_amount OR
+            OLD.igst_amount IS DISTINCT FROM NEW.igst_amount OR
+            OLD.total_amount IS DISTINCT FROM NEW.total_amount OR
+            OLD.invoice_number IS DISTINCT FROM NEW.invoice_number OR
+            OLD.counterparty_name IS DISTINCT FROM NEW.counterparty_name OR
+            OLD.counterparty_gstin IS DISTINCT FROM NEW.counterparty_gstin OR
+            OLD.invoice_date IS DISTINCT FROM NEW.invoice_date OR
+            OLD.profile_id IS DISTINCT FROM NEW.profile_id OR
+            OLD.currency IS DISTINCT FROM NEW.currency
+        );
+
+        -- 1. Strict Immutability once Approved or Export-Ready across ALL updates and transitions (C1)
+        IF OLD.status IN ('approved', 'export_ready') THEN
+            IF v_financial_changed THEN
+                RAISE EXCEPTION 'Cannot modify financial or identifying fields on approved/export-ready invoice % (42501)', OLD.id;
             END IF;
+        END IF;
+
+        -- 2. Strict Immutability during the Approval/Rejection transition itself (C1)
+        IF OLD.status = 'pending_review' AND NEW.status IN ('approved', 'rejected') THEN
+            IF v_financial_changed THEN
+                RAISE EXCEPTION 'Cannot modify financial figures during approval/rejection transition for invoice % (42501)', OLD.id;
+            END IF;
+        END IF;
+
+        -- 3. If no status change, validate financial modification eligibility
+        IF OLD.status = NEW.status THEN
+            -- Non-approved invoices can be edited during correction phases before approval
             RETURN NEW;
         END IF;
 
-        -- Verify permitted transition
+        -- 4. Verify permitted transition in state machine
         SELECT required_role INTO v_req_role
         FROM public.invoice_transition_rules
         WHERE from_status = OLD.status AND to_status = NEW.status;
@@ -135,7 +163,7 @@ def upgrade() -> None:
             RAISE EXCEPTION 'Illegal status transition from % to % for invoice %', OLD.status, NEW.status, OLD.id;
         END IF;
 
-        -- Worker transition
+        -- 5. Worker transition authorization
         IF v_req_role = 'worker' THEN
             IF NOT (session_user = 'worker_owner' OR pg_has_role(session_user, 'worker_owner', 'MEMBER')
                     OR session_user = 'platform_admin' OR pg_has_role(session_user, 'platform_admin', 'MEMBER')
@@ -147,7 +175,7 @@ def upgrade() -> None:
             END IF;
         END IF;
 
-        -- Human approval transition
+        -- 6. Human approval transition authorization
         IF v_req_role = 'human' THEN
             v_user_id := NULLIF(current_setting('app.current_user', true), '')::uuid;
             IF v_user_id IS NULL THEN
@@ -175,6 +203,35 @@ def upgrade() -> None:
     END;
     $$;
 
+    -- Line Item Immutability Trigger (C1)
+    CREATE OR REPLACE FUNCTION public.enforce_invoice_line_item_immutability()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = public, pg_temp
+    AS $$
+    DECLARE
+        v_parent_id uuid;
+        v_inv_status public.invoice_status;
+    BEGIN
+        v_parent_id := COALESCE(NEW.invoice_id, OLD.invoice_id);
+        
+        SELECT status INTO v_inv_status
+        FROM public.invoices
+        WHERE id = v_parent_id;
+
+        IF v_inv_status IN ('approved', 'export_ready') THEN
+            RAISE EXCEPTION 'Cannot insert, update, or delete line items for approved/export-ready invoice % (42501)', v_parent_id;
+        END IF;
+
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        ELSE
+            RETURN NEW;
+        END IF;
+    END;
+    $$;
+
     DROP TRIGGER IF EXISTS trg_invoice_insert_enforce ON public.invoices;
     CREATE TRIGGER trg_invoice_insert_enforce
         BEFORE INSERT ON public.invoices
@@ -186,13 +243,22 @@ def upgrade() -> None:
         BEFORE UPDATE ON public.invoices
         FOR EACH ROW
         EXECUTE FUNCTION public.enforce_invoice_update_status();
+
+    DROP TRIGGER IF EXISTS trg_invoice_lines_immutable ON public.invoice_line_items;
+    CREATE TRIGGER trg_invoice_lines_immutable
+        BEFORE INSERT OR UPDATE OR DELETE ON public.invoice_line_items
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enforce_invoice_line_item_immutability();
     """)
 
 def downgrade() -> None:
+    # Explicit dependency-ordered drops (H7)
+    op.execute('DROP TRIGGER IF EXISTS trg_invoice_lines_immutable ON public.invoice_line_items;')
+    op.execute('DROP FUNCTION IF EXISTS public.enforce_invoice_line_item_immutability();')
     op.execute('DROP TRIGGER IF EXISTS trg_invoice_update_enforce ON public.invoices;')
     op.execute('DROP TRIGGER IF EXISTS trg_invoice_insert_enforce ON public.invoices;')
     op.execute('DROP FUNCTION IF EXISTS public.enforce_invoice_update_status();')
     op.execute('DROP FUNCTION IF EXISTS public.enforce_invoice_insert_status();')
-    op.execute('DROP TABLE IF EXISTS public.invoice_line_items CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.invoices CASCADE;')
-    op.execute('DROP TABLE IF EXISTS public.invoice_transition_rules CASCADE;')
+    op.execute('DROP TABLE IF EXISTS public.invoice_line_items;')
+    op.execute('DROP TABLE IF EXISTS public.invoices;')
+    op.execute('DROP TABLE IF EXISTS public.invoice_transition_rules;')
