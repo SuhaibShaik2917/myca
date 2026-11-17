@@ -164,6 +164,7 @@ class GSTR1DraftResponse(BaseModel):
     legal_name: str
     preceding_fy_aato: Optional[Decimal] = None
     aato_unverified: bool = False
+    aato_provenance: Optional[str] = "unverified_placeholder"
     applicable_b2c_large_threshold: Decimal
     table_4_b2b: List[GSTR1Table4Entry] = []
     table_5_b2c_large: List[Dict[str, Any]] = []
@@ -171,6 +172,7 @@ class GSTR1DraftResponse(BaseModel):
     table_12_hsn_b2b: List[GSTR1Table12Entry] = []
     table_12_hsn_b2c: List[GSTR1Table12Entry] = []
     table_12_hsn_summary: List[GSTR1Table12Entry] = []  # Aggregate compatibility
+    b2b_supply_tables: Dict[str, bool] = {}
     table_12_b2b_mandatory: bool = False
     table_12_b2c_mandatory: bool = False
     table_12_warnings: List[str] = []

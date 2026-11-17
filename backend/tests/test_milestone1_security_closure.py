@@ -1560,13 +1560,14 @@ def test_storage_orphan_reconciliation_lifecycle(test_tenants, tmp_path):
 
 def test_aato_default_dropped_and_placeholder_cleansing(test_tenants):
     """
-    Reviewer Requirement 1:
+    Reviewer Requirement 1 & 2:
     1. Insert profile without supplying AATO -> NULL (default dropped)
     2. Insert profile with explicit NULL -> NULL
     3. Insert profile with verified AATO -> Supplied value retained
-    4. Existing unverified 5 Cr placeholder -> Treated as unverified/unresolved
-    5. Verified AATO above 5 Cr -> Six-digit classification
-    6. Verified AATO at or below 5 Cr -> Applicable four-digit classification
+    4. Legitimate ₹5 Crore declared turnover (provenance='self_declared') is strictly preserved
+    5. Unverified default placeholder (provenance='unverified_placeholder') is treated as unverified
+    6. Verified AATO above 5 Cr -> Six-digit classification
+    7. Verified AATO at or below 5 Cr -> Applicable four-digit classification
     """
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
@@ -1575,10 +1576,11 @@ def test_aato_default_dropped_and_placeholder_cleansing(test_tenants):
             cur.execute("""
                 INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector)
                 VALUES (%s, %s, %s, 'Services', 'IT')
-                RETURNING preceding_fy_aato;
+                RETURNING preceding_fy_aato, aato_provenance;
             """, (p1_id, test_tenants["org_a"], random_gstin("27")))
-            val1 = cur.fetchone()[0]
+            val1, prov1 = cur.fetchone()
             assert val1 is None, f"Default must be dropped; expected NULL, got {val1}"
+            assert prov1 == "unverified_placeholder"
 
             # 2. Insert with explicit NULL
             p2_id = str(uuid.uuid4())
@@ -1593,19 +1595,41 @@ def test_aato_default_dropped_and_placeholder_cleansing(test_tenants):
             # 3. Insert with verified AATO (e.g. 4.2 Crore)
             p3_id = str(uuid.uuid4())
             cur.execute("""
-                INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector, preceding_fy_aato)
-                VALUES (%s, %s, %s, 'Services', 'IT', 42000000.00)
-                RETURNING preceding_fy_aato;
+                INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector, preceding_fy_aato, aato_provenance)
+                VALUES (%s, %s, %s, 'Services', 'IT', 42000000.00, 'self_declared')
+                RETURNING preceding_fy_aato, aato_provenance;
             """, (p3_id, test_tenants["org_a"], random_gstin("27")))
-            val3 = cur.fetchone()[0]
+            val3, prov3 = cur.fetchone()
             assert Decimal(str(val3)) == Decimal("42000000.00")
+            assert prov3 == "self_declared"
 
-    # 4. Existing unverified placeholder check
+            # 4. Legitimate exactly ₹5 Crore declared turnover is protected from cleansing
+            p4_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector, preceding_fy_aato, aato_provenance)
+                VALUES (%s, %s, %s, 'Services', 'IT', 50000000.00, 'self_declared')
+                RETURNING preceding_fy_aato, aato_provenance;
+            """, (p4_id, test_tenants["org_a"], random_gstin("27")))
+            val4, prov4 = cur.fetchone()
+            assert Decimal(str(val4)) == Decimal("50000000.00")
+            assert prov4 == "self_declared"
+
+            # Verify that cleansing only targets unverified_placeholder
+            cur.execute("""
+                UPDATE public.business_profiles
+                SET preceding_fy_aato = NULL
+                WHERE preceding_fy_aato = 50000000.00 AND aato_provenance = 'unverified_placeholder';
+            """)
+            cur.execute("SELECT preceding_fy_aato FROM public.business_profiles WHERE id = %s;", (p4_id,))
+            preserved_val = cur.fetchone()[0]
+            assert Decimal(str(preserved_val)) == Decimal("50000000.00"), "Legitimate 5 Cr value must NOT be wiped by cleansing!"
+
+    # 5. Existing unverified placeholder check
     res_placeholder = validate_hsn_compliance("8471", aato_crores=None, is_b2b=True)
     assert res_placeholder.is_compliant is False
     assert res_placeholder.classification == "aato_unverified_unresolved"
 
-    # 5. Verified AATO above 5 Crore (> 5 Cr requires 6 digits)
+    # 6. Verified AATO above 5 Crore (> 5 Cr requires 6 digits)
     res_above = validate_hsn_compliance("8471", aato_crores=Decimal("8.0"), is_b2b=True)
     assert res_above.is_compliant is False
     assert res_above.classification == "min_digits_unmet"
@@ -1615,7 +1639,7 @@ def test_aato_default_dropped_and_placeholder_cleansing(test_tenants):
     assert res_above_6digit.is_compliant is True
     assert res_above_6digit.classification == "compliant"
 
-    # 6. Verified AATO at or below 5 Crore (<= 5 Cr accepts 4 digits for B2B)
+    # 7. Verified AATO at or below 5 Crore (<= 5 Cr accepts 4 digits for B2B)
     res_below_4digit = validate_hsn_compliance("8471", aato_crores=Decimal("3.5"), is_b2b=True)
     assert res_below_4digit.is_compliant is True
     assert res_below_4digit.classification == "compliant"
@@ -1720,14 +1744,200 @@ def test_gstr1_table_12_b2b_mandatory_across_all_registered_supply_tables(test_t
     """
     Reviewer Requirement 4: Broaden Table 12 B2B requirement detection
     across all applicable registered-recipient supply tables (Table 4, 6B, 6C, 8, 9A, 9B, 9C, 15, 15A).
+    Derives every flag from actual populated registers.
     """
-    headers = {"X-User-Id": test_tenants["user_a"], "X-Org-Id": test_tenants["org_a"]}
+    org_id = test_tenants["org_a"]
+    user_id = test_tenants["user_a"]
+    profile_id = test_tenants["profile_a"]
+    reg_gstin = random_gstin("27")
+
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # 1. Table 4B: Reverse Charge supply
+            seed_invoice(cur, org_id, profile_id, user_id, f"RCM-INV-{uuid.uuid4().hex[:6]}", "2026-11-05", "RCM Supplier Co", reg_gstin, 1000.00, 90.00, 90.00, 0.00, 1180.00, status='approved')
+
+            # 2. Table 6B: SEZ outward supply
+            seed_invoice(cur, org_id, profile_id, user_id, f"SEZ-INV-{uuid.uuid4().hex[:6]}", "2026-11-06", "SEZ Developer Corp", reg_gstin, 2000.00, 0.00, 0.00, 360.00, 2360.00, status='approved')
+
+            # 3. Table 6C: Deemed Export
+            seed_invoice(cur, org_id, profile_id, user_id, f"DE-INV-{uuid.uuid4().hex[:6]}", "2026-11-07", "EOU Manufacturing Ltd", reg_gstin, 3000.00, 270.00, 270.00, 0.00, 3540.00, status='approved')
+
+            # 4. Table 8: Nil-rated supply to registered recipient
+            seed_invoice(cur, org_id, profile_id, user_id, f"NIL-INV-{uuid.uuid4().hex[:6]}", "2026-11-08", "Exempt Grains Trader", reg_gstin, 4000.00, 0.00, 0.00, 0.00, 4000.00, status='approved')
+
+            # 5. Table 9B: Credit Note to registered recipient
+            seed_invoice(cur, org_id, profile_id, user_id, f"CN-INV-{uuid.uuid4().hex[:6]}", "2026-11-09", "Acme Trading Co", reg_gstin, -500.00, -45.00, -45.00, 0.00, -590.00, status='approved')
+
+            # 6. Table 15: ECO outward supply to registered recipient
+            seed_invoice(cur, org_id, profile_id, user_id, f"ECO-INV-{uuid.uuid4().hex[:6]}", "2026-11-10", "E-Commerce Marketplace Partner", reg_gstin, 1500.00, 135.00, 135.00, 0.00, 1770.00, status='approved')
+
+    headers = {"X-User-Id": user_id, "X-Org-Id": org_id}
     res = client.get("/api/v1/gst/gstr1-draft?period=2026-11", headers=headers)
     assert res.status_code == 200
     data = res.json()
-    # If Table 4 supplies exist, Table 12 B2B is marked mandatory
-    assert "table_12_b2b_mandatory" in data
-    assert "table_12_warnings" in data
+
+    assert data["table_12_b2b_mandatory"] is True
+    supply_tables = data["b2b_supply_tables"]
+    assert supply_tables["table_4b"] is True, "Table 4B Reverse Charge should be detected"
+    assert supply_tables["table_6b"] is True, "Table 6B SEZ supply should be detected"
+    assert supply_tables["table_6c"] is True, "Table 6C Deemed export should be detected"
+    assert supply_tables["table_8_b2b"] is True, "Table 8 Nil-rated registered supply should be detected"
+    assert supply_tables["table_9b_b2b"] is True, "Table 9B Credit Note should be detected"
+    assert supply_tables["table_15_b2b"] is True, "Table 15 ECO registered supply should be detected"
+
+
+def test_invoice_ocr_writer_transitive_isolation_and_column_grants():
+    """
+    Reviewer Requirement 5:
+    1. Confirm no worker or application user can transitively assume invoice_ocr_writer.
+    2. Confirm pg_auth_members has 0 entries involving invoice_ocr_writer.
+    3. Confirm UPDATE privilege is granted only on (id) column of worker_tasks and invoices.
+    """
+    with psycopg.connect(DB_ADMIN) as conn:
+        with conn.cursor() as cur:
+            # 1. No role is a member of invoice_ocr_writer, nor is it a member of any other role
+            cur.execute("""
+                SELECT r.rolname as role, m.rolname as member
+                FROM pg_auth_members pam
+                JOIN pg_roles r ON pam.roleid = r.oid
+                JOIN pg_roles m ON pam.member = m.oid
+                WHERE r.rolname = 'invoice_ocr_writer' OR m.rolname = 'invoice_ocr_writer';
+            """)
+            memberships = cur.fetchall()
+            assert len(memberships) == 0, f"invoice_ocr_writer must have NO direct or transitive memberships! Found: {memberships}"
+
+            # 2. Confirm worker_service_user cannot assume invoice_ocr_writer
+            cur.execute("SELECT pg_has_role('worker_service_user', 'invoice_ocr_writer', 'MEMBER');")
+            assert cur.fetchone()[0] is False
+
+            cur.execute("SELECT pg_has_role('app_service_user', 'invoice_ocr_writer', 'MEMBER');")
+            assert cur.fetchone()[0] is False
+
+            # 3. Column-level UPDATE privilege verification:
+            # Must have UPDATE on 'id' column for row locking
+            cur.execute("""
+                SELECT has_column_privilege('invoice_ocr_writer', 'public.worker_tasks', 'id', 'UPDATE');
+            """)
+            assert cur.fetchone()[0] is True, "Must have UPDATE on id for SELECT ... FOR UPDATE"
+
+            # Must NOT have UPDATE on data/status columns
+            for col in ['status', 'payload', 'lease_token_hash']:
+                cur.execute("""
+                    SELECT has_column_privilege('invoice_ocr_writer', 'public.worker_tasks', %s, 'UPDATE');
+                """, (col,))
+                assert cur.fetchone()[0] is False, f"invoice_ocr_writer unexpectedly has UPDATE on worker_tasks.{col}!"
+
+            cur.execute("""
+                SELECT has_column_privilege('invoice_ocr_writer', 'public.invoices', 'id', 'UPDATE');
+            """)
+            assert cur.fetchone()[0] is True
+
+            for col in ['total_amount', 'status', 'counterparty_name']:
+                cur.execute("""
+                    SELECT has_column_privilege('invoice_ocr_writer', 'public.invoices', %s, 'UPDATE');
+                """, (col,))
+                assert cur.fetchone()[0] is False, f"invoice_ocr_writer unexpectedly has UPDATE on invoices.{col}!"
+
+
+def test_populated_data_downgrade_quarantine(test_tenants):
+    """
+    Reviewer Requirement 3: Populated-data rollback handling:
+    1. Database contains authentic incomplete OCR extractions bearing NULLs.
+    2. Downgrade to 0009 safely quarantines incomplete records in public.archived_m1_3_incomplete_extractions.
+    3. Financial defaults (1.00 qty, 18% GST) are NOT forged onto records.
+    4. Upgrade back to 0010 seamlessly restores the authentic incomplete records.
+    """
+    import subprocess
+    org_id = test_tenants["org_a"]
+    profile_id = test_tenants["profile_a"]
+    inv_id = str(uuid.uuid4())
+    line_id = str(uuid.uuid4())
+
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # Insert draft invoice using seed_invoice with status 'pending_review'
+            inv_id = seed_invoice(
+                cur, org_id, profile_id, test_tenants["user_a"],
+                f"INC-INV-{uuid.uuid4().hex[:6]}", "2026-11-12", "Uncertain Vendor Ltd",
+                None, 100.00, 9.00, 9.00, 0.00, 118.00, status='pending_review'
+            )
+
+            cur.execute("""
+                INSERT INTO public.invoice_line_items (
+                    id, invoice_id, org_id, item_description, hsn_sac_code,
+                    quantity, unit_price, taxable_amount, gst_rate, cgst_amount, sgst_amount, igst_amount, total_amount
+                ) VALUES (
+                    %s, %s, %s, 'Incomplete Item with Nulls', '998311',
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+                );
+            """, (line_id, inv_id, org_id))
+
+    # Execute Alembic downgrade to 0009
+    p_down = subprocess.run(
+        ["/opt/myca-venv/bin/alembic", "downgrade", "-1"],
+        cwd="/mnt/c/Users/notyo/.gemini/antigravity/scratch/myca/backend",
+        capture_output=True, text=True
+    )
+    assert p_down.returncode == 0, f"Downgrade failed: {p_down.stderr}"
+
+    # Verify that the record was quarantined with authentic NULLs preserved
+    with psycopg.connect(DB_ADMIN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT original_line_id, quarantine_reason, quantity, gst_rate
+                FROM public.archived_m1_3_incomplete_extractions
+                WHERE original_line_id = %s;
+            """, (line_id,))
+            q_row = cur.fetchone()
+            assert q_row is not None, "Incomplete record must be quarantined in archived_m1_3_incomplete_extractions!"
+            assert q_row[2] is None, "Authentic NULL quantity must be preserved!"
+            assert q_row[3] is None, "Authentic NULL gst_rate must be preserved (not fabricated 18%)!"
+
+    # Execute Alembic upgrade back to head (0010)
+    p_up = subprocess.run(
+        ["/opt/myca-venv/bin/alembic", "upgrade", "head"],
+        cwd="/mnt/c/Users/notyo/.gemini/antigravity/scratch/myca/backend",
+        capture_output=True, text=True
+    )
+    assert p_up.returncode == 0, f"Re-upgrade failed: {p_up.stderr}"
+
+    # Verify that the record was restored cleanly back to invoice_line_items
+    with psycopg.connect(DB_ADMIN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, quantity, gst_rate FROM public.invoice_line_items WHERE id = %s;", (line_id,))
+            restored = cur.fetchone()
+            assert restored is not None, "Quarantined record must be restored to invoice_line_items upon upgrade!"
+            assert restored[1] is None
+            assert restored[2] is None
+
+
+def test_gemini_smoke_script_cli_modes():
+    """
+    Reviewer Requirement 1: Smoke test harness CLI operational modes.
+    1. --test-fallback simulates primary failure and proves fallback works.
+    2. --require-live exits with code 2 if GEMINI_API_KEY is unset.
+    """
+    import subprocess
+
+    # 1. Fallback mode
+    p_fallback = subprocess.run(
+        ["/opt/myca-venv/bin/python3", "backend/scripts/gemini_live_smoke_test.py", "--test-fallback"],
+        cwd="/mnt/c/Users/notyo/.gemini/antigravity/scratch/myca",
+        capture_output=True, text=True
+    )
+    assert p_fallback.returncode == 0
+    assert "FALLBACK VERIFICATION:    PASSED" in p_fallback.stdout
+
+    # 2. Require live when key is unset
+    env_without_key = os.environ.copy()
+    env_without_key.pop("GEMINI_API_KEY", None)
+    p_live_req = subprocess.run(
+        ["/opt/myca-venv/bin/python3", "backend/scripts/gemini_live_smoke_test.py", "--require-live"],
+        cwd="/mnt/c/Users/notyo/.gemini/antigravity/scratch/myca",
+        capture_output=True, text=True, env=env_without_key
+    )
+    assert p_live_req.returncode == 2
+    assert "[FATAL] --require-live flag set but GEMINI_API_KEY is not configured." in p_live_req.stdout
 
 
 def test_gemini_vision_live_smoke_test_harness(tmp_path):

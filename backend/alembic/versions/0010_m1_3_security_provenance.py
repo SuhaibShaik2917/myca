@@ -25,8 +25,10 @@ def upgrade() -> None:
     $$;
 
     GRANT USAGE ON SCHEMA public TO invoice_ocr_writer;
-    GRANT SELECT, UPDATE ON public.worker_tasks TO invoice_ocr_writer;
-    GRANT SELECT, UPDATE ON public.invoices TO invoice_ocr_writer;
+    GRANT SELECT ON public.worker_tasks TO invoice_ocr_writer;
+    GRANT UPDATE (id) ON public.worker_tasks TO invoice_ocr_writer;
+    GRANT SELECT ON public.invoices TO invoice_ocr_writer;
+    GRANT UPDATE (id) ON public.invoices TO invoice_ocr_writer;
     GRANT SELECT, INSERT, UPDATE, DELETE ON public.invoice_line_items TO invoice_ocr_writer;
     GRANT SELECT ON public.worker_service_authorizations TO invoice_ocr_writer;
     GRANT EXECUTE ON FUNCTION public.is_worker_authorized TO invoice_ocr_writer;
@@ -104,6 +106,30 @@ def upgrade() -> None:
 
     ALTER TABLE public.invoice_line_items
     ADD COLUMN IF NOT EXISTS extraction_confidence numeric(4, 3);
+
+    -- If a previous downgrade quarantined incomplete extractions, restore them faithfully
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'archived_m1_3_incomplete_extractions') THEN
+            ALTER TABLE public.invoice_line_items DISABLE TRIGGER trg_invoice_lines_immutable;
+
+            INSERT INTO public.invoice_line_items (
+                id, invoice_id, org_id, item_description, hsn_sac_code,
+                quantity, unit_price, taxable_amount, gst_rate, cgst_amount, sgst_amount,
+                igst_amount, total_amount, extraction_confidence
+            )
+            SELECT original_line_id, invoice_id, org_id, item_description, hsn_sac_code,
+                   quantity, unit_price, taxable_amount, gst_rate, cgst_amount, sgst_amount,
+                   igst_amount, total_amount, extraction_confidence
+            FROM public.archived_m1_3_incomplete_extractions
+            ON CONFLICT (id) DO NOTHING;
+
+            ALTER TABLE public.invoice_line_items ENABLE TRIGGER trg_invoice_lines_immutable;
+
+            DROP TABLE public.archived_m1_3_incomplete_extractions;
+        END IF;
+    END
+    $$;
     """)
 
     # 3. Add OCR raw response and confidence provenance to invoices
@@ -113,17 +139,30 @@ def upgrade() -> None:
     ADD COLUMN IF NOT EXISTS ocr_confidence numeric(4, 3);
     """)
 
-    # 4. Remove assumed ₹5 Crore default on preceding_fy_aato and clean historical placeholders
+    # 4. Remove assumed ₹5 Crore default on preceding_fy_aato, establish data provenance, and clean unverified placeholders
     op.execute("""
+    ALTER TABLE public.business_profiles
+    ADD COLUMN IF NOT EXISTS aato_provenance text NOT NULL DEFAULT 'unverified_placeholder';
+
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_aato_provenance') THEN
+            ALTER TABLE public.business_profiles
+            ADD CONSTRAINT chk_aato_provenance CHECK (aato_provenance IN ('unverified_placeholder', 'self_declared', 'portal_verified'));
+        END IF;
+    END
+    $$;
+
     ALTER TABLE public.business_profiles
     ALTER COLUMN preceding_fy_aato DROP DEFAULT,
     ALTER COLUMN preceding_fy_aato DROP NOT NULL;
 
     -- Historical data cleanup:
-    -- Records created with the previous default 50000000.00 must be cleansed to NULL unless PAN-level verification exists
+    -- Only records originating from unverified defaults (provenance = 'unverified_placeholder') are cleansed.
+    -- Legitimate ₹5 Crore entries (self_declared or portal_verified) are strictly preserved.
     UPDATE public.business_profiles
     SET preceding_fy_aato = NULL
-    WHERE preceding_fy_aato = 50000000.00;
+    WHERE preceding_fy_aato = 50000000.00 AND aato_provenance = 'unverified_placeholder';
     """)
 
     # 5. Recreate replace_ocr_line_items with task-type enforcement, worker lock check, and owner invoice_ocr_writer
@@ -479,19 +518,59 @@ def downgrade() -> None:
     DROP ROLE IF EXISTS invoice_ocr_writer;
     """)
 
-    # 3. Restore previous column definitions, defaults, and NOT NULL constraints
+    # 3. Restore previous column definitions safely:
+    # Incomplete NULL-bearing line items are archived into quarantine table to preserve authentic records without fabricating defaults.
     op.execute("""
+    CREATE TABLE IF NOT EXISTS public.archived_m1_3_incomplete_extractions (
+        quarantine_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        original_line_id uuid,
+        invoice_id uuid,
+        org_id uuid,
+        item_description text,
+        hsn_sac_code text,
+        quantity numeric(12, 3),
+        unit_price numeric(15, 2),
+        taxable_amount numeric(15, 2),
+        gst_rate numeric(5, 2),
+        cgst_amount numeric(15, 2),
+        sgst_amount numeric(15, 2),
+        igst_amount numeric(15, 2),
+        total_amount numeric(15, 2),
+        extraction_confidence numeric(4, 3),
+        quarantined_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+        quarantine_reason text NOT NULL DEFAULT 'Downgrade to 0009: preserved authentic incomplete OCR extraction'
+    );
+
     ALTER TABLE public.invoice_line_items DISABLE TRIGGER trg_invoice_lines_immutable;
 
-    -- Data preservation fallback before restoring NOT NULL
-    UPDATE public.invoice_line_items SET quantity = 1.000 WHERE quantity IS NULL;
-    UPDATE public.invoice_line_items SET unit_price = 0.00 WHERE unit_price IS NULL;
-    UPDATE public.invoice_line_items SET taxable_amount = 0.00 WHERE taxable_amount IS NULL;
-    UPDATE public.invoice_line_items SET gst_rate = 18.00 WHERE gst_rate IS NULL;
-    UPDATE public.invoice_line_items SET cgst_amount = 0.00 WHERE cgst_amount IS NULL;
-    UPDATE public.invoice_line_items SET sgst_amount = 0.00 WHERE sgst_amount IS NULL;
-    UPDATE public.invoice_line_items SET igst_amount = 0.00 WHERE igst_amount IS NULL;
-    UPDATE public.invoice_line_items SET total_amount = 0.00 WHERE total_amount IS NULL;
+    -- Safely archive records containing NULL values
+    INSERT INTO public.archived_m1_3_incomplete_extractions (
+        original_line_id, invoice_id, org_id, item_description, hsn_sac_code,
+        quantity, unit_price, taxable_amount, gst_rate, cgst_amount, sgst_amount,
+        igst_amount, total_amount, extraction_confidence
+    )
+    SELECT id, invoice_id, org_id, item_description, hsn_sac_code,
+           quantity, unit_price, taxable_amount, gst_rate, cgst_amount, sgst_amount,
+           igst_amount, total_amount, extraction_confidence
+    FROM public.invoice_line_items
+    WHERE quantity IS NULL
+       OR unit_price IS NULL
+       OR taxable_amount IS NULL
+       OR gst_rate IS NULL
+       OR cgst_amount IS NULL
+       OR sgst_amount IS NULL
+       OR igst_amount IS NULL
+       OR total_amount IS NULL;
+
+    DELETE FROM public.invoice_line_items
+    WHERE quantity IS NULL
+       OR unit_price IS NULL
+       OR taxable_amount IS NULL
+       OR gst_rate IS NULL
+       OR cgst_amount IS NULL
+       OR sgst_amount IS NULL
+       OR igst_amount IS NULL
+       OR total_amount IS NULL;
 
     ALTER TABLE public.invoice_line_items
         ALTER COLUMN quantity SET DEFAULT 1.000,
@@ -520,5 +599,6 @@ def downgrade() -> None:
     UPDATE public.business_profiles SET preceding_fy_aato = 50000000.00 WHERE preceding_fy_aato IS NULL;
     ALTER TABLE public.business_profiles
         ALTER COLUMN preceding_fy_aato SET DEFAULT 50000000.00,
-        ALTER COLUMN preceding_fy_aato SET NOT NULL;
+        ALTER COLUMN preceding_fy_aato SET NOT NULL,
+        DROP COLUMN IF EXISTS aato_provenance;
     """)

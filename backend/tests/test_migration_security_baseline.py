@@ -6,9 +6,10 @@ import string
 from psycopg.rows import dict_row
 
 def random_pan():
+    letters1 = "".join(random.choices(string.ascii_uppercase, k=5))
     digits = f"{random.randint(1000, 9999)}"
     letter = random.choice(string.ascii_uppercase)
-    return f"ABCDE{digits}{letter}"
+    return f"{letters1}{digits}{letter}"
 
 def random_gstin(pan=None):
     if not pan:

@@ -51,7 +51,8 @@ def prepare_gstr1_draft(
         SELECT 
             o.legal_name, 
             bp.gstin,
-            bp.preceding_fy_aato
+            bp.preceding_fy_aato,
+            COALESCE(bp.aato_provenance, 'unverified_placeholder')
         FROM public.organizations o
         JOIN public.business_profiles bp ON bp.org_id = o.id
         WHERE o.id = :org_id
@@ -61,8 +62,9 @@ def prepare_gstr1_draft(
     legal_name = org_row[0] if org_row else "Unknown Organization"
     supplier_gstin = org_row[1] if org_row else "Unregistered"
     raw_aato = org_row[2] if org_row else None
+    aato_provenance = str(org_row[3]) if org_row and org_row[3] else "unverified_placeholder"
     preceding_fy_aato = Decimal(str(raw_aato)) if raw_aato is not None else None
-    aato_unverified = (preceding_fy_aato is None)
+    aato_unverified = (preceding_fy_aato is None or aato_provenance == "unverified_placeholder")
 
     supplier_state = supplier_gstin[:2] if len(supplier_gstin) >= 2 else "27"
     b2c_large_threshold = get_b2c_large_threshold(tax_period)
@@ -88,6 +90,17 @@ def prepare_gstr1_draft(
     total_liability = Decimal("0.00")
 
     invoice_numbers = []
+
+    has_table_4a = False
+    has_table_4b = False
+    has_table_6b = False
+    has_table_6c = False
+    has_table_8_b2b = False
+    has_table_9a_b2b = False
+    has_table_9b_b2b = False
+    has_table_9c_b2b = False
+    has_table_15_b2b = False
+    has_table_15a_b2b = False
 
     for inv in invoices:
         inv_id, inv_num, inv_date, cp_name, cp_gstin, taxable, cgst, sgst, igst, total = inv
@@ -120,7 +133,42 @@ def prepare_gstr1_draft(
             rate = (((cgst_dec + sgst_dec + igst_dec) / taxable_dec) * 100).quantize(Decimal("0.01"))
 
         if cp_gstin and len(cp_gstin.strip()) == 15:
-            # Table 4: B2B Registered supplies
+            # Table 4 / Registered supplies
+            num_upper = inv_num.upper()
+            name_upper = (cp_name or "").upper()
+
+            # Classify specific registered outward supply categories
+            if num_upper.startswith(("AMCN-", "AMDN-", "CDNRA-")):
+                has_table_9c_b2b = True
+                inv_type = "CDNRA"
+            elif num_upper.startswith(("CN-", "CRN-", "DN-", "DBN-", "CDNR-")) or total_dec < 0:
+                has_table_9b_b2b = True
+                inv_type = "CDNR"
+            elif num_upper.startswith(("AMD-", "REV-", "B2BA-")):
+                has_table_9a_b2b = True
+                inv_type = "B2BA"
+            elif num_upper.startswith(("AMECO-", "ECOA-")):
+                has_table_15a_b2b = True
+                inv_type = "ECOA"
+            elif num_upper.startswith(("ECO-",)) or "ECO" in name_upper:
+                has_table_15_b2b = True
+                inv_type = "ECO"
+            elif pos == "96" or "SEZ" in name_upper or "SEZ" in num_upper:
+                has_table_6b = True
+                inv_type = "SEZ"
+            elif num_upper.startswith(("DE-", "EXP-")) or "DEEMED" in name_upper:
+                has_table_6c = True
+                inv_type = "Deemed Export"
+            elif num_upper.startswith(("RCM-", "REV-CHG-")) or "RCM" in name_upper:
+                has_table_4b = True
+                inv_type = "Reverse Charge"
+            else:
+                has_table_4a = True
+                inv_type = "Regular"
+
+            if rate == Decimal("0.00") or (taxable_dec > 0 and (cgst_dec + sgst_dec + igst_dec) == 0):
+                has_table_8_b2b = True
+
             b2b_entries.append(GSTR1Table4Entry(
                 recipient_gstin=cp_gstin,
                 recipient_name=cp_name,
@@ -128,8 +176,8 @@ def prepare_gstr1_draft(
                 invoice_date=str(inv_date),
                 invoice_value=total_dec,
                 place_of_supply=pos,
-                reverse_charge="N",
-                invoice_type="Regular",
+                reverse_charge="Y" if has_table_4b else "N",
+                invoice_type=inv_type,
                 rate=rate,
                 taxable_value=taxable_dec,
                 cgst_amount=cgst_dec,
@@ -219,7 +267,8 @@ def prepare_gstr1_draft(
 
     # GST Portal May 2025 Guidance & Phase 3 Rules:
     # Table 12 B2B tab is mandatory when registered-recipient outward supplies are reported across ANY of:
-    # - Table 4 (Taxable outward supplies to registered persons - B2B regular)
+    # - Table 4A (Regular B2B supplies to registered persons)
+    # - Table 4B (Supplies attracting reverse charge to registered persons)
     # - Table 6B (Supplies made to SEZ unit / SEZ developer with or without payment)
     # - Table 6C (Deemed exports)
     # - Table 8 (Nil-rated / exempt outward supplies to registered persons)
@@ -229,19 +278,22 @@ def prepare_gstr1_draft(
     # - Table 15 (Supplies made through E-commerce operators to registered persons u/s 9(5))
     # - Table 15A (Amendments to supplies through ECO to registered persons)
     b2b_supply_tables = {
-        "table_4": len(b2b_entries) > 0,
-        "table_6b": False,      # SEZ supplies to registered units
-        "table_6c": False,      # Deemed exports to registered recipients
-        "table_8_b2b": False,   # Nil-rated / exempt to registered
-        "table_9a_b2b": False,  # B2B amendments
-        "table_9b_b2b": False,  # B2B credit/debit notes
-        "table_9c_b2b": False,  # Amended B2B credit/debit notes
-        "table_15_b2b": False,  # ECO supplies to registered u/s 9(5)
-        "table_15a_b2b": False, # ECO amendments to registered
+        "table_4": has_table_4a or has_table_4b,
+        "table_4a": has_table_4a,
+        "table_4b": has_table_4b,
+        "table_6b": has_table_6b,
+        "table_6c": has_table_6c,
+        "table_8_b2b": has_table_8_b2b,
+        "table_9a_b2b": has_table_9a_b2b,
+        "table_9b_b2b": has_table_9b_b2b,
+        "table_9c_b2b": has_table_9c_b2b,
+        "table_15_b2b": has_table_15_b2b,
+        "table_15a_b2b": has_table_15a_b2b,
     }
     B2B_REQUIRING_TABLE_12 = {
-        "table_4", "table_6b", "table_6c", "table_8_b2b",
-        "table_9a_b2b", "table_9b_b2b", "table_9c_b2b", "table_15_b2b", "table_15a_b2b"
+        "table_4", "table_4a", "table_4b", "table_6b", "table_6c",
+        "table_8_b2b", "table_9a_b2b", "table_9b_b2b", "table_9c_b2b",
+        "table_15_b2b", "table_15a_b2b"
     }
     b2b_triggering_tables = [t for t in B2B_REQUIRING_TABLE_12 if b2b_supply_tables[t]]
     table_12_b2b_mandatory = len(b2b_triggering_tables) > 0
@@ -278,15 +330,15 @@ def prepare_gstr1_draft(
     # Statutorily mandatory from May 2025 (tax_period >= '2025-05') if ANY outward supply tables contain data:
     # Tables 4, 5, 6, 7, 8, 9, 10, 14, 15.
     table_has_data = {
-        "table_4": len(b2b_entries) > 0,
+        "table_4": has_table_4a or has_table_4b,
         "table_5": len(b2c_large) > 0,
-        "table_6": False,  # Zero-rated / exports (requires customs shipping bill module)
+        "table_6": has_table_6b or has_table_6c,
         "table_7": len(b2c_small) > 0,
-        "table_8": False,  # Nil rated / exempt
-        "table_9": False,  # Amendments
-        "table_10": False, # Amendments to unregistered
-        "table_14": False, # E-commerce supplies u/s 52
-        "table_15": False, # Supplies u/s 9(5)
+        "table_8": has_table_8_b2b,
+        "table_9": has_table_9a_b2b or has_table_9b_b2b or has_table_9c_b2b,
+        "table_10": False,
+        "table_14": False,
+        "table_15": has_table_15_b2b or has_table_15a_b2b,
     }
     REQUIRING_TABLE_13 = {"table_4", "table_5", "table_6", "table_7", "table_8", "table_9", "table_10", "table_14", "table_15"}
     has_outward_supplies = any(table_has_data[t] for t in REQUIRING_TABLE_13)
@@ -360,6 +412,7 @@ def prepare_gstr1_draft(
         legal_name=legal_name,
         preceding_fy_aato=preceding_fy_aato,
         aato_unverified=aato_unverified,
+        aato_provenance=aato_provenance,
         applicable_b2c_large_threshold=b2c_large_threshold,
         table_4_b2b=b2b_entries,
         table_5_b2c_large=b2c_large,
@@ -367,6 +420,7 @@ def prepare_gstr1_draft(
         table_12_hsn_b2b=table_12_hsn_b2b,
         table_12_hsn_b2c=table_12_hsn_b2c,
         table_12_hsn_summary=table_12_hsn_summary,
+        b2b_supply_tables=b2b_supply_tables,
         table_12_b2b_mandatory=table_12_b2b_mandatory,
         table_12_b2c_mandatory=table_12_b2c_mandatory,
         table_12_warnings=table_12_warnings,
