@@ -64,7 +64,7 @@ def upgrade() -> None:
         CONSTRAINT uq_invoices_id_org UNIQUE (id, org_id),
         CONSTRAINT uq_invoices_org_number UNIQUE (org_id, invoice_number),
         FOREIGN KEY (profile_id, org_id) REFERENCES public.business_profiles(id, org_id) ON DELETE CASCADE,
-        FOREIGN KEY (document_id, org_id) REFERENCES public.documents(id, org_id) ON DELETE SET NULL
+        FOREIGN KEY (document_id, org_id) REFERENCES public.documents(id, org_id) ON DELETE SET NULL (document_id)
     );
     CREATE INDEX IF NOT EXISTS idx_invoices_org_status ON public.invoices(org_id, status);
     CREATE INDEX IF NOT EXISTS idx_invoices_doc_org ON public.invoices(document_id, org_id);
@@ -203,7 +203,7 @@ def upgrade() -> None:
     END;
     $$;
 
-    -- Line Item Immutability Trigger (C1)
+    -- Line Item Immutability Trigger (C1 Fix: Prevents moving line items out of or into approved/export-ready invoices)
     CREATE OR REPLACE FUNCTION public.enforce_invoice_line_item_immutability()
     RETURNS trigger
     LANGUAGE plpgsql
@@ -211,24 +211,54 @@ def upgrade() -> None:
     SET search_path = public, pg_temp
     AS $$
     DECLARE
-        v_parent_id uuid;
-        v_inv_status public.invoice_status;
+        v_old_status public.invoice_status;
+        v_new_status public.invoice_status;
     BEGIN
-        v_parent_id := COALESCE(NEW.invoice_id, OLD.invoice_id);
-        
-        SELECT status INTO v_inv_status
-        FROM public.invoices
-        WHERE id = v_parent_id;
+        IF TG_OP = 'INSERT' THEN
+            SELECT status INTO v_new_status
+            FROM public.invoices
+            WHERE id = NEW.invoice_id;
 
-        IF v_inv_status IN ('approved', 'export_ready') THEN
-            RAISE EXCEPTION 'Cannot insert, update, or delete line items for approved/export-ready invoice % (42501)', v_parent_id;
-        END IF;
+            IF v_new_status IN ('approved', 'export_ready') THEN
+                RAISE EXCEPTION 'Cannot insert line items for approved/export-ready invoice % (42501)', NEW.invoice_id;
+            END IF;
+            RETURN NEW;
 
-        IF TG_OP = 'DELETE' THEN
+        ELSIF TG_OP = 'DELETE' THEN
+            SELECT status INTO v_old_status
+            FROM public.invoices
+            WHERE id = OLD.invoice_id;
+
+            IF v_old_status IN ('approved', 'export_ready') THEN
+                RAISE EXCEPTION 'Cannot delete line items from approved/export-ready invoice % (42501)', OLD.invoice_id;
+            END IF;
             RETURN OLD;
-        ELSE
+
+        ELSIF TG_OP = 'UPDATE' THEN
+            -- Check original parent invoice
+            SELECT status INTO v_old_status
+            FROM public.invoices
+            WHERE id = OLD.invoice_id;
+
+            IF v_old_status IN ('approved', 'export_ready') THEN
+                RAISE EXCEPTION 'Cannot modify or move line items out of approved/export-ready invoice % (42501)', OLD.invoice_id;
+            END IF;
+
+            -- If moving to a different invoice, also check destination invoice
+            IF NEW.invoice_id <> OLD.invoice_id THEN
+                SELECT status INTO v_new_status
+                FROM public.invoices
+                WHERE id = NEW.invoice_id;
+
+                IF v_new_status IN ('approved', 'export_ready') THEN
+                    RAISE EXCEPTION 'Cannot move line items into approved/export-ready invoice % (42501)', NEW.invoice_id;
+                END IF;
+            END IF;
+
             RETURN NEW;
         END IF;
+
+        RETURN NEW;
     END;
     $$;
 

@@ -60,6 +60,12 @@ def upgrade() -> None:
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_service_user') THEN
             CREATE ROLE worker_service_user WITH LOGIN IN ROLE worker_owner;
         END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_service_user_1') THEN
+            CREATE ROLE worker_service_user_1 WITH LOGIN IN ROLE worker_owner;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_service_user_2') THEN
+            CREATE ROLE worker_service_user_2 WITH LOGIN IN ROLE worker_owner;
+        END IF;
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'audit_service_user') THEN
             CREATE ROLE audit_service_user WITH LOGIN IN ROLE audit_writer;
         END IF;
@@ -139,6 +145,7 @@ def upgrade() -> None:
         v_result jsonb := '{}'::jsonb;
         v_elem jsonb;
         v_arr jsonb := '[]'::jsonb;
+        v_key_clean text;
     BEGIN
         IF p_data IS NULL THEN
             RETURN NULL;
@@ -146,7 +153,21 @@ def upgrade() -> None:
 
         IF jsonb_typeof(p_data) = 'object' THEN
             FOR v_key, v_val IN SELECT * FROM jsonb_each(p_data) LOOP
-                IF lower(v_key) ~* '(password|secret|token|pan|aadhaar|bank_account|account_number|key|credentials|auth|private_key|jwt)' THEN
+                v_key_clean := lower(trim(v_key));
+                
+                -- Refined regex matching sensitive keys & credential variants without false-positives on innocent words
+                IF v_key_clean ~* '(^|_)password($|_)'
+                   OR v_key_clean ~* '(^|_)secret($|_)'
+                   OR v_key_clean ~* '(^|_)(api_)?token($|_)'
+                   OR v_key_clean ~* '(^|_)(access|refresh|auth)_token($|_)'
+                   OR v_key_clean ~* '(^|_)pan($|_)'
+                   OR v_key_clean ~* '(^|_)aadhaar($|_)'
+                   OR v_key_clean ~* '(^|_)(bank_)?account(_number)?($|_)'
+                   OR v_key_clean ~* '(^|_)(api_key|private_key|secret_key)($|_)'
+                   OR v_key_clean ~* '(^|_)credentials($|_)'
+                   OR v_key_clean ~* '(^|_)authorization($|_)'
+                   OR v_key_clean ~* '(^|_)jwt($|_)'
+                   OR v_key_clean IN ('key', 'token', 'auth', 'secret', 'password', 'pan', 'aadhaar', 'cvv', 'pin') THEN
                     v_result := jsonb_set(v_result, ARRAY[v_key], '"[REDACTED]"'::jsonb);
                 ELSIF jsonb_typeof(v_val) IN ('object', 'array') THEN
                     v_result := jsonb_set(v_result, ARRAY[v_key], audit.redact_sensitive_keys(v_val));
