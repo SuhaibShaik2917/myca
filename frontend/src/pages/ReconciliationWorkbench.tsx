@@ -11,6 +11,9 @@ export const ReconciliationWorkbench: React.FC = () => {
   const [toleranceTaxable, setToleranceTaxable] = useState("1.00");
   const [toleranceTax, setToleranceTax] = useState("1.00");
   const [toleranceTotal, setToleranceTotal] = useState("2.00");
+  const [toleranceCgst, setToleranceCgst] = useState("1.00");
+  const [toleranceSgst, setToleranceSgst] = useState("1.00");
+  const [toleranceIgst, setToleranceIgst] = useState("1.00");
 
   const [matches, setMatches] = useState([
     {
@@ -159,25 +162,55 @@ export const ReconciliationWorkbench: React.FC = () => {
         </div>
 
         {/* Configurable Tolerances Bar */}
-        <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 flex flex-wrap items-center gap-6 text-xs">
+        <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 flex flex-wrap items-center gap-5 text-xs">
           <span className="font-semibold text-slate-700 flex items-center gap-1.5">
             <Filter className="w-3.5 h-3.5 text-slate-500" /> Tolerances:
           </span>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             <label className="text-slate-600">Taxable:</label>
             <input
               type="text"
               value={toleranceTaxable}
               onChange={e => setToleranceTaxable(e.target.value)}
-              className="w-16 px-2 py-1 border border-slate-300 rounded font-mono text-center"
+              className="w-14 px-2 py-0.5 border border-slate-300 rounded font-mono text-center"
             />
             <span className="text-slate-400">₹</span>
           </div>
-          <div className="flex items-center gap-2">
-            <label className="text-slate-600">Tax:</label>
+          <div className="flex items-center gap-1.5">
+            <label className="text-slate-600">Total Tax:</label>
             <input
               type="text"
               value={toleranceTax}
+              onChange={e => setToleranceTax(e.target.value)}
+              className="w-14 px-2 py-0.5 border border-slate-300 rounded font-mono text-center"
+            />
+            <span className="text-slate-400">₹</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <label className="text-slate-600">CGST/SGST/IGST:</label>
+            <input
+              type="text"
+              value={toleranceCgst}
+              onChange={e => {
+                setToleranceCgst(e.target.value);
+                setToleranceSgst(e.target.value);
+                setToleranceIgst(e.target.value);
+              }}
+              className="w-14 px-2 py-0.5 border border-slate-300 rounded font-mono text-center"
+            />
+            <span className="text-slate-400">₹</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <label className="text-slate-600">Total Value:</label>
+            <input
+              type="text"
+              value={toleranceTotal}
+              onChange={e => setToleranceTotal(e.target.value)}
+              className="w-14 px-2 py-0.5 border border-slate-300 rounded font-mono text-center"
+            />
+            <span className="text-slate-400">₹</span>
+          </div>
+        </div>
               onChange={e => setToleranceTax(e.target.value)}
               className="w-16 px-2 py-1 border border-slate-300 rounded font-mono text-center"
             />

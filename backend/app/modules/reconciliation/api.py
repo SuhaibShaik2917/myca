@@ -15,11 +15,13 @@ from app.modules.reconciliation.schemas import (
     PurchaseDocumentCreate, ReconciliationRunConfig, ReconciliationSummaryOut,
     MatchDetailOut, VarianceDetailOut, MatchCategoryEnum, ITCAssessmentOut,
     HumanResolutionRequest, HumanResolutionResponse, PurchasePaymentRequest,
-    GSTR3BTable4WorkingOutput, ITCRiskEvaluateRequest
+    GSTR3BTable4WorkingOutput, ITCRiskEvaluateRequest,
+    GSTRegistrationCreate, GSTRegistrationOut, GSTR2BRecomputeRequest, GSTR2BRecomputeResponse
 )
 from app.modules.reconciliation.gstr2b_parser import parse_gstr2b_json, parse_gstr2b_excel
 from app.modules.reconciliation.purchase_service import (
     create_purchase_document, approve_purchase_document, record_purchase_payment,
+    mark_purchase_doc_availed_in_3b,
     DuplicatePurchaseDocumentError, PurchaseServiceError
 )
 from app.modules.reconciliation.matching_engine import DeterministicReconciliationEngine
@@ -27,6 +29,128 @@ from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
 from app.modules.reconciliation.gstr3b_itc import generate_gstr3b_table4_summary
 
 router = APIRouter(prefix="/reconciliation", tags=["GSTR-2B & Purchase Reconciliation"])
+
+
+# -----------------------------------------------------------------------------
+# 0. Multi-GST Registration Management under PAN
+# -----------------------------------------------------------------------------
+
+@router.post("/gst-registrations/create", response_model=GSTRegistrationOut)
+def create_gst_registration(
+    payload: GSTRegistrationCreate,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Creates a GST registration under the organization's PAN.
+    Validates PAN consistency (chars 3-12 match organization PAN)
+    and enforces partial unique index for primary registration.
+    """
+    org_row = db.execute(
+        text("SELECT pan FROM public.organizations WHERE id = :org;"),
+        {"org": x_org_id}
+    ).fetchone()
+    if not org_row or not org_row.pan:
+        raise HTTPException(status_code=400, detail="Organization PAN is not configured")
+
+    gstin_clean = payload.gstin.strip().upper()
+    extracted_pan = gstin_clean[2:12]
+    if extracted_pan != org_row.pan.strip().upper():
+        raise HTTPException(
+            status_code=400,
+            detail=f"GSTIN PAN ({extracted_pan}) does not match organization PAN ({org_row.pan})."
+        )
+
+    if payload.is_primary:
+        existing_primary = db.execute(
+            text("SELECT id FROM public.gst_registrations WHERE org_id = :org AND is_primary = true;"),
+            {"org": x_org_id}
+        ).fetchone()
+        if existing_primary:
+            raise HTTPException(
+                status_code=409,
+                detail="Organization already has a primary GST registration. Only one primary registration is permitted."
+            )
+
+    dup_gstin = db.execute(
+        text("SELECT id FROM public.gst_registrations WHERE org_id = :org AND gstin = :gstin;"),
+        {"org": x_org_id, "gstin": gstin_clean}
+    ).fetchone()
+    if dup_gstin:
+        raise HTTPException(status_code=409, detail=f"GSTIN {gstin_clean} is already registered for this organization.")
+
+    reg_id = str(uuid.uuid4())
+    now_ts = datetime.utcnow()
+
+    db.execute(
+        text("""
+        INSERT INTO public.gst_registrations (
+            id, org_id, gstin, state_code, trade_name, legal_name,
+            registration_type, is_primary, created_at, updated_at
+        ) VALUES (
+            :id, :org_id, :gstin, :state_code, :trade_name, :legal_name,
+            :reg_type, :is_primary, :ts, :ts
+        );
+        """),
+        {
+            "id": reg_id,
+            "org_id": x_org_id,
+            "gstin": gstin_clean,
+            "state_code": payload.state_code,
+            "trade_name": payload.trade_name,
+            "legal_name": payload.legal_name,
+            "reg_type": payload.registration_type,
+            "is_primary": payload.is_primary,
+            "ts": now_ts
+        }
+    )
+    db.commit()
+
+    return GSTRegistrationOut(
+        id=reg_id,
+        org_id=x_org_id,
+        gstin=gstin_clean,
+        state_code=payload.state_code,
+        trade_name=payload.trade_name,
+        legal_name=payload.legal_name,
+        registration_type=payload.registration_type,
+        is_primary=payload.is_primary,
+        created_at=now_ts.isoformat()
+    )
+
+
+@router.get("/gst-registrations", response_model=List[GSTRegistrationOut])
+def list_gst_registrations(
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """Lists all GST registrations belonging to this organization."""
+    rows = db.execute(
+        text("""
+        SELECT id, org_id, gstin, state_code, trade_name, legal_name,
+               registration_type, is_primary, created_at
+        FROM public.gst_registrations
+        WHERE org_id = :org
+        ORDER BY is_primary DESC, created_at ASC;
+        """),
+        {"org": x_org_id}
+    ).fetchall()
+
+    return [
+        GSTRegistrationOut(
+            id=str(r.id),
+            org_id=str(r.org_id),
+            gstin=r.gstin,
+            state_code=r.state_code,
+            trade_name=r.trade_name,
+            legal_name=r.legal_name,
+            registration_type=r.registration_type,
+            is_primary=r.is_primary,
+            created_at=r.created_at.isoformat() if hasattr(r.created_at, "isoformat") else str(r.created_at)
+        )
+        for r in rows
+    ]
 
 
 # -----------------------------------------------------------------------------
@@ -213,13 +337,14 @@ def upload_gstr2b(
                 or "ISD" in doc.section_name.upper()
             ) else "NO_ACTION"
 
+            is_deemed = (initial_ims == "NO_ACTION")
             db.execute(
                 text("""
                 INSERT INTO public.ims_document_actions (
                     id, org_id, gstr2b_doc_id, supplier_doc_reference,
-                    current_action, gstr2b_return_period
+                    current_action, gstr2b_return_period, deemed_accepted_at_generation
                 ) VALUES (
-                    :id, :org_id, :g_doc_id, :ref, :action, :rp
+                    :id, :org_id, :g_doc_id, :ref, :action, :rp, :deemed
                 );
                 """),
                 {
@@ -228,7 +353,8 @@ def upload_gstr2b(
                     "g_doc_id": doc_id,
                     "ref": f"{doc.supplier_gstin or 'UNKNOWN'}:{doc.document_number}",
                     "action": initial_ims,
-                    "rp": rp
+                    "rp": rp,
+                    "deemed": is_deemed
                 }
             )
 
@@ -376,6 +502,21 @@ def set_ims_action(
             detail=f"IMS actions for period {ims_row.gstr2b_return_period} are frozen because GSTR-3B has been filed."
         )
 
+    # Statutory IMS Rule: Credit Notes cannot be kept Pending by recipient
+    if payload.action.value == "PENDING":
+        doc_type_row = db.execute(
+            text("SELECT document_type, section_name FROM public.gstr2b_source_documents WHERE id = :id AND org_id = :org;"),
+            {"id": payload.gstr2b_doc_id, "org": x_org_id}
+        ).fetchone()
+        if doc_type_row:
+            dt = (doc_type_row.document_type or "").lower()
+            sec = (doc_type_row.section_name or "").upper()
+            if "CREDIT" in dt.upper() or "CRN" in dt.upper() or "CDNR" in sec:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Credit Notes cannot be marked as PENDING in IMS; only ACCEPT or REJECT is permitted by statutory rules."
+                )
+
     prev_action = ims_row.current_action
     now_ts = datetime.utcnow()
 
@@ -407,6 +548,184 @@ def set_ims_action(
         action_timestamp=now_ts.isoformat(),
         is_frozen_by_gstr3b=False
     )
+
+
+@router.post("/gstr2b/recompute", response_model=GSTR2BRecomputeResponse)
+def recompute_gstr2b(
+    payload: GSTR2BRecomputeRequest,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Recomputes GSTR-2B statement snapshot after IMS recipient action changes.
+    Enforces statutory lifecycle:
+    - Blocked if period is frozen by GSTR-3B filing.
+    - Excludes 'PENDING' documents from the current period's GSTR-2B available total (held in IMS).
+    - Excludes 'REJECTED' documents.
+    - Includes 'ACCEPTED' and 'DEEMED_ACCEPTED' / 'NO_ACTION' documents where itc_availability == 'available'.
+    - Deactivates previous snapshot and creates Snapshot Version N+1.
+    - Preserves action history in ims_document_actions.
+    """
+    # 1. Check if frozen by GSTR-3B
+    frozen_check = db.execute(
+        text("""
+        SELECT 1 FROM public.ims_document_actions
+        WHERE org_id = :org AND gstr2b_return_period = :rp AND is_frozen_by_gstr3b = true
+        LIMIT 1;
+        """),
+        {"org": x_org_id, "rp": payload.return_period}
+    ).fetchone()
+    if frozen_check:
+        raise HTTPException(
+            status_code=403,
+            detail=f"GSTR-2B recomputation for period {payload.return_period} is blocked because GSTR-3B has already been filed."
+        )
+
+    # 2. Fetch current active snapshot
+    curr_snapshot = db.execute(
+        text("""
+        SELECT id, import_id, registration_id, recipient_gstin, return_period, version_number
+        FROM public.gstr2b_snapshots
+        WHERE id = :sid AND org_id = :org;
+        """),
+        {"sid": payload.snapshot_id, "org": x_org_id}
+    ).fetchone()
+    if not curr_snapshot:
+        raise HTTPException(status_code=404, detail="GSTR-2B snapshot not found")
+
+    # 3. Fetch all source documents and their latest IMS actions
+    doc_rows = db.execute(
+        text("""
+        SELECT d.id, d.itc_availability, d.taxable_value, d.integrated_tax,
+               d.central_tax, d.state_ut_tax, d.cess_amount,
+               COALESCE(a.current_action, 'NO_ACTION') as ims_action
+        FROM public.gstr2b_source_documents d
+        LEFT JOIN public.ims_document_actions a ON d.id = a.gstr2b_doc_id AND d.org_id = a.org_id
+        WHERE d.snapshot_id = :sid AND d.org_id = :org;
+        """),
+        {"sid": payload.snapshot_id, "org": x_org_id}
+    ).fetchall()
+
+    new_avail = Decimal("0.00")
+    new_not_avail = Decimal("0.00")
+    accepted_count = 0
+    pending_count = 0
+    rejected_count = 0
+
+    for d in doc_rows:
+        tax = Decimal(str((d.integrated_tax or 0) + (d.central_tax or 0) + (d.state_ut_tax or 0) + (d.cess_amount or 0)))
+        act = d.ims_action
+
+        if d.itc_availability == "not_available":
+            new_not_avail += tax
+        else:
+            if act in ("ACCEPTED", "DEEMED_ACCEPTED", "NO_ACTION"):
+                new_avail += tax
+                accepted_count += 1
+            elif act == "PENDING":
+                pending_count += 1
+                # Statutory rule: Pending records do NOT flow into generated GSTR-2B (held in IMS)
+            elif act == "REJECTED":
+                rejected_count += 1
+                new_not_avail += tax
+            else:
+                new_avail += tax
+                accepted_count += 1
+
+    # 4. Deactivate old snapshot
+    db.execute(
+        text("UPDATE public.gstr2b_snapshots SET is_active = false WHERE id = :id AND org_id = :org;"),
+        {"id": curr_snapshot.id, "org": x_org_id}
+    )
+
+    # 5. Insert new Snapshot Version N+1
+    new_version = curr_snapshot.version_number + 1
+    new_snap_id = str(uuid.uuid4())
+    now_ts = datetime.utcnow()
+
+    db.execute(
+        text("""
+        INSERT INTO public.gstr2b_snapshots (
+            id, org_id, import_id, registration_id, recipient_gstin,
+            return_period, version_number, previous_snapshot_id,
+            total_itc_available, total_itc_not_available, is_active
+        ) VALUES (
+            :id, :org_id, :import_id, :reg_id, :gstin,
+            :rp, :ver, :prev_id, :avail, :not_avail, true
+        );
+        """),
+        {
+            "id": new_snap_id,
+            "org_id": x_org_id,
+            "import_id": curr_snapshot.import_id,
+            "reg_id": curr_snapshot.registration_id,
+            "gstin": curr_snapshot.recipient_gstin,
+            "rp": curr_snapshot.return_period,
+            "ver": new_version,
+            "prev_id": curr_snapshot.id,
+            "avail": new_avail,
+            "not_avail": new_not_avail
+        }
+    )
+
+    # 6. Mark ims_document_actions as recomputed
+    db.execute(
+        text("""
+        UPDATE public.ims_document_actions
+        SET recomputed_at = :ts
+        WHERE org_id = :org AND gstr2b_return_period = :rp;
+        """),
+        {"org": x_org_id, "rp": curr_snapshot.return_period, "ts": now_ts}
+    )
+
+    db.commit()
+
+    return GSTR2BRecomputeResponse(
+        new_snapshot_id=new_snap_id,
+        previous_snapshot_id=str(curr_snapshot.id),
+        version_number=new_version,
+        return_period=curr_snapshot.return_period,
+        recipient_gstin=curr_snapshot.recipient_gstin,
+        total_itc_available=new_avail,
+        total_itc_not_available=new_not_avail,
+        accepted_docs_count=accepted_count,
+        pending_docs_held_count=pending_count,
+        rejected_docs_count=rejected_count,
+        recomputed_at=now_ts.isoformat()
+    )
+
+
+@router.post("/gstr3b/file-freeze")
+def freeze_ims_on_gstr3b_filing(
+    registration_id: str = Query(...),
+    return_period: str = Query(...),
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Freezes all IMS actions for a specific registration and return period upon GSTR-3B filing.
+    Prevents any further action modification or GSTR-2B recomputation.
+    """
+    now_ts = datetime.utcnow()
+    res = db.execute(
+        text("""
+        UPDATE public.ims_document_actions
+        SET is_frozen_by_gstr3b = true,
+            gstr3b_filing_date = :ts,
+            updated_at = :ts
+        WHERE org_id = :org AND gstr2b_return_period = :rp;
+        """),
+        {"org": x_org_id, "rp": return_period, "ts": now_ts}
+    )
+    db.commit()
+    return {
+        "status": "frozen",
+        "return_period": return_period,
+        "frozen_timestamp": now_ts.isoformat(),
+        "rows_affected": res.rowcount
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -912,6 +1231,18 @@ def get_gstr3b_table4_summary(
     ).fetchall()
     approved_set = {str(r.id) for r in approved_rows}
 
+    # 7. Reclaims / Reavailment Events
+    rec_rows = db.execute(
+        text("""
+        SELECT r.*
+        FROM public.itc_reavailment_events r
+        JOIN public.purchase_documents p ON r.purchase_doc_id = p.id AND r.org_id = p.org_id
+        WHERE p.registration_id = :reg_id AND r.reavailment_period = :rp AND r.org_id = :org;
+        """),
+        {"reg_id": registration_id, "rp": return_period, "org": x_org_id}
+    ).fetchall()
+    reclaims = [dict(r._mapping) for r in rec_rows]
+
     return generate_gstr3b_table4_summary(
         return_period=return_period,
         recipient_gstin=reg_row.gstin,
@@ -919,5 +1250,32 @@ def get_gstr3b_table4_summary(
         purchase_docs=purchase_docs,
         matches=matches,
         assessments=assessments,
-        human_approved_ids=approved_set
+        human_approved_ids=approved_set,
+        reclaims=reclaims
     )
+
+
+# -----------------------------------------------------------------------------
+# 8. Purchase Register GSTR-3B Availment Tracking (Rule 37A)
+# -----------------------------------------------------------------------------
+
+@router.post("/purchase/avail-in-3b")
+def avail_purchase_document_in_3b(
+    purchase_doc_id: str = Query(..., description="Purchase document UUID"),
+    return_period: str = Query(..., description="GSTR-3B tax period YYYY-MM"),
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Marks an inward purchase document as availed in GSTR-3B for a specific return period.
+    Statutory prerequisite for assessing Rule 37A supplier non-filing reversal risk.
+    """
+    res = mark_purchase_doc_availed_in_3b(
+        session=db,
+        org_id=x_org_id,
+        doc_id=purchase_doc_id,
+        return_period=return_period
+    )
+    db.commit()
+    return res

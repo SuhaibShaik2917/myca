@@ -144,25 +144,96 @@ class StatutoryITCRiskEngine:
             ))
 
         # -------------------------------------------------------------
-        # 5. Rule 37A: Supplier GSTR-3B Non-Filing Assessment
+        # 5. Rule 37A: Supplier GSTR-3B Non-Filing Statutory Assessment
         # -------------------------------------------------------------
         if gstr2b_doc:
-            # Check if supplier filing details are provided in raw payload or status
             source_payload = gstr2b_doc.get("raw_payload") or {}
-            gstr3b_status = source_payload.get("gstr3b_status", "FILED")
-            if str(gstr3b_status).upper() == "NOT_FILED":
+            gstr3b_status_raw = source_payload.get("gstr3b_status")
+            gstr3b_status = str(gstr3b_status_raw).upper() if gstr3b_status_raw else "UNKNOWN"
+            is_availed_in_3b = purchase_doc.get("is_availed_in_3b", False)
+
+            # Financial Year determination: FY end is 31st March
+            fy_end_year = inv_year if inv_month <= 3 else inv_year + 1
+            supplier_filing_deadline = date(fy_end_year, 9, 30)
+            recipient_reversal_deadline = date(fy_end_year, 11, 30)
+
+            if not is_availed_in_3b:
+                # Rule 37A explicitly applies only where ITC was availed by recipient in GSTR-3B
+                logger.debug("Purchase doc %s not availed in GSTR-3B; Rule 37A reversal not triggered.", p_id)
+            elif gstr3b_status == "UNKNOWN":
+                # Do not assume non-compliance when authoritative portal data is missing
                 assessments.append(ITCAssessmentOut(
                     purchase_doc_id=p_id,
                     gstr2b_doc_id=g_id,
                     rule_code="RULE_37A_NON_FILING",
                     statutory_section="Rule 37A",
-                    eligibility_status=ITCEligibilityEnum.RULE_37A_RISK,
+                    eligibility_status=ITCEligibilityEnum.SUPPLIER_STATUS_UNKNOWN,
                     potential_itc=total_tax,
-                    risk_reversal_amount=total_tax,
-                    findings_explanation="Supplier reported invoice in GSTR-1 but has not furnished GSTR-3B return. ITC must be reversed by 30th November if return remains unfiled.",
-                    missing_evidence_required="Obtain supplier GSTR-3B filing acknowledgement or ARN.",
+                    risk_reversal_amount=Decimal("0.00"),
+                    findings_explanation="Authoritative supplier GSTR-3B filing status is unknown/uncommunicated by GST portal. No reversal assessed pending verification.",
+                    missing_evidence_required="Obtain supplier GSTR-3B filing acknowledgement or portal confirmation.",
                     evaluation_date=str(eval_dt)
                 ))
+            elif gstr3b_status == "NOT_FILED":
+                if eval_dt <= supplier_filing_deadline:
+                    # Before 30th September of following FY: supplier still has statutory time
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="RULE_37A_NON_FILING",
+                        statutory_section="Rule 37A",
+                        eligibility_status=ITCEligibilityEnum.POTENTIALLY_ELIGIBLE,
+                        potential_itc=total_tax,
+                        risk_reversal_amount=Decimal("0.00"),
+                        findings_explanation=f"Supplier GSTR-3B is currently unfiled, but supplier has until statutory cut-off 30th September {fy_end_year} to furnish return.",
+                        missing_evidence_required="Monitor supplier GSTR-3B filing until 30th September cut-off.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                elif eval_dt <= recipient_reversal_deadline:
+                    # Between 1st Oct and 30th Nov: reversal required; no interest under proviso
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="RULE_37A_NON_FILING",
+                        statutory_section="Rule 37A",
+                        eligibility_status=ITCEligibilityEnum.RULE_37A_RISK,
+                        potential_itc=total_tax,
+                        risk_reversal_amount=total_tax,
+                        findings_explanation=f"Supplier failed to furnish GSTR-3B by statutory cut-off 30th September {fy_end_year}. Mandatory reversal of ₹{total_tax} required in GSTR-3B on or before 30th November {fy_end_year}. No interest payable under Rule 37A proviso if reversed before deadline.",
+                        missing_evidence_required="Reverse credit in Form GSTR-3B Table 4(B)(2) on or before 30th November.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                else:
+                    # After 30th Nov: reversal required along with 18% p.a. interest under Section 50
+                    days_delayed = (eval_dt - recipient_reversal_deadline).days
+                    interest_liability = (total_tax * Decimal("0.18") * Decimal(days_delayed) / Decimal("365")).quantize(Decimal("0.01"))
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="RULE_37A_NON_FILING",
+                        statutory_section="Rule 37A",
+                        eligibility_status=ITCEligibilityEnum.RULE_37A_RISK,
+                        potential_itc=total_tax,
+                        risk_reversal_amount=total_tax,
+                        findings_explanation=f"Supplier unfiled past 30th September {fy_end_year}. Recipient reversal deadline 30th November {fy_end_year} exceeded by {days_delayed} days. Mandatory reversal of ₹{total_tax} plus Section 50 interest at 18% p.a. (estimated ₹{interest_liability}).",
+                        missing_evidence_required="Pay reversed ITC along with applicable Section 50 interest.",
+                        evaluation_date=str(eval_dt)
+                    ))
+            elif gstr3b_status == "FILED":
+                # Supplier filed return; check if previously reversed for re-availment
+                if purchase_doc.get("status") == "reversed" or purchase_doc.get("previously_reversed_under_37a"):
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="RULE_37A_NON_FILING",
+                        statutory_section="Rule 37A",
+                        eligibility_status=ITCEligibilityEnum.REAVAILMENT_REVIEW_REQUIRED,
+                        potential_itc=total_tax,
+                        risk_reversal_amount=Decimal("0.00"),
+                        findings_explanation="Supplier has subsequently furnished GSTR-3B return. Recipient is legally eligible to re-avail previously reversed ITC under Rule 37A second proviso in Form GSTR-3B Table 4(A)(5) and report in 4(D)(1).",
+                        missing_evidence_required="Record re-availment in current period GSTR-3B Table 4(A)(5) and 4(D)(1).",
+                        evaluation_date=str(eval_dt)
+                    ))
 
         # -------------------------------------------------------------
         # 6. Section 17(5): Blocked Credit Catalogue Checks
@@ -260,3 +331,80 @@ class StatutoryITCRiskEngine:
             ))
 
         return assessments
+
+    def evaluate_rule_37a_details(
+        self,
+        purchase_doc: Dict[str, Any],
+        gstr2b_doc: Optional[Dict[str, Any]] = None,
+        evaluation_date: Optional[date] = None
+    ) -> Rule37AFilingCheck:
+        """
+        Detailed statutory evaluation of Rule 37A with separate 30-Sept supplier cut-off
+        and 30-Nov recipient reversal deadline, un-availed exclusion, and 18% p.a. interest.
+        """
+        eval_dt = evaluation_date or date.today()
+        p_id = str(purchase_doc["id"])
+        supplier_gstin = str(purchase_doc.get("supplier_gstin") or "UNKNOWN")
+        p_date_raw = purchase_doc.get("document_date")
+        p_date = datetime.strptime(str(p_date_raw)[:10], "%Y-%m-%d").date() if p_date_raw else eval_dt
+
+        inv_year = p_date.year
+        inv_month = p_date.month
+        fy_end_year = inv_year if inv_month <= 3 else inv_year + 1
+        supplier_filing_deadline = date(fy_end_year, 9, 30)
+        recipient_reversal_deadline = date(fy_end_year, 11, 30)
+
+        source_payload = (gstr2b_doc.get("raw_payload") or {}) if gstr2b_doc else {}
+        gstr3b_status_raw = source_payload.get("gstr3b_status")
+        gstr3b_status = str(gstr3b_status_raw).upper() if gstr3b_status_raw else "UNKNOWN"
+        is_availed_in_3b = purchase_doc.get("is_availed_in_3b", False)
+
+        cgst = Decimal(str(purchase_doc.get("cgst_amount") or 0))
+        sgst = Decimal(str(purchase_doc.get("sgst_amount") or 0))
+        igst = Decimal(str(purchase_doc.get("igst_amount") or 0))
+        cess = Decimal(str(purchase_doc.get("cess_amount") or 0))
+        total_tax = cgst + sgst + igst + cess
+
+        reversal_required = False
+        reversal_amount = Decimal("0.00")
+        interest_liability = Decimal("0.00")
+        reavailment_eligible = False
+        risk_status = ITCEligibilityEnum.ELIGIBLE_EVIDENCE_COMPLETE
+
+        if not is_availed_in_3b:
+            risk_status = ITCEligibilityEnum.ELIGIBLE_EVIDENCE_COMPLETE
+        elif gstr3b_status == "UNKNOWN":
+            risk_status = ITCEligibilityEnum.SUPPLIER_STATUS_UNKNOWN
+        elif gstr3b_status == "NOT_FILED":
+            if eval_dt <= supplier_filing_deadline:
+                risk_status = ITCEligibilityEnum.POTENTIALLY_ELIGIBLE
+            elif eval_dt <= recipient_reversal_deadline:
+                reversal_required = True
+                reversal_amount = total_tax
+                risk_status = ITCEligibilityEnum.RULE_37A_RISK
+            else:
+                reversal_required = True
+                reversal_amount = total_tax
+                days_delayed = (eval_dt - recipient_reversal_deadline).days
+                interest_liability = (total_tax * Decimal("0.18") * Decimal(days_delayed) / Decimal("365")).quantize(Decimal("0.01"))
+                risk_status = ITCEligibilityEnum.RULE_37A_RISK
+        elif gstr3b_status == "FILED":
+            if purchase_doc.get("status") == "reversed" or purchase_doc.get("previously_reversed_under_37a"):
+                reavailment_eligible = True
+                risk_status = ITCEligibilityEnum.REAVAILMENT_REVIEW_REQUIRED
+
+        return Rule37AFilingCheck(
+            purchase_doc_id=p_id,
+            supplier_gstin=supplier_gstin,
+            invoice_date=str(p_date),
+            gstr1_reported_period=gstr2b_doc.get("source_gstr1_filing_period", "") if gstr2b_doc else "",
+            supplier_gstr3b_status=gstr3b_status,
+            supplier_filing_deadline=str(supplier_filing_deadline),
+            recipient_reversal_deadline=str(recipient_reversal_deadline),
+            is_availed_in_3b=is_availed_in_3b,
+            reversal_required=reversal_required,
+            reversal_amount=reversal_amount,
+            interest_liability=interest_liability,
+            reavailment_eligible=reavailment_eligible,
+            risk_status=risk_status
+        )

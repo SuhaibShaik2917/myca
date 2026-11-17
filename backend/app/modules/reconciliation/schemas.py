@@ -42,6 +42,27 @@ class ITCEligibilityEnum(str, Enum):
     REAVAILMENT_REVIEW_REQUIRED = "REAVAILMENT_REVIEW_REQUIRED"
 
 
+class GSTRegistrationCreate(BaseModel):
+    gstin: str
+    state_code: str
+    trade_name: Optional[str] = None
+    legal_name: str
+    registration_type: str = "regular"
+    is_primary: bool = False
+
+
+class GSTRegistrationOut(BaseModel):
+    id: str
+    org_id: str
+    gstin: str
+    state_code: str
+    trade_name: Optional[str] = None
+    legal_name: str
+    registration_type: str
+    is_primary: bool
+    created_at: str
+
+
 # --- GSTR-2B Ingest Models ---
 
 class GSTR2BDocumentItem(BaseModel):
@@ -122,6 +143,8 @@ class PurchaseDocumentCreate(BaseModel):
     goods_receipt_date: Optional[str] = None
     goods_receipt_note_ref: Optional[str] = None
     purchase_ledger_code: Optional[str] = None
+    is_availed_in_3b: bool = False
+    availed_period: Optional[str] = None
     line_items: List[PurchaseLineItemIn] = []
 
 
@@ -212,9 +235,16 @@ class Rule37PaymentCheck(BaseModel):
 class Rule37AFilingCheck(BaseModel):
     purchase_doc_id: str
     supplier_gstin: str
+    invoice_date: str
     gstr1_reported_period: str
     supplier_gstr3b_status: str  # FILED, NOT_FILED, UNKNOWN
-    reversal_deadline: str  # 30th November
+    supplier_filing_deadline: str  # 30th September of following FY
+    recipient_reversal_deadline: str  # 30th November of following FY
+    is_availed_in_3b: bool = False
+    reversal_required: bool = False
+    reversal_amount: Decimal = Decimal("0.00")
+    interest_liability: Decimal = Decimal("0.00")  # 18% p.a. under Sec 50 if past 30 Nov
+    reavailment_eligible: bool = False  # True if previously reversed and supplier subsequently filed
     risk_status: ITCEligibilityEnum
 
 
@@ -224,29 +254,54 @@ class GSTR3BTable4WorkingOutput(BaseModel):
     disclaimer: str = "Outward/Inward Reconciled GSTR-3B Table 4 Working Summary. Not official tax advice."
     return_period: str
     recipient_gstin: str
-    # 4(A) ITC Available
-    itc_available_import_goods: Decimal = Decimal("0.00")
-    itc_available_import_services: Decimal = Decimal("0.00")
-    itc_available_inward_reverse_charge: Decimal = Decimal("0.00")
-    itc_available_isd: Decimal = Decimal("0.00")
-    itc_available_all_other: Decimal = Decimal("0.00")
-    total_itc_available: Decimal = Decimal("0.00")
+    # 4(A) ITC Available (whether in full or in part)
+    itc_available_import_goods: Decimal = Decimal("0.00")              # 4(A)(1)
+    itc_available_import_services: Decimal = Decimal("0.00")           # 4(A)(2)
+    itc_available_inward_reverse_charge: Decimal = Decimal("0.00")     # 4(A)(3)
+    itc_available_isd: Decimal = Decimal("0.00")                       # 4(A)(4)
+    itc_available_all_other: Decimal = Decimal("0.00")                 # 4(A)(5) (B2B, includes amounts to be reversed under 4(B)(1))
+    total_itc_available: Decimal = Decimal("0.00")                     # Sum of 4(A)(1)..(5)
     # 4(B) ITC Reversed
-    itc_reversed_rule_38_42_43: Decimal = Decimal("0.00")
-    itc_reversed_rule_37_180_days: Decimal = Decimal("0.00")
-    itc_reversed_rule_37a: Decimal = Decimal("0.00")
-    itc_reversed_other: Decimal = Decimal("0.00")
-    total_itc_reversed: Decimal = Decimal("0.00")
-    # 4(C) Net ITC
-    net_itc_available: Decimal = Decimal("0.00")
-    # 4(D) Other Ineligible
-    ineligible_sec_17_5_blocked: Decimal = Decimal("0.00")
+    itc_reversed_rule_38_42_43: Decimal = Decimal("0.00")              # 4(B)(1) Non-reclaimable: Rules 38, 42, 43 and Section 17(5)
+    itc_reversed_rule_37_180_days: Decimal = Decimal("0.00")           # Part of 4(B)(2) Reclaimable
+    itc_reversed_rule_37a: Decimal = Decimal("0.00")                   # Part of 4(B)(2) Reclaimable
+    itc_reversed_other: Decimal = Decimal("0.00")                      # Part of 4(B)(2) Reclaimable
+    total_itc_reversed_reclaimable_4b2: Decimal = Decimal("0.00")     # Total 4(B)(2)
+    total_itc_reversed: Decimal = Decimal("0.00")                     # Total 4(B) = 4(B)(1) + 4(B)(2)
+    # 4(C) Net ITC Available
+    net_itc_available: Decimal = Decimal("0.00")                       # 4(C) = 4(A) - 4(B)
+    # 4(D) Other Details (Reporting & Ineligible)
+    itc_reclaimed_earlier_reversal_4d1: Decimal = Decimal("0.00")      # 4(D)(1) Reclaimed ITC previously reversed under 4(B)(2) (NEVER 17(5))
+    ineligible_sec_16_4_and_pos_restrictions_4d2: Decimal = Decimal("0.00") # 4(D)(2) Ineligible from GSTR-2B Table 4 unavailable
+    ineligible_sec_17_5_blocked: Decimal = Decimal("0.00")             # Section 17(5) blocked credit (included in 4(B)(1))
     ineligible_other: Decimal = Decimal("0.00")
-    # Distinct Subtotals (Statutory Non-Confused Totals)
+    # Distinct Subtotals (Statutory Provenance Non-Confused Totals)
     subtotal_gstr2b_portal_available: Decimal = Decimal("0.00")
     subtotal_books_matched: Decimal = Decimal("0.00")
     subtotal_legally_eligible: Decimal = Decimal("0.00")
     subtotal_human_approved: Decimal = Decimal("0.00")
+
+
+# --- Recomputation Models ---
+
+class GSTR2BRecomputeRequest(BaseModel):
+    registration_id: str
+    return_period: str
+    snapshot_id: str
+
+
+class GSTR2BRecomputeResponse(BaseModel):
+    new_snapshot_id: str
+    previous_snapshot_id: str
+    version_number: int
+    return_period: str
+    recipient_gstin: str
+    total_itc_available: Decimal
+    total_itc_not_available: Decimal
+    accepted_docs_count: int
+    pending_docs_held_count: int
+    rejected_docs_count: int
+    recomputed_at: str
 
 
 # --- Human Resolution & Payment Requests ---

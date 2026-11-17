@@ -8,8 +8,8 @@ export const ItcRiskDashboard: React.FC = () => {
   const statutorySubtotals = {
     portalAvailable: "4,82,500.00",
     booksMatched: "4,64,500.00",
-    legallyEligible: "4,32,000.00",
-    humanApproved: "4,15,000.00"
+    legallyEligible: "3,54,600.00",
+    humanApproved: "3,54,600.00"
   };
 
   const rule37AgingRows = [
@@ -43,9 +43,11 @@ export const ItcRiskDashboard: React.FC = () => {
       supplierName: "Reliance Polymers Dist",
       gstr1Period: "2026-02",
       supplierGstr3bStatus: "NOT_FILED",
-      deadline: "30-Nov-2026",
+      supplierCutoff: "30-Sep-2026",
+      reversalDeadline: "30-Nov-2026",
       itcExposure: "32,400.00",
-      actionNeeded: "Reverse in Nov 2026 GSTR-3B"
+      interestRate: "18% p.a. past 30-Nov",
+      actionNeeded: "Reverse in Nov 2026 GSTR-3B under Table 4(B)(2)"
     }
   ];
 
@@ -172,12 +174,12 @@ export const ItcRiskDashboard: React.FC = () => {
           <div className="flex items-center justify-between pb-2 border-b border-slate-100">
             <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider flex items-center gap-1.5">
               <AlertOctagon className="w-4 h-4 text-rose-600" />
-              Rule 37A: Supplier Non-Filing Risk
+              Rule 37A: Supplier Non-Filing Risk (Dual Deadlines)
             </h3>
-            <span className="text-[11px] text-rose-600 font-semibold font-mono">Deadline: 30-Nov</span>
+            <span className="text-[11px] text-rose-600 font-semibold font-mono">Cut-off: 30-Sep | Reversal: 30-Nov</span>
           </div>
           <p className="text-[11px] text-slate-500">
-            Supplier reported in GSTR-1 but failed to furnish Form GSTR-3B. ITC must be reversed by 30th November.
+            Supplier reported in GSTR-1 but failed to furnish Form GSTR-3B by 30th September. ITC must be reversed by 30th November. If reversed after 30th November, 18% p.a. interest applies under Section 50.
           </p>
           <div className="border border-slate-200 rounded-lg overflow-hidden">
             <table className="w-full text-left text-xs font-mono">
@@ -185,6 +187,7 @@ export const ItcRiskDashboard: React.FC = () => {
                 <tr>
                   <th className="px-2.5 py-1.5 font-semibold">Supplier GSTIN</th>
                   <th className="px-2.5 py-1.5 text-center font-semibold">3B Status</th>
+                  <th className="px-2.5 py-1.5 text-center font-semibold">Statutory Deadlines</th>
                   <th className="px-2.5 py-1.5 text-right font-semibold">ITC at Risk (₹)</th>
                 </tr>
               </thead>
@@ -199,6 +202,10 @@ export const ItcRiskDashboard: React.FC = () => {
                       <span className="px-1.5 py-0.5 rounded text-[10px] bg-rose-100 text-rose-800 font-bold">
                         {row.supplierGstr3bStatus}
                       </span>
+                    </td>
+                    <td className="px-2.5 py-2 text-center font-sans text-[10px]">
+                      <div className="text-amber-700 font-medium">Cutoff: {row.supplierCutoff}</div>
+                      <div className="text-rose-700 font-bold">Reversal: {row.reversalDeadline}</div>
                     </td>
                     <td className="px-2.5 py-2 text-right font-bold text-rose-700">₹{row.itcExposure}</td>
                   </tr>
@@ -320,45 +327,53 @@ export const ItcRiskDashboard: React.FC = () => {
                 </td>
               </tr>
               <tr>
-                <td className="px-4 py-2 pl-8 font-sans text-slate-700">(1) Rule 37 (180-Day Non-Payment)</td>
+                <td className="px-4 py-2 pl-8 font-sans text-slate-700">(1) As per rules 38, 42 and 43 of CGST Rules and section 17(5) (Non-Reclaimable Reversals)</td>
+                <td className="px-4 py-2 text-right text-rose-600">65,000.00</td>
+                <td className="px-4 py-2 text-right text-rose-600">6,250.00</td>
+                <td className="px-4 py-2 text-right text-rose-600">6,250.00</td>
                 <td className="px-4 py-2 text-right text-rose-600">0.00</td>
-                <td className="px-4 py-2 text-right text-rose-600">9,000.00</td>
-                <td className="px-4 py-2 text-right text-rose-600">9,000.00</td>
-                <td className="px-4 py-2 text-right text-rose-600">0.00</td>
-                <td className="px-4 py-2 text-right font-bold text-rose-700">18,000.00</td>
+                <td className="px-4 py-2 text-right font-bold text-rose-700">77,500.00</td>
               </tr>
               <tr>
-                <td className="px-4 py-2 pl-8 font-sans text-slate-700">(2) Rule 37A (Supplier 3B Non-Filing)</td>
+                <td className="px-4 py-2 pl-8 font-sans text-slate-700">(2) Others: Rule 37 (180-Day Non-Payment ₹18,000) + Rule 37A (Supplier Non-Filing ₹32,400) (Reclaimable)</td>
                 <td className="px-4 py-2 text-right text-rose-600">32,400.00</td>
+                <td className="px-4 py-2 text-right text-rose-600">9,000.00</td>
+                <td className="px-4 py-2 text-right text-rose-600">9,000.00</td>
                 <td className="px-4 py-2 text-right text-rose-600">0.00</td>
-                <td className="px-4 py-2 text-right text-rose-600">0.00</td>
-                <td className="px-4 py-2 text-right text-rose-600">0.00</td>
-                <td className="px-4 py-2 text-right font-bold text-rose-700">32,400.00</td>
+                <td className="px-4 py-2 text-right font-bold text-rose-700">50,400.00</td>
               </tr>
 
               {/* 4(C) Net ITC */}
               <tr className="bg-indigo-50 font-sans font-bold text-slate-900">
-                <td className="px-4 py-2.5">(C) Net ITC Available (A) - (B)</td>
-                <td className="px-4 py-2.5 text-right font-mono">1,72,600.00</td>
-                <td className="px-4 py-2.5 text-right font-mono">1,29,750.00</td>
-                <td className="px-4 py-2.5 text-right font-mono">1,29,750.00</td>
+                <td className="px-4 py-2.5">(C) Net ITC Available (A) - (B) [4(A) ₹4,82,500 - 4(B)(1) ₹77,500 - 4(B)(2) ₹50,400]</td>
+                <td className="px-4 py-2.5 text-right font-mono">1,07,600.00</td>
+                <td className="px-4 py-2.5 text-right font-mono">1,23,500.00</td>
+                <td className="px-4 py-2.5 text-right font-mono">1,23,500.00</td>
                 <td className="px-4 py-2.5 text-right font-mono">0.00</td>
-                <td className="px-4 py-2.5 text-right font-mono text-indigo-700 text-sm">4,32,100.00</td>
+                <td className="px-4 py-2.5 text-right font-mono text-indigo-700 text-sm font-extrabold">3,54,600.00</td>
               </tr>
 
-              {/* 4(D) Other Ineligible */}
+              {/* 4(D) Other Details */}
               <tr className="bg-purple-50/40 font-sans font-bold text-slate-800">
                 <td colSpan={6} className="px-4 py-2 text-[11px] text-purple-800">
-                  (D) Other Disclosures & Ineligible ITC
+                  (D) Other Details
                 </td>
               </tr>
               <tr>
-                <td className="px-4 py-2 pl-8 font-sans text-slate-700">(1) Ineligible under Section 17(5)</td>
-                <td className="px-4 py-2 text-right text-purple-700">65,000.00</td>
-                <td className="px-4 py-2 text-right text-purple-700">6,250.00</td>
-                <td className="px-4 py-2 text-right text-purple-700">6,250.00</td>
+                <td className="px-4 py-2 pl-8 font-sans text-slate-700">(1) ITC reclaimed which was reversed under Table 4(B)(2) in earlier tax period (Never Section 17(5))</td>
                 <td className="px-4 py-2 text-right text-purple-700">0.00</td>
-                <td className="px-4 py-2 text-right font-bold text-purple-900">77,500.00</td>
+                <td className="px-4 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-4 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-4 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-4 py-2 text-right font-bold text-purple-900">0.00</td>
+              </tr>
+              <tr>
+                <td className="px-4 py-2 pl-8 font-sans text-slate-700">(2) Ineligible ITC under section 16(4) & PoS restrictions (from GSTR-2B Table 4 unavailable; never added to 4(A))</td>
+                <td className="px-4 py-2 text-right text-purple-700">12,400.00</td>
+                <td className="px-4 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-4 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-4 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-4 py-2 text-right font-bold text-purple-900">12,400.00</td>
               </tr>
             </tbody>
           </table>

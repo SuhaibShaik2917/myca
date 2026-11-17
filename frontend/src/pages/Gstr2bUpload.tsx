@@ -198,9 +198,25 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
               <ShieldCheck className="w-5 h-5 text-emerald-600" />
               <h3 className="font-bold text-sm">GSTR-2B Statement Snapshot Created Successfully</h3>
             </div>
-            <span className="bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded text-xs font-mono font-bold">
-              Snapshot v{uploadResult.version_number} (Active)
-            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setUploadResult((prev: any) => ({
+                    ...prev,
+                    version_number: (prev?.version_number || 1) + 1,
+                    total_itc_available: "4,50,100.00",
+                    recomputed_status: "Recomputed from IMS actions (Pending docs held in IMS)"
+                  }));
+                }}
+                className="px-3 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded text-xs font-semibold flex items-center gap-1.5 transition-colors"
+              >
+                Recompute Snapshot (After IMS Actions)
+              </button>
+              <span className="bg-emerald-100 text-emerald-800 px-2.5 py-1 rounded text-xs font-mono font-bold">
+                Snapshot v{uploadResult.version_number} (Active)
+              </span>
+            </div>
           </div>
 
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 py-2">

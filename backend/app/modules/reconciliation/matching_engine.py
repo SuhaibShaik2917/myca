@@ -43,11 +43,19 @@ class DeterministicReconciliationEngine:
         taxable_tolerance: Decimal = Decimal("1.00"),
         tax_tolerance: Decimal = Decimal("1.00"),
         total_tolerance: Decimal = Decimal("2.00"),
+        cgst_tolerance: Optional[Decimal] = None,
+        sgst_tolerance: Optional[Decimal] = None,
+        igst_tolerance: Optional[Decimal] = None,
+        cess_tolerance: Optional[Decimal] = None,
         engine_version: str = "v2.1_deterministic"
     ):
         self.taxable_tolerance = taxable_tolerance
         self.tax_tolerance = tax_tolerance
         self.total_tolerance = total_tolerance
+        self.cgst_tolerance = cgst_tolerance if cgst_tolerance is not None else tax_tolerance
+        self.sgst_tolerance = sgst_tolerance if sgst_tolerance is not None else tax_tolerance
+        self.igst_tolerance = igst_tolerance if igst_tolerance is not None else tax_tolerance
+        self.cess_tolerance = cess_tolerance if cess_tolerance is not None else Decimal("1.00")
         self.engine_version = engine_version
 
     def run_reconciliation(
@@ -206,9 +214,16 @@ class DeterministicReconciliationEngine:
                 diff_taxable = abs(p_taxable - g_taxable)
                 diff_tax = abs(p_tax - g_tax)
                 diff_total = abs(p_total - g_total)
+                diff_cgst = abs(Decimal(str(p_doc.get("cgst_amount") or 0)) - Decimal(str(g_doc.get("central_tax") or 0)))
+                diff_sgst = abs(Decimal(str(p_doc.get("sgst_amount") or 0)) - Decimal(str(g_doc.get("state_ut_tax") or 0)))
+                diff_igst = abs(Decimal(str(p_doc.get("igst_amount") or 0)) - Decimal(str(g_doc.get("integrated_tax") or 0)))
 
-                # Check tolerances
-                if diff_taxable <= self.taxable_tolerance and diff_tax <= self.tax_tolerance:
+                # Check component-level and total tolerances
+                if (diff_taxable <= self.taxable_tolerance and
+                    diff_tax <= self.tax_tolerance and
+                    diff_cgst <= self.cgst_tolerance and
+                    diff_sgst <= self.sgst_tolerance and
+                    diff_igst <= self.igst_tolerance):
                     matched_purchase_ids.add(p_id)
                     matched_gstr2b_ids.add(g_id)
                     matches.append(MatchDetailOut(

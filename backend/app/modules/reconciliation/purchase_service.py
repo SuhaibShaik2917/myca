@@ -27,7 +27,8 @@ def create_purchase_document(
 ) -> Dict[str, Any]:
     """
     Creates an inward purchase document in the purchase register.
-    Validates GST registration ownership, enforces unique constraint on (org_id, supplier_gstin, doc_num, doc_date),
+    Validates GST registration ownership, enforces unique constraint on
+    (org_id, registration_id, supplier_gstin, document_type, document_number, document_date),
     and persists line items.
     """
     # 1. Verify registration exists for this org
@@ -38,26 +39,30 @@ def create_purchase_document(
     if not reg_check:
         raise PurchaseServiceError(f"GST registration {payload.registration_id} not found for this organization")
 
-    # 2. Check duplicate
+    # 2. Check duplicate with registration_id and document_type
     dup_check = session.execute(
         text("""
         SELECT id FROM public.purchase_documents
         WHERE org_id = :org_id
-          AND supplier_gstin = :supplier_gstin
+          AND registration_id = :reg_id
+          AND ((supplier_gstin = :supplier_gstin) OR (supplier_gstin IS NULL AND :supplier_gstin IS NULL))
+          AND document_type = :doc_type
           AND document_number = :doc_num
           AND document_date = :doc_date;
         """),
         {
             "org_id": org_id,
+            "reg_id": payload.registration_id,
             "supplier_gstin": payload.supplier_gstin,
+            "doc_type": payload.document_type,
             "doc_num": payload.document_number,
             "doc_date": payload.document_date
         }
     ).fetchone()
     if dup_check:
         raise DuplicatePurchaseDocumentError(
-            f"Purchase document {payload.document_number} dated {payload.document_date} "
-            f"from supplier {payload.supplier_gstin} already exists."
+            f"Purchase document {payload.document_number} ({payload.document_type}) dated {payload.document_date} "
+            f"for registration {payload.registration_id} from supplier {payload.supplier_gstin} already exists."
         )
 
     # Calculate financial totals from lines if omitted
@@ -85,14 +90,16 @@ def create_purchase_document(
             recipient_gstin, place_of_supply, is_reverse_charge, supply_category,
             total_taxable_amount, cgst_amount, sgst_amount, igst_amount, cess_amount,
             total_invoice_value, goods_services_type, goods_receipt_date,
-            goods_receipt_note_ref, purchase_ledger_code, status
+            goods_receipt_note_ref, purchase_ledger_code, status,
+            is_availed_in_3b, availed_period
         ) VALUES (
             :id, :org_id, :registration_id, :document_type, :document_number,
             :document_date, :financial_period, :supplier_gstin, :supplier_legal_name,
             :recipient_gstin, :place_of_supply, :is_reverse_charge, :supply_category,
             :total_taxable_amount, :cgst_amount, :sgst_amount, :igst_amount, :cess_amount,
             :total_invoice_value, :goods_services_type, :goods_receipt_date,
-            :goods_receipt_note_ref, :purchase_ledger_code, 'draft'
+            :goods_receipt_note_ref, :purchase_ledger_code, 'draft',
+            :is_availed_in_3b, :availed_period
         ) RETURNING id, status, created_at;
         """),
         {
@@ -119,6 +126,8 @@ def create_purchase_document(
             "goods_receipt_date": payload.goods_receipt_date,
             "goods_receipt_note_ref": payload.goods_receipt_note_ref,
             "purchase_ledger_code": payload.purchase_ledger_code,
+            "is_availed_in_3b": getattr(payload, "is_availed_in_3b", False),
+            "availed_period": getattr(payload, "availed_period", None)
         }
     ).fetchone()
 
@@ -274,3 +283,37 @@ def record_purchase_payment(
         "total_amount_paid": str(total_amount_paid),
         "allocation_count": len(created_allocations)
     }
+
+
+def mark_purchase_doc_availed_in_3b(
+    session: Session,
+    org_id: str,
+    doc_id: str,
+    return_period: str
+) -> Dict[str, Any]:
+    """
+    Marks a purchase register document as availed in GSTR-3B for a specific return period.
+    Required for statutory Rule 37A tracking.
+    """
+    row = session.execute(
+        text("""
+        UPDATE public.purchase_documents
+        SET is_availed_in_3b = true,
+            availed_period = :rp,
+            updated_at = clock_timestamp()
+        WHERE id = :id AND org_id = :org_id
+        RETURNING id, document_number, is_availed_in_3b, availed_period;
+        """),
+        {"id": doc_id, "org_id": org_id, "rp": return_period}
+    ).fetchone()
+
+    if not row:
+        raise PurchaseServiceError(f"Purchase document {doc_id} not found for this organization")
+
+    return {
+        "id": str(row.id),
+        "document_number": row.document_number,
+        "is_availed_in_3b": row.is_availed_in_3b,
+        "availed_period": row.availed_period
+    }
+

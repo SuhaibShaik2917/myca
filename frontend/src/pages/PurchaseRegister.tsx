@@ -146,10 +146,33 @@ export const PurchaseRegister: React.FC = () => {
       {/* Add Document Drawer / Form */}
       {showAddForm && (
         <form onSubmit={handleCreateDocument} className="bg-slate-50 border border-slate-300 rounded-xl p-6 space-y-4 shadow-inner">
-          <h3 className="text-sm font-bold text-slate-800 border-b border-slate-200 pb-2">
-            New Inward Purchase Invoice
+          <h3 className="text-sm font-bold text-slate-800 border-b border-slate-200 pb-2 flex items-center justify-between">
+            <span>New Inward Purchase Document</span>
+            <span className="text-[11px] font-normal text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200">
+              Registration Scoped under PAN: AABCB1234M
+            </span>
           </h3>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
+            <div>
+              <label className="block font-semibold text-slate-700 mb-1">GST Registration (Branch)</label>
+              <select
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg font-mono focus:ring-2 focus:ring-indigo-500"
+              >
+                <option value="reg-01">27AABCB1234M1ZT (MH Primary)</option>
+                <option value="reg-02">24AABCB1234M1ZR (GJ Branch)</option>
+              </select>
+            </div>
+            <div>
+              <label className="block font-semibold text-slate-700 mb-1">Document Type</label>
+              <select
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+              >
+                <option value="tax_invoice">Tax Invoice</option>
+                <option value="debit_note">Debit Note</option>
+                <option value="credit_note">Credit Note</option>
+                <option value="rcm_self_invoice">RCM Self Invoice</option>
+              </select>
+            </div>
             <div>
               <label className="block font-semibold text-slate-700 mb-1">Supplier GSTIN</label>
               <input
@@ -172,6 +195,8 @@ export const PurchaseRegister: React.FC = () => {
                 required
               />
             </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
             <div>
               <label className="block font-semibold text-slate-700 mb-1">Invoice / Doc Number</label>
               <input
