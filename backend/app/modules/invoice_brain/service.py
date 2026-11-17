@@ -42,6 +42,7 @@ def upload_and_enqueue_invoice(
     """
     Stage 1: Multipart upload, SHA-256 deduplication, storage isolation,
     initial invoice creation, and controlled task enqueuing.
+    Guarantees no orphaned files on disk if database insertion or task enqueuing fails.
     """
     doc_id = str(uuid.uuid4())
     inv_id = str(uuid.uuid4())
@@ -53,97 +54,109 @@ def upload_and_enqueue_invoice(
         doc_id=doc_id
     )
 
-    # 2. Check for duplicate document in this organization
-    dup_stmt = text("""
-        SELECT id FROM public.documents
-        WHERE org_id = :org_id AND sha256_checksum = :sha
-        LIMIT 1;
-    """)
-    existing_doc = session.execute(dup_stmt, {"org_id": org_id, "sha": sha256_checksum}).fetchone()
-    if existing_doc:
-        # Clean up the newly written duplicate file
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise DuplicateDocumentError(f"Duplicate document detected (matches existing document {existing_doc[0]})")
+    try:
+        # 2. Check for duplicate document in this organization (application check)
+        dup_stmt = text("""
+            SELECT id FROM public.documents
+            WHERE org_id = :org_id AND sha256_checksum = :sha
+            LIMIT 1;
+        """)
+        existing_doc = session.execute(dup_stmt, {"org_id": org_id, "sha": sha256_checksum}).fetchone()
+        if existing_doc:
+            raise DuplicateDocumentError(f"Duplicate document detected (matches existing document {existing_doc[0]})")
 
-    # 3. Insert into public.documents
-    doc_insert_stmt = text("""
-        INSERT INTO public.documents (
-            id, org_id, doc_type, file_name, file_path,
-            mime_type, file_size_bytes, sha256_checksum, uploaded_by
-        ) VALUES (
-            :id, :org_id, 'invoice', :file_name, :file_path,
-            :mime_type, :file_size, :sha, :uploaded_by
-        );
-    """)
-    session.execute(doc_insert_stmt, {
-        "id": doc_id,
-        "org_id": org_id,
-        "file_name": file_name,
-        "file_path": file_path,
-        "mime_type": mime_type,
-        "file_size": file_size,
-        "sha": sha256_checksum,
-        "uploaded_by": user_id
-    })
-
-    # 4. Insert into public.invoices (MUST start with status='uploaded')
-    inv_insert_stmt = text("""
-        INSERT INTO public.invoices (
-            id, org_id, profile_id, invoice_number, invoice_date,
-            counterparty_name, total_taxable_amount, cgst_amount,
-            sgst_amount, igst_amount, total_amount, currency,
-            status, document_id
-        ) VALUES (
-            :id, :org_id, :profile_id, :inv_num, CURRENT_DATE,
-            'Pending OCR Extraction', 0.00, 0.00,
-            0.00, 0.00, 0.00, 'INR',
-            'uploaded', :doc_id
-        );
-    """)
-    session.execute(inv_insert_stmt, {
-        "id": inv_id,
-        "org_id": org_id,
-        "profile_id": profile_id,
-        "inv_num": f"TEMP-{inv_id[:8].upper()}",
-        "doc_id": doc_id
-    })
-
-    # 5. Enqueue OCR task through controlled enqueue_task function
-    task_stmt = text("""
-        SELECT public.enqueue_task(
-            'invoice_ocr',
-            CAST(:payload AS jsonb),
-            CAST(:org_id AS uuid)
-        );
-    """)
-    task_id = session.execute(task_stmt, {
-        "payload": json.dumps({
-            "invoice_id": inv_id,
-            "document_id": doc_id,
+        # 3. Insert into public.documents (protected by uq_documents_org_sha256 constraint)
+        doc_insert_stmt = text("""
+            INSERT INTO public.documents (
+                id, org_id, doc_type, file_name, file_path,
+                mime_type, file_size_bytes, sha256_checksum, uploaded_by
+            ) VALUES (
+                :id, :org_id, 'invoice', :file_name, :file_path,
+                :mime_type, :file_size, :sha, :uploaded_by
+            );
+        """)
+        session.execute(doc_insert_stmt, {
+            "id": doc_id,
+            "org_id": org_id,
+            "file_name": file_name,
             "file_path": file_path,
-            "mime_type": mime_type
-        }),
-        "org_id": org_id
-    }).scalar()
+            "mime_type": mime_type,
+            "file_size": file_size,
+            "sha": sha256_checksum,
+            "uploaded_by": user_id
+        })
 
-    # 6. Audit log event
-    audit_stmt = text("""
-        SELECT audit.log_audit_event(
-            CAST(:org_id AS uuid),
-            'invoices',
-            CAST(:inv_id AS text),
-            'CREATE'::public.audit_action,
-            NULL,
-            CAST(:details AS jsonb),
-            '{"source": "invoice_brain"}'::jsonb
-        );
-    """)
-    session.execute(audit_stmt, {
-        "inv_id": inv_id,
-        "details": json.dumps({"document_id": doc_id, "file_name": file_name, "size": file_size}),
-        "org_id": org_id
-    })
+        # 4. Insert into public.invoices (MUST start with status='uploaded')
+        inv_insert_stmt = text("""
+            INSERT INTO public.invoices (
+                id, org_id, profile_id, invoice_number, invoice_date,
+                counterparty_name, total_taxable_amount, cgst_amount,
+                sgst_amount, igst_amount, total_amount, currency,
+                status, document_id
+            ) VALUES (
+                :id, :org_id, :profile_id, :inv_num, CURRENT_DATE,
+                'Pending OCR Extraction', 0.00, 0.00,
+                0.00, 0.00, 0.00, 'INR',
+                'uploaded', :doc_id
+            );
+        """)
+        session.execute(inv_insert_stmt, {
+            "id": inv_id,
+            "org_id": org_id,
+            "profile_id": profile_id,
+            "inv_num": f"TEMP-{inv_id[:8].upper()}",
+            "doc_id": doc_id
+        })
+
+        # 5. Enqueue OCR task through controlled enqueue_task function
+        task_stmt = text("""
+            SELECT public.enqueue_task(
+                'invoice_ocr',
+                CAST(:payload AS jsonb),
+                CAST(:org_id AS uuid)
+            );
+        """)
+        task_id = session.execute(task_stmt, {
+            "payload": json.dumps({
+                "invoice_id": inv_id,
+                "document_id": doc_id,
+                "file_path": file_path,
+                "mime_type": mime_type
+            }),
+            "org_id": org_id
+        }).scalar()
+
+        # 6. Audit log event
+        audit_stmt = text("""
+            SELECT audit.log_audit_event(
+                CAST(:org_id AS uuid),
+                'invoices',
+                CAST(:inv_id AS text),
+                'CREATE'::public.audit_action,
+                NULL,
+                CAST(:details AS jsonb),
+                '{"source": "invoice_brain"}'::jsonb
+            );
+        """)
+        session.execute(audit_stmt, {
+            "inv_id": inv_id,
+            "details": json.dumps({"document_id": doc_id, "file_name": file_name, "size": file_size}),
+            "org_id": org_id
+        })
+
+        session.flush()
+
+    except Exception as e:
+        # Atomic storage cleanup: delete saved file if DB insert, enqueue, or constraint fails
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+        if isinstance(e, DuplicateDocumentError) or "uq_documents_org_sha256" in str(e) or "unique constraint" in str(e).lower():
+            raise DuplicateDocumentError(f"Duplicate document detected (matches existing document SHA-256 {sha256_checksum})") from e
+        raise e
 
     return InvoiceUploadResponse(
         invoice_id=uuid.UUID(inv_id),
@@ -163,12 +176,16 @@ def process_invoice_ocr_task(
     document_id: str,
     org_id: str,
     file_path: str,
-    mime_type: str
+    mime_type: str,
+    lease_token: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Stage 2 & 3: Worker execution of OCR extraction and GST validation.
     Runs under worker_service_user connection.
-    Guarantees that OCR extraction never silently transitions to approved!
+    Guarantees that:
+    1. Worker line items are replaced ONLY via controlled replace_ocr_line_items() using active lease_token.
+    2. Invoices in 'pending_review', 'approved', 'rejected', or 'export_ready' are NEVER overwritten on worker retry.
+    3. OCR extraction never silently transitions directly to approved.
     Transitions: uploaded -> queued -> processing -> extracted -> (pending_review OR validation_failed).
     """
     with db_conn.cursor() as cur:
@@ -188,14 +205,33 @@ def process_invoice_ocr_task(
         # Fetch current invoice status
         cur.execute("SELECT status FROM public.invoices WHERE id = %s;", (invoice_id,))
         status_row = cur.fetchone()
-        curr_status = status_row[0] if status_row else None
+        if not status_row:
+            raise InvoiceBrainError(f"Invoice {invoice_id} not found")
+        curr_status = status_row[0]
 
-        # State transition into processing (supporting initial run and worker task retries)
+        # CRITICAL INTEGRITY CHECK: Protect human corrections and immutable statuses against worker retries
+        if curr_status in ('pending_review', 'validation_failed', 'approved', 'rejected', 'export_ready'):
+            logger.warning(
+                f"Task {task_id} attempted OCR processing on invoice {invoice_id} with protected status '{curr_status}'. "
+                "Skipping to preserve human edits and immutable states."
+            )
+            return {
+                "invoice_id": invoice_id,
+                "status": curr_status,
+                "skipped": True,
+                "reason": f"Protected status '{curr_status}' preserved against worker retry"
+            }
+
+        # State transition into processing
         if curr_status == 'uploaded':
             cur.execute("UPDATE public.invoices SET status = 'queued' WHERE id = %s;", (invoice_id,))
             cur.execute("UPDATE public.invoices SET status = 'processing' WHERE id = %s;", (invoice_id,))
-        elif curr_status in ('queued', 'pending_review', 'validation_failed'):
+        elif curr_status == 'queued':
             cur.execute("UPDATE public.invoices SET status = 'processing' WHERE id = %s;", (invoice_id,))
+        elif curr_status == 'processing':
+            pass
+        else:
+            raise InvoiceStatusError(f"Invoice {invoice_id} in invalid status '{curr_status}' for OCR processing")
 
         # Stage 2: OCR extraction
         extracted = extract_invoice_with_gemini(file_path, mime_type)
@@ -230,28 +266,19 @@ def process_invoice_ocr_task(
             invoice_id
         ))
 
-        # Idempotent cleanup of any previous draft line items before insertion
-        cur.execute("DELETE FROM public.invoice_line_items WHERE invoice_id = %s;", (invoice_id,))
+        # Controlled Atomic Line-Item Replacement via SECURITY DEFINER function
+        if not lease_token:
+            raise ValueError(f"Active lease_token is required to invoke replace_ocr_line_items for task {task_id}")
 
-        # Insert extracted line items (draft state before approval)
-        raw_lines = []
-        for line in extracted.line_items:
-            line_id = str(uuid.uuid4())
-            cur.execute("""
-                INSERT INTO public.invoice_line_items (
-                    id, invoice_id, org_id, item_description, hsn_sac_code,
-                    quantity, unit_price, taxable_amount, gst_rate,
-                    cgst_amount, sgst_amount, igst_amount, total_amount
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                );
-            """, (
-                line_id, invoice_id, org_id,
-                line.item_description, line.hsn_sac_code,
-                line.quantity, line.unit_price, line.taxable_amount, line.gst_rate,
-                line.cgst_amount, line.sgst_amount, line.igst_amount, line.total_amount
-            ))
-            raw_lines.append(line.model_dump())
+        raw_lines = [line.model_dump() for line in extracted.line_items]
+        cur.execute("""
+            SELECT public.replace_ocr_line_items(%s, %s, %s, %s::jsonb);
+        """, (
+            task_id,
+            lease_token,
+            invoice_id,
+            json.dumps(raw_lines, default=str)
+        ))
 
         # Stage 3: GST Validation and Reconciliation
         validation = validate_invoice_financials(

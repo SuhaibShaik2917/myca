@@ -33,10 +33,14 @@ DB_WORKER = "postgresql:///myca?user=worker_service_user"
 client = TestClient(app)
 
 def random_pan():
-    return f"ABCDE{random.randint(1000, 9999)}F"
+    letters1 = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=5))
+    digits = f"{random.randint(1000, 9999)}"
+    letter2 = random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    return f"{letters1}{digits}{letter2}"
 
-def random_gstin():
-    base = f"27ABCDE{random.randint(1000, 9999)}F1Z"
+def random_gstin(state="27"):
+    pan = random_pan()
+    base = f"{state}{pan}1Z"
     return f"{base}{calculate_gstin_checksum(base)}"
 
 def random_email():
@@ -201,7 +205,8 @@ def test_stage2_and_3_ocr_extraction_and_validation(seeded_org):
             document_id=payload["document_id"],
             org_id=seeded_org["org_id"],
             file_path=payload["file_path"],
-            mime_type=payload["mime_type"]
+            mime_type=payload["mime_type"],
+            lease_token=lease_token
         )
 
         # Worker completes task
@@ -301,7 +306,8 @@ def test_stage4_human_review_and_field_correction(seeded_org):
         ocr_result = process_invoice_ocr_task(
             db_conn=conn, task_id=task_id, invoice_id=inv_id,
             document_id=payload["document_id"], org_id=seeded_org["org_id"],
-            file_path=payload["file_path"], mime_type=payload["mime_type"]
+            file_path=payload["file_path"], mime_type=payload["mime_type"],
+            lease_token=token
         )
         with conn.cursor() as cur:
             cur.execute("SELECT public.complete_task(%s, %s, %s::jsonb);", (task_id, token, psycopg.types.json.Jsonb(ocr_result)))
@@ -373,7 +379,8 @@ def test_stage5_gstr_working_outputs_generation(seeded_org):
         ocr_result = process_invoice_ocr_task(
             db_conn=conn, task_id=task_id, invoice_id=inv_id,
             document_id=payload["document_id"], org_id=seeded_org["org_id"],
-            file_path=payload["file_path"], mime_type=payload["mime_type"]
+            file_path=payload["file_path"], mime_type=payload["mime_type"],
+            lease_token=token
         )
         with conn.cursor() as cur:
             cur.execute("SELECT public.complete_task(%s, %s, %s::jsonb);", (task_id, token, psycopg.types.json.Jsonb(ocr_result)))

@@ -185,7 +185,8 @@ class WorkerRunner:
                         document_id=document_id,
                         org_id=self.org_id,
                         file_path=file_path,
-                        mime_type=mime_type
+                        mime_type=mime_type,
+                        lease_token=heartbeat.lease_token
                     )
                 else:
                     return {"status": "success", "task_type": task_type, "processed_task": task_id}

@@ -53,7 +53,7 @@ Ensure numeric precision is maintained. Return ONLY clean structured JSON adheri
 
 def extract_invoice_with_gemini(file_path: str, mime_type: str) -> ExtractedInvoiceData:
     """
-    Extracts structured invoice information using Google Gemini 2.5 Flash Vision.
+    Extracts structured invoice information using Google Gemini 2.0 Flash Vision.
     Falls back to deterministic parser ONLY in non-production development/test modes.
     PROHIBITED IN PRODUCTION: If ENVIRONMENT == 'production', mock fallback is strictly forbidden.
     """

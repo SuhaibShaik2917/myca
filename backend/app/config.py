@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     
     # Gemini AI
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-2.0-flash"
     
     @field_validator("SECRET_KEY")
     def validate_secret_key(cls, v, info):

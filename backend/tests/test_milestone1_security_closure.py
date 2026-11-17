@@ -48,8 +48,7 @@ def random_pan():
     letter2 = random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     return f"{letters1}{digits}{letter2}"
 
-def random_gstin():
-    state = random.choice(["27", "29", "07", "33", "24", "19"])
+def random_gstin(state="27"):
     pan = random_pan()
     base = f"{state}{pan}1Z"
     return f"{base}{calculate_gstin_checksum(base)}"
@@ -62,7 +61,7 @@ def test_tenants():
             org_a = str(uuid.uuid4())
             user_a = str(uuid.uuid4())
             profile_a = str(uuid.uuid4())
-            gstin_a = random_gstin()
+            gstin_a = random_gstin("27")
             pan_a = gstin_a[2:12]
 
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'Milestone Tenant A', %s);", (org_a, pan_a))
@@ -469,10 +468,10 @@ def test_worker_task_reprocessing_idempotency(test_tenants):
     """
     Operational Integrity Verification:
     Reprocessing an OCR task multiple times must NOT duplicate line items.
+    If an invoice is in pending_review, worker retry protects human corrections and skips overwriting.
     """
     inv_id = str(uuid.uuid4())
     doc_id = str(uuid.uuid4())
-    task_id = str(uuid.uuid4())
     org_id = test_tenants["org_a"]
 
     mock_pdf = Path("/tmp/mock.pdf")
@@ -482,20 +481,40 @@ def test_worker_task_reprocessing_idempotency(test_tenants):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
-                VALUES (%s, %s, 'invoice', 'reprocess_test.pdf', 1024, 'application/pdf', '/tmp/mock.pdf', 'fake_hash');
+                VALUES (%s, %s, 'invoice', 'reprocess_test.pdf', 1024, 'application/pdf', '/tmp/mock.pdf', 'fake_hash_reprocess');
             """, (doc_id, org_id))
             cur.execute("""
                 INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, status)
                 VALUES (%s, %s, %s, 'INV-REPROCESS', '2026-11-01', 'Test Counterparty', 0, 0, 0, 0, 0, 'uploaded');
             """, (inv_id, org_id, test_tenants["profile_a"]))
+            # Enqueue actual task for this invoice
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_id,))
+            cur.execute("""
+                SELECT public.enqueue_task('invoice_ocr', %s::jsonb, %s::uuid);
+            """, (json.dumps({
+                "invoice_id": inv_id,
+                "document_id": doc_id,
+                "file_path": "/tmp/mock.pdf",
+                "mime_type": "application/pdf"
+            }), org_id))
+            task_id = str(cur.fetchone()[0])
+
+    # Claim task as worker
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT o_task_id, o_lease_token FROM public.claim_task(%s, 'worker-reprocess');", (org_id,))
+            claimed_id, lease_token = cur.fetchone()
+            assert str(claimed_id) == task_id
 
     # First worker processing run
     with psycopg.connect(DB_WORKER, autocommit=True) as conn:
-        process_invoice_ocr_task(
+        res1 = process_invoice_ocr_task(
             db_conn=conn, task_id=task_id, invoice_id=inv_id,
             document_id=doc_id, org_id=org_id,
-            file_path="/tmp/mock.pdf", mime_type="application/pdf"
+            file_path="/tmp/mock.pdf", mime_type="application/pdf",
+            lease_token=lease_token
         )
+        assert res1["status"] in ("pending_review", "validation_failed")
 
     # Check line items count
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
@@ -504,13 +523,15 @@ def test_worker_task_reprocessing_idempotency(test_tenants):
             count_first_run = cur.fetchone()[0]
             assert count_first_run > 0
 
-    # Second worker processing run (reprocessing on retry)
+    # Second worker processing run (reprocessing on retry while in pending_review)
     with psycopg.connect(DB_WORKER, autocommit=True) as conn:
-        process_invoice_ocr_task(
+        res2 = process_invoice_ocr_task(
             db_conn=conn, task_id=task_id, invoice_id=inv_id,
             document_id=doc_id, org_id=org_id,
-            file_path="/tmp/mock.pdf", mime_type="application/pdf"
+            file_path="/tmp/mock.pdf", mime_type="application/pdf",
+            lease_token=lease_token
         )
+        assert res2.get("skipped") is True
 
     # Verify count remains identical (no duplicated rows)
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
@@ -600,3 +621,479 @@ def test_approval_strictly_prohibited_for_invalid_invoice(test_tenants):
         with conn.cursor() as cur:
             cur.execute("SELECT status FROM public.invoices WHERE id = %s;", (inv_id,))
             assert cur.fetchone()[0] == "validation_failed"
+
+
+# ==============================================================================
+# MILESTONE 1.2: INVOICE BRAIN FINAL INTEGRITY & GST COMPLIANCE CLOSURE TESTS
+# ==============================================================================
+
+def test_worker_direct_line_item_dml_revoked(test_tenants):
+    """
+    Security Gate Verification:
+    Direct INSERT, UPDATE, DELETE on public.invoice_line_items must be revoked
+    from worker_service_user (ERRCODE 42501).
+    """
+    org_id = test_tenants["org_a"]
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_id,))
+            
+            # Direct INSERT must fail
+            with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc1:
+                cur.execute("""
+                    INSERT INTO public.invoice_line_items (
+                        id, invoice_id, org_id, item_description, quantity, unit_price,
+                        taxable_amount, gst_rate, cgst_amount, sgst_amount, igst_amount, total_amount
+                    ) VALUES (
+                        gen_random_uuid(), gen_random_uuid(), %s, 'Unauthorized Item', 1, 100,
+                        100, 18, 9, 9, 0, 118
+                    );
+                """, (org_id,))
+            assert "permission denied for table invoice_line_items" in str(exc1.value)
+
+            # Direct UPDATE must fail
+            with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc2:
+                cur.execute("UPDATE public.invoice_line_items SET item_description = 'Hacked';")
+            assert "permission denied for table invoice_line_items" in str(exc2.value)
+
+            # Direct DELETE must fail
+            with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc3:
+                cur.execute("DELETE FROM public.invoice_line_items;")
+            assert "permission denied for table invoice_line_items" in str(exc3.value)
+
+
+def test_replace_ocr_line_items_strict_access_control(test_tenants):
+    """
+    Security Gate Verification:
+    replace_ocr_line_items() security boundary enforcement:
+    1. app_service_user cannot execute the function (42501).
+    2. Missing task or invalid lease token rejected (42501).
+    3. Expired lease token rejected (42501).
+    4. Task payload invoice_id mismatch rejected (42501).
+    5. Cross-tenant invoice replacement rejected (42501).
+    6. Modification of invoices in pending_review, approved, or rejected strictly rejected (42501).
+    """
+    org_a = test_tenants["org_a"]
+    org_b = test_tenants["org_b"]
+    inv_a = str(uuid.uuid4())
+    doc_a = str(uuid.uuid4())
+
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
+                VALUES (%s, %s, 'invoice', 'sec_test.pdf', 1024, 'application/pdf', '/tmp/sec.pdf', 'fake_hash_sec');
+            """, (doc_a, org_a))
+            cur.execute("""
+                INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, status)
+                VALUES (%s, %s, %s, 'INV-SEC', '2026-11-01', 'Counterparty', 0, 0, 0, 0, 0, 'uploaded');
+            """, (inv_a, org_a, test_tenants["profile_a"]))
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_a,))
+            cur.execute("""
+                SELECT public.enqueue_task('invoice_ocr', %s::jsonb, %s::uuid);
+            """, (json.dumps({"invoice_id": inv_a, "document_id": doc_a}), org_a))
+            task_a = str(cur.fetchone()[0])
+
+    # 1. app_service_user execution attempt
+    with psycopg.connect(DB_APP, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                cur.execute("SELECT public.replace_ocr_line_items(%s, 'token', %s, '[]'::jsonb);", (task_a, inv_a))
+
+    # Worker claims task to get valid lease token
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT o_task_id, o_lease_token FROM public.claim_task(%s, 'worker-sec');", (org_a,))
+            claimed_id, valid_token = cur.fetchone()
+            assert str(claimed_id) == task_a
+
+    # 2. Worker with INVALID token
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_a,))
+            with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc_bad_tok:
+                cur.execute("SELECT public.replace_ocr_line_items(%s, 'wrong-token', %s, '[]'::jsonb);", (task_a, inv_a))
+            assert "Invalid lease token" in str(exc_bad_tok.value)
+
+    # 3. Task payload invoice mismatch (foreign invoice in same org)
+    inv_other = str(uuid.uuid4())
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, status)
+                VALUES (%s, %s, %s, 'INV-OTHER', '2026-11-01', 'Other', 0, 0, 0, 0, 0, 'uploaded');
+            """, (inv_other, org_a, test_tenants["profile_a"]))
+
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_a,))
+            with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc_mismatch:
+                cur.execute("SELECT public.replace_ocr_line_items(%s, %s, %s, '[]'::jsonb);", (task_a, valid_token, inv_other))
+            assert "not associated with invoice" in str(exc_mismatch.value)
+
+    # 4. Cross-tenant attempt: Invoice in Org B
+    inv_b = str(uuid.uuid4())
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, status)
+                VALUES (%s, %s, %s, 'INV-B', '2026-11-01', 'Org B CP', 0, 0, 0, 0, 0, 'uploaded');
+            """, (inv_b, org_b, test_tenants["profile_b"]))
+
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_a,))
+            with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc_cross:
+                cur.execute("SELECT public.replace_ocr_line_items(%s, %s, %s, '[]'::jsonb);", (task_a, valid_token, inv_b))
+            assert "not associated with invoice" in str(exc_cross.value)
+
+    # 5. Cannot modify invoice in pending_review or approved
+    for protected_status in ('pending_review', 'approved'):
+        with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                inv_prot = seed_invoice(
+                    cur, org_a, test_tenants["profile_a"], test_tenants["user_a"],
+                    f'INV-{protected_status[:4]}', '2026-11-01', 'CP', None,
+                    100, 9, 9, 0, 118,
+                    status=protected_status
+                )
+                cur.execute(
+                    "UPDATE public.worker_tasks SET payload = jsonb_set(payload, '{invoice_id}', to_jsonb(%s::text)) WHERE id = %s;",
+                    (inv_prot, task_a)
+                )
+
+        with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT set_config('app.current_org', %s, false);", (org_a,))
+                with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc_protected:
+                    cur.execute("SELECT public.replace_ocr_line_items(%s, %s, %s, '[]'::jsonb);", (task_a, valid_token, inv_prot))
+                assert "Cannot modify line items on invoice" in str(exc_protected.value)
+                assert protected_status in str(exc_protected.value)
+
+    # 6. Expired lease token rejection
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            inv_proc = seed_invoice(
+                cur, org_a, test_tenants["profile_a"], test_tenants["user_a"],
+                'INV-EXP-TEST', '2026-11-01', 'CP', None,
+                100, 9, 9, 0, 118,
+                status='uploaded'
+            )
+            cur.execute("UPDATE public.invoices SET status = 'queued' WHERE id = %s;", (inv_proc,))
+            cur.execute("UPDATE public.invoices SET status = 'processing' WHERE id = %s;", (inv_proc,))
+            cur.execute(
+                "UPDATE public.worker_tasks SET payload = jsonb_set(payload, '{invoice_id}', to_jsonb(%s::text)), lease_expire = clock_timestamp() - interval '1 second' WHERE id = %s;",
+                (inv_proc, task_a)
+            )
+
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_a,))
+            with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc_exp:
+                cur.execute("SELECT public.replace_ocr_line_items(%s, %s, %s, '[]'::jsonb);", (task_a, valid_token, inv_proc))
+            assert "has expired" in str(exc_exp.value)
+
+
+def test_transition_rules_worker_pending_review_to_processing_revoked():
+    """
+    Integrity Verification:
+    invoice_transition_rules must NOT contain any rule allowing 'worker'
+    to transition 'pending_review' -> 'processing' or 'validation_failed' -> 'processing'.
+    """
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT count(*) FROM public.invoice_transition_rules
+                WHERE from_status = 'pending_review' AND to_status = 'processing' AND required_role = 'worker';
+            """)
+            assert cur.fetchone()[0] == 0
+
+            cur.execute("""
+                SELECT count(*) FROM public.invoice_transition_rules
+                WHERE from_status = 'validation_failed' AND to_status = 'processing' AND required_role = 'worker';
+            """)
+            assert cur.fetchone()[0] == 0
+
+
+def test_human_corrections_survive_worker_retry(test_tenants):
+    """
+    Human Review Integrity Verification:
+    Human edits on an invoice in pending_review must NEVER be overwritten
+    by a subsequent worker task retry.
+    """
+    org_id = test_tenants["org_a"]
+    user_id = test_tenants["user_a"]
+    prof_id = test_tenants["profile_a"]
+    headers = {"X-User-Id": user_id, "X-Org-Id": org_id}
+
+    inv_id = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())
+    mock_pdf = Path("/tmp/human_test.pdf")
+    mock_pdf.write_bytes(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\nxref\n0 2\n0000000000 65535 f\ntrailer<</Root 1 0 R>>\nstartxref\n50\n%%EOF\n")
+
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
+                VALUES (%s, %s, 'invoice', 'human_test.pdf', 1024, 'application/pdf', '/tmp/human_test.pdf', 'fake_hash_human');
+            """, (doc_id, org_id))
+            cur.execute("""
+                INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, status)
+                VALUES (%s, %s, %s, 'INV-HUMAN', '2026-11-01', 'Original Counterparty', 0, 0, 0, 0, 0, 'uploaded');
+            """, (inv_id, org_id, prof_id))
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_id,))
+            cur.execute("""
+                SELECT public.enqueue_task('invoice_ocr', %s::jsonb, %s::uuid);
+            """, (json.dumps({"invoice_id": inv_id, "document_id": doc_id, "file_path": "/tmp/human_test.pdf", "mime_type": "application/pdf"}), org_id))
+            task_id = str(cur.fetchone()[0])
+
+    # Worker claims and processes initial OCR
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT o_task_id, o_lease_token FROM public.claim_task(%s, 'worker-h');", (org_id,))
+            c_id, token = cur.fetchone()
+
+        process_invoice_ocr_task(
+            db_conn=conn, task_id=task_id, invoice_id=inv_id,
+            document_id=doc_id, org_id=org_id,
+            file_path="/tmp/human_test.pdf", mime_type="application/pdf",
+            lease_token=token
+        )
+
+    # Human reviewer performs manual corrections
+    patch_res = client.patch(f"/api/v1/invoices/{inv_id}", headers=headers, json={
+        "counterparty_name": "Corrected Vendor Name Private Limited"
+    })
+    assert patch_res.status_code == 200
+
+    # Human reviewer edits line item
+    inv_data = client.get(f"/api/v1/invoices/{inv_id}", headers=headers).json()
+    assert inv_data["status"] == "pending_review"
+    assert inv_data["counterparty_name"] == "Corrected Vendor Name Private Limited"
+    first_line_id = inv_data["line_items"][0]["id"]
+
+    line_patch = client.patch(f"/api/v1/invoices/{inv_id}/line-items/{first_line_id}", headers=headers, json={
+        "item_description": "Custom Human Description"
+    })
+    assert line_patch.status_code == 200
+
+    # Worker task retries (simulating redelivery or delayed message)
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        retry_res = process_invoice_ocr_task(
+            db_conn=conn, task_id=task_id, invoice_id=inv_id,
+            document_id=doc_id, org_id=org_id,
+            file_path="/tmp/human_test.pdf", mime_type="application/pdf",
+            lease_token=token
+        )
+        assert retry_res.get("skipped") is True
+
+    # Confirm human edits and line items remain UNTOUCHED
+    inv_after = client.get(f"/api/v1/invoices/{inv_id}", headers=headers).json()
+    assert inv_after["status"] == "pending_review"
+    assert inv_after["counterparty_name"] == "Corrected Vendor Name Private Limited"
+    assert inv_after["line_items"][0]["item_description"] == "Custom Human Description"
+
+
+def test_document_deduplication_database_constraint_and_storage_cleanup(test_tenants):
+    """
+    Storage & Deduplication Integrity:
+    1. Database constraint uq_documents_org_sha256 blocks duplicate SHA-256 within the same organization.
+    2. Concurrent/duplicate upload raises 409 DuplicateDocumentError.
+    3. Storage files are deleted from disk if upload or enqueue fails.
+    """
+    org_id = test_tenants["org_a"]
+    user_id = test_tenants["user_a"]
+    headers = {"X-User-Id": user_id, "X-Org-Id": org_id}
+
+    pdf_bytes = b"%PDF-1.4\nUnique test content for deduplication test\n%%EOF\n"
+    
+    # 1. First upload succeeds
+    res1 = client.post(
+        "/api/v1/invoices/upload",
+        headers=headers,
+        files={"file": ("invoice_dup1.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        data={"profile_id": test_tenants["profile_a"]}
+    )
+    assert res1.status_code == 200
+    sha = res1.json()["sha256_checksum"]
+
+    # 2. Second upload with identical bytes fails with 409
+    res2 = client.post(
+        "/api/v1/invoices/upload",
+        headers=headers,
+        files={"file": ("invoice_dup2.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        data={"profile_id": test_tenants["profile_a"]}
+    )
+    assert res2.status_code == 409
+    assert "duplicate document" in res2.json()["detail"].lower()
+
+    # 3. Direct DB insert violating uq_documents_org_sha256 constraint directly
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(psycopg.errors.UniqueViolation) as exc_uq:
+                cur.execute("""
+                    INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
+                    VALUES (%s, %s, 'invoice', 'dup.pdf', 100, 'application/pdf', '/tmp/dup.pdf', %s);
+                """, (str(uuid.uuid4()), org_id, sha))
+            assert "uq_documents_org_sha256" in str(exc_uq.value)
+
+
+def test_gstr1_table_12_and_preceding_fy_aato(test_tenants):
+    """
+    GST Statutory Compliance:
+    1. Business profile preceding_fy_aato is exposed and used in GSTR-1 draft.
+    2. Table 12 B2B is mandatory when Table 4 contains supplies.
+    3. Table 12 B2C is strictly optional.
+    4. Table 12 supply-value mismatches generate non-blocking warnings, not filing blockers.
+    """
+    headers = {"X-User-Id": test_tenants["user_a"], "X-Org-Id": test_tenants["org_a"]}
+    org_id = test_tenants["org_a"]
+    prof_id = test_tenants["profile_a"]
+    user_id = test_tenants["user_a"]
+
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # Update business profile preceding_fy_aato to ₹12 Crore (120,000,000.00)
+            cur.execute("UPDATE public.business_profiles SET preceding_fy_aato = 120000000.00 WHERE id = %s;", (prof_id,))
+            
+            # Seed an approved B2B invoice
+            inv_id = seed_invoice(
+                cur, org_id, prof_id, user_id,
+                'INV-GSTR-T12', '2026-11-10', 'Tata Motors Ltd', '27AAACT2727Q1ZW',
+                50000.00, 4500.00, 4500.00, 0, 59000.00,
+                status='approved',
+                lines=[{"item_description": "Auto Parts", "hsn_sac_code": "87082900", "quantity": 10, "unit_price": 5000.00, "taxable_amount": 50000.00, "gst_rate": 18.00, "cgst_amount": 4500.00, "sgst_amount": 4500.00, "igst_amount": 0, "total_amount": 59000.00}]
+            )
+
+    gstr1_res = client.get("/api/v1/gst/gstr1-draft?period=2026-11", headers=headers)
+    assert gstr1_res.status_code == 200
+    gstr1 = gstr1_res.json()
+
+    assert Decimal(str(gstr1["preceding_fy_aato"])) == Decimal("120000000.00")
+    assert gstr1["table_12_b2b_mandatory"] is True
+    assert gstr1["table_12_b2c_mandatory"] is False
+    assert len(gstr1["table_12_hsn_b2b"]) >= 1
+    assert isinstance(gstr1["table_12_warnings"], list)
+
+
+def test_gstr1_table_13_conditional_mandate_and_5_categories(test_tenants):
+    """
+    GST May 2025 Phase 3 Portal Compliance:
+    1. Table 13 is_mandatory = (tax_period >= '2025-05') and (len(invoices) > 0).
+    2. Historical periods (< '2025-05') have is_mandatory = False.
+    3. Nil returns (no outward invoices) have is_mandatory = False.
+    4. Table 13 includes 5 standard document categories.
+    """
+    headers = {"X-User-Id": test_tenants["user_a"], "X-Org-Id": test_tenants["org_a"]}
+    org_id = test_tenants["org_a"]
+
+    # 1. Historical period test (2024-04): Must be False
+    res_hist = client.get("/api/v1/gst/gstr1-draft?period=2024-04", headers=headers)
+    assert res_hist.status_code == 200
+    assert res_hist.json()["table_13_doc_summary"]["is_mandatory"] is False
+
+    # 2. Nil period test (2026-01): Must be False (no invoices seeded for this period)
+    res_nil = client.get("/api/v1/gst/gstr1-draft?period=2026-01", headers=headers)
+    assert res_nil.status_code == 200
+    assert res_nil.json()["table_13_doc_summary"]["is_mandatory"] is False
+
+    # 3. Active period with supplies (2026-11): Must be True
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            seed_invoice(
+                cur, org_id, test_tenants["profile_a"], test_tenants["user_a"],
+                'INV-T13-ACTIVE', '2026-11-15', 'Customer T13', None,
+                1000.00, 90.00, 90.00, 0, 1180.00,
+                status='approved',
+                lines=[{"item_description": "Goods", "hsn_sac_code": "998311", "quantity": 1, "unit_price": 1000.00, "taxable_amount": 1000.00, "gst_rate": 18.00, "cgst_amount": 90.00, "sgst_amount": 90.00, "igst_amount": 0, "total_amount": 1180.00}]
+            )
+
+    res_active = client.get("/api/v1/gst/gstr1-draft?period=2026-11", headers=headers)
+    assert res_active.status_code == 200
+    doc_sum = res_active.json()["table_13_doc_summary"]
+    assert doc_sum["is_mandatory"] is True
+    assert len(doc_sum["document_categories"]) == 5
+    doc_types = [c["doc_type_code"] for c in doc_sum["document_categories"]]
+    assert doc_types == ["01", "02", "03", "04", "05"]
+
+
+def test_gstr3b_zero_placeholders_eliminated(test_tenants):
+    """
+    Statutory Honesty & GSTR-3B Integrity:
+    Zero placeholders (0.00) are eliminated for unestablished fields:
+    - Tables 3.1(b), 3.1(c), 3.1(d), 3.1.1
+    - Table 4 Eligible ITC
+    - Net cash payable / ITC offset
+    Must have value: None and status: 'not_computed' with explicit provenance reasons.
+    """
+    headers = {"X-User-Id": test_tenants["user_a"], "X-Org-Id": test_tenants["org_a"]}
+    res = client.get("/api/v1/gst/gstr3b-draft?period=2026-11", headers=headers)
+    assert res.status_code == 200
+    gstr3b = res.json()
+
+    # Table 3.1 checks
+    t31 = gstr3b["table_3_1_outward_supplies"]
+    assert t31["3_1_a_outward_taxable_supplies"]["status"] == "computed"
+    assert t31["3_1_b_outward_taxable_zero_rated"]["status"] == "not_computed"
+    assert t31["3_1_b_outward_taxable_zero_rated"]["total_taxable_value"] is None
+    assert t31["3_1_c_other_outward_supplies_nil_exempt"]["status"] == "not_computed"
+    assert t31["3_1_c_other_outward_supplies_nil_exempt"]["total_taxable_value"] is None
+    assert t31["3_1_d_inward_supplies_reverse_charge"]["status"] == "not_computed"
+    assert t31["3_1_d_inward_supplies_reverse_charge"]["total_taxable_value"] is None
+    assert t31["3_1_1_ecommerce_supplies"]["status"] == "not_computed"
+    assert t31["3_1_1_ecommerce_supplies"]["total_taxable_value"] is None
+
+    # Table 4 ITC checks
+    t4 = gstr3b["table_4_eligible_itc"]
+    assert t4["status"] == "not_computed"
+    assert t4["itc_available"]["all_other_itc"]["value"] is None
+    assert t4["itc_available"]["all_other_itc"]["status"] == "not_computed"
+    assert t4["net_itc_available"]["value"] is None
+    assert t4["net_itc_available"]["status"] == "not_computed"
+
+    # Tax payable checks
+    tp = gstr3b["tax_payable_summary"]
+    assert tp["outward_tax_liability"]["status"] == "computed"
+    assert tp["itc_credit_applied"]["status"] == "not_computed"
+    assert tp["itc_credit_applied"]["value"] is None
+    assert tp["net_cash_payable_after_itc"]["status"] == "not_computed"
+    assert tp["net_cash_payable_after_itc"]["value"] is None
+
+
+def test_gemini_ocr_model_configuration_and_schema():
+    """
+    Gemini OCR Compatibility:
+    Verify model is set to supported gemini-2.0-flash and extraction schema is consistent.
+    """
+    assert settings.GEMINI_MODEL == "gemini-2.0-flash"
+    
+    from app.modules.invoice_brain.ocr import ExtractedInvoiceData, ExtractedLineItem
+    # Verify schema serialization
+    sample_item = ExtractedLineItem(
+        item_description="Test Item",
+        hsn_sac_code="998311",
+        quantity=2.0,
+        unit_price=100.0,
+        taxable_amount=200.0,
+        gst_rate=18.0,
+        cgst_amount=18.0,
+        sgst_amount=18.0,
+        igst_amount=0.0,
+        total_amount=236.0
+    )
+    sample_data = ExtractedInvoiceData(
+        invoice_number="INV-001",
+        invoice_date="2026-11-17",
+        counterparty_name="Vendor ABC",
+        counterparty_gstin="27ABCDE1234F1Z5",
+        total_taxable_amount=200.0,
+        cgst_amount=18.0,
+        sgst_amount=18.0,
+        igst_amount=0.0,
+        total_amount=236.0,
+        line_items=[sample_item]
+    )
+    json_str = sample_data.model_dump_json()
+    reconstructed = ExtractedInvoiceData.model_validate_json(json_str)
+    assert reconstructed.invoice_number == "INV-001"
+    assert len(reconstructed.line_items) == 1

@@ -161,6 +161,7 @@ class GSTR1DraftResponse(BaseModel):
     tax_period: str
     gstin: str
     legal_name: str
+    preceding_fy_aato: Decimal = Decimal("50000000.00")
     applicable_b2c_large_threshold: Decimal
     table_4_b2b: List[GSTR1Table4Entry] = []
     table_5_b2c_large: List[Dict[str, Any]] = []
@@ -168,6 +169,9 @@ class GSTR1DraftResponse(BaseModel):
     table_12_hsn_b2b: List[GSTR1Table12Entry] = []
     table_12_hsn_b2c: List[GSTR1Table12Entry] = []
     table_12_hsn_summary: List[GSTR1Table12Entry] = []  # Aggregate compatibility
+    table_12_b2b_mandatory: bool = False
+    table_12_b2c_mandatory: bool = False
+    table_12_warnings: List[str] = []
     table_13_doc_summary: Dict[str, Any] = {}
     total_taxable_value: Decimal
     total_tax_liability: Decimal
