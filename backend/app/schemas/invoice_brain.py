@@ -120,6 +120,14 @@ GSTR_WORKING_DRAFT_DISCLAIMER = (
     "or an authorized GST Suvidha Provider (GSP)."
 )
 
+GSTR3B_WORKING_SUMMARY_DISCLAIMER = (
+    "OUTWARD-SUPPLY-DERIVED WORKING SUMMARY ONLY — NOT A COMPLETE GSTR-3B RETURN. "
+    "This summary reflects outward supplies extracted from approved sales invoices. "
+    "It DOES NOT calculate authoritative Input Tax Credit (ITC), reverse-charge liabilities, "
+    "tax-ledger offsets, or net cash payable, which require reconciled purchase ledgers, "
+    "GSTR-2B data, and electronic cash/credit ledger balances."
+)
+
 class GSTR1Table4Entry(BaseModel):
     recipient_gstin: Optional[str] = None
     recipient_name: str
@@ -135,24 +143,51 @@ class GSTR1Table4Entry(BaseModel):
     sgst_amount: Decimal
     igst_amount: Decimal
 
+class GSTR1Table12Entry(BaseModel):
+    hsn_sac_code: str
+    description: str
+    uqc: str = "OTH"
+    total_quantity: Decimal
+    total_value: Decimal
+    taxable_value: Decimal
+    gst_rate: Decimal
+    cgst_amount: Decimal
+    sgst_amount: Decimal
+    igst_amount: Decimal
+    cess_amount: Decimal = Decimal("0.00")
+
 class GSTR1DraftResponse(BaseModel):
     disclaimer: str = GSTR_WORKING_DRAFT_DISCLAIMER
     tax_period: str
     gstin: str
     legal_name: str
+    applicable_b2c_large_threshold: Decimal
     table_4_b2b: List[GSTR1Table4Entry] = []
     table_5_b2c_large: List[Dict[str, Any]] = []
     table_7_b2c_small: List[Dict[str, Any]] = []
-    table_12_hsn_summary: List[Dict[str, Any]] = []
+    table_12_hsn_b2b: List[GSTR1Table12Entry] = []
+    table_12_hsn_b2c: List[GSTR1Table12Entry] = []
+    table_12_hsn_summary: List[GSTR1Table12Entry] = []  # Aggregate compatibility
     table_13_doc_summary: Dict[str, Any] = {}
     total_taxable_value: Decimal
     total_tax_liability: Decimal
 
 class GSTR3BDraftResponse(BaseModel):
-    disclaimer: str = GSTR_WORKING_DRAFT_DISCLAIMER
+    disclaimer: str = GSTR3B_WORKING_SUMMARY_DISCLAIMER
+    document_type: str = "Outward-Supply-Derived GSTR-3B Working Summary"
     tax_period: str
     gstin: str
     legal_name: str
+    field_provenance: Dict[str, str] = {
+        "table_3_1_a_outward_taxable": "calculated_from_approved_sales_invoices",
+        "table_3_1_d_inward_reverse_charge": "missing_requires_purchase_register",
+        "table_3_1_1_ecommerce": "missing_not_in_scope",
+        "table_4_a_itc_available": "external_requires_gstr2b_reconciliation",
+        "table_4_b_itc_reversed": "external_requires_rules_42_43_calculation",
+        "table_6_1_payment_of_tax": "unsupported_requires_gst_portal_cash_ledger"
+    }
+    authoritative_itc_calculated: bool = False
+    authoritative_net_cash_calculated: bool = False
     table_3_1_outward_supplies: Dict[str, Any] = {}
     table_4_eligible_itc: Dict[str, Any] = {}
     tax_payable_summary: Dict[str, Any] = {}

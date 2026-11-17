@@ -6,8 +6,23 @@ from sqlalchemy.orm import Session
 
 from app.schemas.invoice_brain import (
     GSTR1DraftResponse, GSTR3BDraftResponse,
-    GSTR1Table4Entry, GSTR_WORKING_DRAFT_DISCLAIMER
+    GSTR1Table4Entry, GSTR1Table12Entry,
+    GSTR_WORKING_DRAFT_DISCLAIMER, GSTR3B_WORKING_SUMMARY_DISCLAIMER
 )
+from app.modules.invoice_brain.hsn_catalog import lookup_hsn_code
+
+
+def get_b2c_large_threshold(tax_period: str) -> Decimal:
+    """
+    Returns statutory B2C Large invoice threshold:
+    - Notification No. 12/2024 – Central Tax (effective August 2024) amended Rule 59(4):
+      For tax period >= '2024-08', interstate unregistered invoice threshold is > ₹1,00,000.
+    - Historical periods (< '2024-08'): interstate unregistered invoice threshold was > ₹2,50,000.
+    """
+    if tax_period >= "2024-08":
+        return Decimal("100000.00")
+    return Decimal("250000.00")
+
 
 def prepare_gstr1_draft(
     session: Session,
@@ -16,6 +31,10 @@ def prepare_gstr1_draft(
 ) -> GSTR1DraftResponse:
     """
     Stage 5: Generates GSTR-1 Working Draft based solely on approved invoices.
+    Complies with:
+    - Notification No. 12/2024 – Central Tax (B2C Large ₹1 Lakh threshold from August 2024 onwards)
+    - May 2025 GST Portal Phase 3 rules (Table 12 separate B2B and B2C tabs, validated HSN descriptions)
+    - Mandatory Table 13 Document Details
     Applies prominent working draft disclaimer.
     Never submits to or represents as an official tax filing.
     """
@@ -32,6 +51,7 @@ def prepare_gstr1_draft(
     supplier_gstin = org_row[1] if org_row else "Unregistered"
 
     supplier_state = supplier_gstin[:2] if len(supplier_gstin) >= 2 else "27"
+    b2c_large_threshold = get_b2c_large_threshold(tax_period)
 
     # 2. Fetch approved invoices for the period
     inv_stmt = text("""
@@ -67,16 +87,25 @@ def prepare_gstr1_draft(
         total_taxable += taxable_dec
         total_liability += (cgst_dec + sgst_dec + igst_dec)
 
-        # Place of supply
-        pos = cp_gstin[:2] if (cp_gstin and len(cp_gstin) >= 2) else supplier_state
-        is_interstate = (pos != supplier_state)
+        # Place of supply & Interstate determination
+        is_interstate = False
+        if cp_gstin and len(cp_gstin.strip()) >= 2:
+            pos = cp_gstin[:2]
+            is_interstate = (pos != supplier_state)
+        elif igst_dec > Decimal("0.00") and (cgst_dec == Decimal("0.00") and sgst_dec == Decimal("0.00")):
+            # B2C Interstate supply characterized by IGST charging
+            is_interstate = True
+            pos = "29" if supplier_state != "29" else "27"
+        else:
+            pos = supplier_state
+            is_interstate = False
 
         # Rate derivation
         rate = Decimal("18.00")
         if taxable_dec > 0:
             rate = (((cgst_dec + sgst_dec + igst_dec) / taxable_dec) * 100).quantize(Decimal("0.01"))
 
-        if cp_gstin:
+        if cp_gstin and len(cp_gstin.strip()) == 15:
             # Table 4: B2B Registered supplies
             b2b_entries.append(GSTR1Table4Entry(
                 recipient_gstin=cp_gstin,
@@ -94,8 +123,10 @@ def prepare_gstr1_draft(
                 igst_amount=igst_dec
             ))
         else:
-            # Unregistered: Table 5 (B2C Large > 2.5 Lakh interstate) vs Table 7 (B2C Small)
-            if is_interstate and total_dec > Decimal("250000.00"):
+            # Unregistered supplies:
+            # Table 5 (B2C Large): Interstate and total invoice value strictly > threshold
+            # Table 7 (B2C Small): Intrastate OR interstate <= threshold
+            if is_interstate and total_dec > b2c_large_threshold:
                 b2c_large.append({
                     "place_of_supply": pos,
                     "invoice_number": inv_num,
@@ -115,10 +146,14 @@ def prepare_gstr1_draft(
                     "igst_amount": igst_dec
                 })
 
-    # 3. Table 12: HSN Summary from approved invoice line items
+    # 3. Table 12: HSN Summary split into separate B2B and B2C tabs (May 2025 Phase 3 Portal rules)
     hsn_stmt = text("""
         SELECT 
             COALESCE(ili.hsn_sac_code, '998311') as hsn,
+            CASE 
+                WHEN i.counterparty_gstin IS NOT NULL AND length(trim(i.counterparty_gstin)) = 15 THEN 'B2B' 
+                ELSE 'B2C' 
+            END as supply_type,
             SUM(ili.quantity) as total_qty,
             SUM(ili.total_amount) as total_val,
             SUM(ili.taxable_amount) as taxable_val,
@@ -131,30 +166,49 @@ def prepare_gstr1_draft(
         WHERE i.org_id = :org_id
           AND i.status = 'approved'
           AND to_char(i.invoice_date, 'YYYY-MM') = :period
-        GROUP BY ili.hsn_sac_code, ili.gst_rate;
+        GROUP BY ili.hsn_sac_code, supply_type, ili.gst_rate;
     """)
     hsn_rows = session.execute(hsn_stmt, {"org_id": org_id, "period": tax_period}).fetchall()
-    hsn_summary = []
-    for h in hsn_rows:
-        hsn_summary.append({
-            "hsn_sac_code": h[0],
-            "total_quantity": float(h[1]),
-            "total_value": float(h[2]),
-            "taxable_value": float(h[3]),
-            "gst_rate": float(h[4]),
-            "cgst_amount": float(h[5]),
-            "sgst_amount": float(h[6]),
-            "igst_amount": float(h[7])
-        })
+    
+    table_12_hsn_b2b: List[GSTR1Table12Entry] = []
+    table_12_hsn_b2c: List[GSTR1Table12Entry] = []
+    table_12_hsn_summary: List[GSTR1Table12Entry] = []
 
-    # 4. Table 13: Document summary
+    for h in hsn_rows:
+        code_str = str(h[0])
+        supply_type = h[1]
+        catalog_entry = lookup_hsn_code(code_str)
+        desc = catalog_entry.description if catalog_entry else "Goods and Services Classification"
+
+        entry = GSTR1Table12Entry(
+            hsn_sac_code=code_str,
+            description=desc,
+            uqc="OTH",
+            total_quantity=Decimal(str(h[2])),
+            total_value=Decimal(str(h[3])),
+            taxable_value=Decimal(str(h[4])),
+            gst_rate=Decimal(str(h[5])),
+            cgst_amount=Decimal(str(h[6])),
+            sgst_amount=Decimal(str(h[7])),
+            igst_amount=Decimal(str(h[8])),
+            cess_amount=Decimal("0.00")
+        )
+
+        if supply_type == "B2B":
+            table_12_hsn_b2b.append(entry)
+        else:
+            table_12_hsn_b2c.append(entry)
+        table_12_hsn_summary.append(entry)
+
+    # 4. Table 13: Mandatory Document Details
     doc_summary = {
         "nature_of_document": "Invoices for outward supply",
         "total_number_issued": len(invoices),
         "from_serial_number": invoice_numbers[0] if invoice_numbers else None,
         "to_serial_number": invoice_numbers[-1] if invoice_numbers else None,
         "cancelled_count": 0,
-        "net_issued": len(invoices)
+        "net_issued": len(invoices),
+        "is_mandatory": True
     }
 
     return GSTR1DraftResponse(
@@ -162,10 +216,13 @@ def prepare_gstr1_draft(
         tax_period=tax_period,
         gstin=supplier_gstin,
         legal_name=legal_name,
+        applicable_b2c_large_threshold=b2c_large_threshold,
         table_4_b2b=b2b_entries,
         table_5_b2c_large=b2c_large,
         table_7_b2c_small=b2c_small,
-        table_12_hsn_summary=hsn_summary,
+        table_12_hsn_b2b=table_12_hsn_b2b,
+        table_12_hsn_b2c=table_12_hsn_b2c,
+        table_12_hsn_summary=table_12_hsn_summary,
         table_13_doc_summary=doc_summary,
         total_taxable_value=total_taxable,
         total_tax_liability=total_liability
@@ -178,8 +235,12 @@ def prepare_gstr3b_draft(
     tax_period: str
 ) -> GSTR3BDraftResponse:
     """
-    Stage 5: Generates GSTR-3B Working Draft with Table 3.1 (Outward Supplies)
-    and Table 4 (Eligible ITC summary) for internal tax preparation.
+    Stage 5: Generates Outward-Supply-Derived GSTR-3B Working Summary.
+    EXPLICIT SCOPE:
+    - Calculates Table 3.1(a) Outward Taxable Supplies strictly from approved sales invoices.
+    - Honest provenance metadata explicitly notes that inward reverse charge, e-commerce,
+      authoritative ITC (Table 4), and cash tax payment (Table 6.1) require external
+      purchase registers, GSTR-2B reconciliation, and official GST portal cash ledger data.
     """
     # 1. Fetch organization GSTIN
     org_stmt = text("""
@@ -236,7 +297,7 @@ def prepare_gstr3b_draft(
         }
     }
 
-    # 3. Table 4 Eligible ITC (Simulated based on purchase transactions/records)
+    # 3. Table 4 Eligible ITC - honest placeholders indicating external provenance requirement
     table_4 = {
         "itc_available": {
             "import_of_goods": {"igst": Decimal("0.00"), "cess": Decimal("0.00")},
@@ -257,18 +318,19 @@ def prepare_gstr3b_draft(
     }
 
     tax_payable = {
-        "total_tax_payable": {
+        "outward_tax_liability": {
             "integrated_tax": igst,
             "central_tax": cgst,
             "state_ut_tax": sgst,
             "total": igst + cgst + sgst
         },
-        "tax_paid_through_itc": {
+        "itc_credit_applied": {
             "integrated_tax": Decimal("0.00"),
             "central_tax": Decimal("0.00"),
-            "state_ut_tax": Decimal("0.00")
+            "state_ut_tax": Decimal("0.00"),
+            "note": "Requires GSTR-2B purchase reconciliation"
         },
-        "net_tax_payable_in_cash": {
+        "estimated_cash_payable_pre_itc": {
             "integrated_tax": igst,
             "central_tax": cgst,
             "state_ut_tax": sgst,
@@ -277,10 +339,21 @@ def prepare_gstr3b_draft(
     }
 
     return GSTR3BDraftResponse(
-        disclaimer=GSTR_WORKING_DRAFT_DISCLAIMER,
+        disclaimer=GSTR3B_WORKING_SUMMARY_DISCLAIMER,
+        document_type="Outward-Supply-Derived GSTR-3B Working Summary",
         tax_period=tax_period,
         gstin=gstin,
         legal_name=legal_name,
+        field_provenance={
+            "table_3_1_a_outward_taxable": "calculated_from_approved_sales_invoices",
+            "table_3_1_d_inward_reverse_charge": "missing_requires_purchase_register",
+            "table_3_1_1_ecommerce": "missing_not_in_scope",
+            "table_4_a_itc_available": "external_requires_gstr2b_reconciliation",
+            "table_4_b_itc_reversed": "external_requires_rules_42_43_calculation",
+            "table_6_1_payment_of_tax": "unsupported_requires_gst_portal_cash_ledger"
+        },
+        authoritative_itc_calculated=False,
+        authoritative_net_cash_calculated=False,
         table_3_1_outward_supplies=table_3_1,
         table_4_eligible_itc=table_4,
         tax_payable_summary=tax_payable

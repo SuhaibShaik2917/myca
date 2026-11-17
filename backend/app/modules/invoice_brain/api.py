@@ -6,7 +6,7 @@ from sqlalchemy import text
 
 from app.core.dependencies import get_tenant_db
 from app.modules.invoice_brain.service import (
-    upload_and_enqueue_invoice, update_invoice_fields,
+    upload_and_enqueue_invoice, update_invoice_fields, update_line_item,
     approve_invoice, reject_invoice, DuplicateDocumentError,
     InvoiceStatusError, InvoiceBrainError
 )
@@ -172,25 +172,28 @@ def patch_line_item(
 ):
     """
     Stage 4: Line item correction before approval.
+    Re-runs automated GST validation and updates invoice status accordingly.
     """
-    # Enforce invoice status check
-    inv = db.execute(text("SELECT status FROM public.invoices WHERE id = :id AND org_id = :org;"),
-                     {"id": invoice_id, "org": x_org_id}).fetchone()
-    if not inv:
-        raise HTTPException(status_code=404, detail="Invoice not found")
-    if inv[0] in ("approved", "export_ready"):
-        raise HTTPException(status_code=403, detail="Cannot modify line items on approved invoices.")
-
-    data = patch.model_dump(exclude_unset=True)
-    if not data:
-        return {"status": "no_changes"}
-
-    updates = [f"{k} = :{k}" for k in data.keys()]
-    params = {"item_id": item_id, "inv_id": invoice_id, "org_id": x_org_id, **data}
-    sql = f"UPDATE public.invoice_line_items SET {', '.join(updates)} WHERE id = :item_id AND invoice_id = :inv_id AND org_id = :org_id;"
-    db.execute(text(sql), params)
-    db.commit()
-    return {"status": "success", "modified_fields": list(data.keys())}
+    try:
+        result = update_line_item(
+            session=db,
+            org_id=x_org_id,
+            user_id=x_user_id,
+            invoice_id=invoice_id,
+            item_id=item_id,
+            patch=patch
+        )
+        db.commit()
+        return result
+    except InvoiceStatusError as e:
+        db.rollback()
+        raise HTTPException(status_code=403, detail=str(e))
+    except InvoiceBrainError as e:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/invoices/{invoice_id}/approve")
@@ -215,7 +218,8 @@ def approve_invoice_endpoint(
         db.commit()
         return result
     except InvoiceStatusError as e:
-        db.rollback()
+        # Commit revalidation status update (e.g. pending_review -> validation_failed)
+        db.commit()
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         db.rollback()
@@ -259,10 +263,12 @@ def get_task_status_endpoint(
 ):
     """
     Check status of queued/in-progress OCR or reconciliation worker task.
+    Reads strictly from restricted tenant view (v_tenant_task_status).
+    Protects internal worker tokens, hashes, and execution payloads.
     """
     stmt = text("""
-        SELECT id, task_type, status, attempts, error_message, result, created_at, updated_at
-        FROM public.worker_tasks
+        SELECT id, task_type, status, created_at, updated_at
+        FROM public.v_tenant_task_status
         WHERE id = :id AND org_id = :org;
     """)
     task = db.execute(stmt, {"id": task_id, "org": x_org_id}).mappings().fetchone()

@@ -22,7 +22,7 @@ from app.modules.invoice_brain.validator import (
     validate_hsn_sac,
     validate_invoice_financials
 )
-from app.schemas.invoice_brain import GSTR_WORKING_DRAFT_DISCLAIMER
+from app.schemas.invoice_brain import GSTR_WORKING_DRAFT_DISCLAIMER, GSTR3B_WORKING_SUMMARY_DISCLAIMER
 from app.modules.invoice_brain.service import process_invoice_ocr_task
 
 # Database connection strings for test assertions
@@ -402,9 +402,13 @@ def test_stage5_gstr_working_outputs_generation(seeded_org):
     assert gstr3b_res.status_code == 200
     gstr3b = gstr3b_res.json()
 
-    # Verify Disclaimer
-    assert gstr3b["disclaimer"] == GSTR_WORKING_DRAFT_DISCLAIMER
-    assert "NOT AN OFFICIAL FILING" in gstr3b["disclaimer"]
+    # Verify Outward-Supply-Derived Disclaimer and Field Provenance
+    assert gstr3b["disclaimer"] == GSTR3B_WORKING_SUMMARY_DISCLAIMER
+    assert "OUTWARD-SUPPLY-DERIVED WORKING SUMMARY" in gstr3b["disclaimer"]
+    assert gstr3b["authoritative_itc_calculated"] is False
+    assert gstr3b["authoritative_net_cash_calculated"] is False
+    assert "table_3_1_a_outward_taxable" in gstr3b["field_provenance"]
+    assert "table_4_a_itc_available" in gstr3b["field_provenance"]
 
     # Verify Table 3.1 Outward supplies aggregated
     t31 = gstr3b["table_3_1_outward_supplies"]["3_1_a_outward_taxable_supplies"]

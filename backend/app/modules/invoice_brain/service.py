@@ -28,6 +28,9 @@ class DuplicateDocumentError(InvoiceBrainError):
 class InvoiceStatusError(InvoiceBrainError):
     pass
 
+class InvoiceValidationError(InvoiceBrainError):
+    pass
+
 def upload_and_enqueue_invoice(
     session: Session,
     org_id: str,
@@ -182,10 +185,17 @@ def process_invoice_ocr_task(
         profile_row = cur.fetchone()
         supplier_gstin = profile_row[0] if profile_row else None
 
-        # State transition 1: uploaded -> queued
-        cur.execute("UPDATE public.invoices SET status = 'queued' WHERE id = %s;", (invoice_id,))
-        # State transition 2: queued -> processing
-        cur.execute("UPDATE public.invoices SET status = 'processing' WHERE id = %s;", (invoice_id,))
+        # Fetch current invoice status
+        cur.execute("SELECT status FROM public.invoices WHERE id = %s;", (invoice_id,))
+        status_row = cur.fetchone()
+        curr_status = status_row[0] if status_row else None
+
+        # State transition into processing (supporting initial run and worker task retries)
+        if curr_status == 'uploaded':
+            cur.execute("UPDATE public.invoices SET status = 'queued' WHERE id = %s;", (invoice_id,))
+            cur.execute("UPDATE public.invoices SET status = 'processing' WHERE id = %s;", (invoice_id,))
+        elif curr_status in ('queued', 'pending_review', 'validation_failed'):
+            cur.execute("UPDATE public.invoices SET status = 'processing' WHERE id = %s;", (invoice_id,))
 
         # Stage 2: OCR extraction
         extracted = extract_invoice_with_gemini(file_path, mime_type)
@@ -219,6 +229,9 @@ def process_invoice_ocr_task(
             extracted.total_amount,
             invoice_id
         ))
+
+        # Idempotent cleanup of any previous draft line items before insertion
+        cur.execute("DELETE FROM public.invoice_line_items WHERE invoice_id = %s;", (invoice_id,))
 
         # Insert extracted line items (draft state before approval)
         raw_lines = []
@@ -270,6 +283,66 @@ def process_invoice_ocr_task(
         }
 
 
+def revalidate_invoice(
+    session: Session,
+    org_id: str,
+    invoice_id: str
+) -> Optional[ValidationReport]:
+    """
+    Re-evaluates automated GST validation after any invoice or line item modification.
+    Automatically transitions invoice between 'pending_review' and 'validation_failed'.
+    """
+    inv_stmt = text("""
+        SELECT 
+            i.id, i.org_id, i.profile_id, i.invoice_number, i.invoice_date,
+            i.due_date, i.counterparty_name, i.counterparty_gstin,
+            i.total_taxable_amount, i.cgst_amount, i.sgst_amount,
+            i.igst_amount, i.total_amount, i.status,
+            bp.gstin as supplier_gstin
+        FROM public.invoices i
+        JOIN public.business_profiles bp ON bp.id = i.profile_id
+        WHERE i.id = :id AND i.org_id = :org_id;
+    """)
+    inv = session.execute(inv_stmt, {"id": invoice_id, "org_id": org_id}).mappings().fetchone()
+    if not inv:
+        return None
+
+    lines_stmt = text("""
+        SELECT id, invoice_id, org_id, item_description, hsn_sac_code,
+               quantity, unit_price, taxable_amount, gst_rate,
+               cgst_amount, sgst_amount, igst_amount, total_amount
+        FROM public.invoice_line_items
+        WHERE invoice_id = :id AND org_id = :org_id
+        ORDER BY created_at ASC;
+    """)
+    lines = session.execute(lines_stmt, {"id": invoice_id, "org_id": org_id}).mappings().fetchall()
+
+    validation = validate_invoice_financials(
+        invoice=dict(inv),
+        line_items=[dict(l) for l in lines],
+        supplier_gstin=inv["supplier_gstin"]
+    )
+
+    if inv["status"] in ("pending_review", "validation_failed", "extracted", "queued", "uploaded"):
+        new_status = "pending_review" if validation.is_valid else "validation_failed"
+        new_reason = None if validation.is_valid else f"Automated GST validation flagged {validation.discrepancy_count} discrepancy issues."
+
+        session.execute(text("""
+            UPDATE public.invoices
+            SET status = :status,
+                rejection_reason = :reason,
+                updated_at = clock_timestamp()
+            WHERE id = :id AND org_id = :org_id;
+        """), {
+            "status": new_status,
+            "reason": new_reason,
+            "id": invoice_id,
+            "org_id": org_id
+        })
+
+    return validation
+
+
 def update_invoice_fields(
     session: Session,
     org_id: str,
@@ -280,6 +353,7 @@ def update_invoice_fields(
     """
     Stage 4: Allows human reviewer to correct OCR fields prior to approval.
     Database triggers strictly reject modifications if status is approved/export_ready!
+    Automatically triggers validation re-evaluation and updates review status.
     """
     # Fetch current status
     cur_stmt = text("SELECT status, total_amount FROM public.invoices WHERE id = :id AND org_id = :org_id;")
@@ -318,7 +392,70 @@ def update_invoice_fields(
             "org_id": org_id
         })
 
-    return {"status": "success", "modified_fields": list(data.keys())}
+    # Automatically revalidate invoice after field updates
+    validation = revalidate_invoice(session, org_id, invoice_id)
+
+    return {
+        "status": "success",
+        "modified_fields": list(data.keys()),
+        "validation_report": validation.model_dump() if validation else None
+    }
+
+
+def update_line_item(
+    session: Session,
+    org_id: str,
+    user_id: str,
+    invoice_id: str,
+    item_id: str,
+    patch: LineItemUpdate
+) -> Dict[str, Any]:
+    """
+    Stage 4: Line item correction before approval.
+    Automatically re-evaluates validation and updates review status.
+    """
+    inv = session.execute(text("SELECT status FROM public.invoices WHERE id = :id AND org_id = :org;"),
+                          {"id": invoice_id, "org": org_id}).fetchone()
+    if not inv:
+        raise InvoiceBrainError("Invoice not found")
+    if inv[0] in ("approved", "export_ready"):
+        raise InvoiceStatusError(f"Cannot modify line items on invoice in '{inv[0]}' state. Approved invoices are immutable.")
+
+    data = patch.model_dump(exclude_unset=True)
+    if not data:
+        return {"status": "no_changes"}
+
+    updates = [f"{k} = :{k}" for k in data.keys()]
+    params = {"item_id": item_id, "inv_id": invoice_id, "org_id": org_id, **data}
+    sql = f"UPDATE public.invoice_line_items SET {', '.join(updates)} WHERE id = :item_id AND invoice_id = :inv_id AND org_id = :org_id;"
+    session.execute(text(sql), params)
+
+    # Revalidate invoice after line item edit
+    validation = revalidate_invoice(session, org_id, invoice_id)
+
+    # Audit log
+    session.execute(text("""
+        SELECT audit.log_audit_event(
+            CAST(:org_id AS uuid),
+            'invoice_line_items',
+            CAST(:item_id AS text),
+            'UPDATE'::public.audit_action,
+            NULL,
+            CAST(:patch_data AS jsonb),
+            CAST(:metadata AS jsonb)
+        );
+    """), {
+        "item_id": item_id,
+        "patch_data": json.dumps(data, default=str),
+        "metadata": json.dumps({"source": "invoice_brain", "invoice_id": invoice_id}),
+        "org_id": org_id
+    })
+
+    return {
+        "status": "success",
+        "modified_fields": list(data.keys()),
+        "validation_report": validation.model_dump() if validation else None
+    }
 
 
 def approve_invoice(
@@ -330,6 +467,7 @@ def approve_invoice(
     """
     Stage 4: Authenticated human approval of invoice.
     Transitions pending_review -> approved.
+    Enforces that invoice must currently pass automated validation with NO critical errors!
     Enforces active owner/admin membership and guarantees immutability afterwards.
     """
     cur_stmt = text("SELECT status, total_amount, invoice_number FROM public.invoices WHERE id = :id AND org_id = :org_id;")
@@ -338,6 +476,14 @@ def approve_invoice(
         raise InvoiceBrainError("Invoice not found")
     if inv[0] != "pending_review":
         raise InvoiceStatusError(f"Cannot approve invoice in status '{inv[0]}'. Only 'pending_review' invoices can be approved.")
+
+    # Re-evaluate validation at the exact moment of approval to ensure integrity
+    validation = revalidate_invoice(session, org_id, invoice_id)
+    if validation and (not validation.is_valid or validation.has_critical_errors):
+        raise InvoiceStatusError(
+            f"Cannot approve invoice: invoice failed validation with {validation.discrepancy_count} discrepancy issues. "
+            "All critical validation errors must be resolved prior to approval."
+        )
 
     approve_stmt = text("""
         UPDATE public.invoices

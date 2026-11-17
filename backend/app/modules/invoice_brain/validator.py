@@ -3,6 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Tuple, Dict, Any
 from app.schemas.invoice_brain import ValidationReport, ValidationFlag
+from app.modules.invoice_brain.hsn_catalog import validate_hsn_compliance, lookup_hsn_code
 
 CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -267,25 +268,17 @@ def validate_invoice_financials(
                 ))
                 has_critical = True
 
-        # HSN/SAC check
+        # HSN/SAC statutory compliance check (Notification No. 78/2020 & Phase 3 rules)
         hsn = item.get("hsn_sac_code")
-        if hsn:
-            hsn_ok, hsn_err = validate_hsn_sac(hsn)
-            if not hsn_ok:
-                flags.append(ValidationFlag(
-                    code="WARN_INVALID_HSN",
-                    severity="warning",
-                    field=f"{item_prefix}.hsn_sac_code",
-                    message=f"Line {idx+1} HSN/SAC code warning: {hsn_err}"
-                ))
-                all_hsn_valid = False
-        else:
+        hsn_ok, hsn_err, _ = validate_hsn_compliance(hsn, aato_crores=Decimal("5.0"), is_b2b=bool(cp_gstin))
+        if not hsn_ok:
             flags.append(ValidationFlag(
-                code="WARN_MISSING_HSN",
+                code="WARN_INVALID_HSN",
                 severity="warning",
                 field=f"{item_prefix}.hsn_sac_code",
-                message=f"Line {idx+1} is missing HSN/SAC code (required for businesses above 5 Cr turnover)."
+                message=f"Line {idx+1} HSN compliance issue: {hsn_err}"
             ))
+            all_hsn_valid = False
 
         sum_taxable += taxable
         sum_cgst += cgst

@@ -54,11 +54,14 @@ Ensure numeric precision is maintained. Return ONLY clean structured JSON adheri
 def extract_invoice_with_gemini(file_path: str, mime_type: str) -> ExtractedInvoiceData:
     """
     Extracts structured invoice information using Google Gemini 2.5 Flash Vision.
-    Falls back to deterministic parser if API key is not configured or in offline test mode.
+    Falls back to deterministic parser ONLY in non-production development/test modes.
+    PROHIBITED IN PRODUCTION: If ENVIRONMENT == 'production', mock fallback is strictly forbidden.
     """
     api_key = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
     if not api_key:
-        logger.info("GEMINI_API_KEY not configured. Using deterministic OCR fallback parser.")
+        if settings.ENVIRONMENT == "production":
+            raise RuntimeError("CRITICAL PRODUCTION INTEGRITY ERROR: GEMINI_API_KEY is not configured. Mock OCR fallback is strictly prohibited in production.")
+        logger.info("GEMINI_API_KEY not configured. Using deterministic OCR fallback parser for dev/testing.")
         return extract_invoice_mock(file_path, mime_type)
 
     try:
@@ -86,6 +89,8 @@ def extract_invoice_with_gemini(file_path: str, mime_type: str) -> ExtractedInvo
         return extracted
 
     except Exception as e:
+        if settings.ENVIRONMENT == "production":
+            raise RuntimeError(f"CRITICAL: Gemini Vision OCR extraction failed in production: {e}") from e
         logger.warning(f"Gemini API extraction failed ({e}). Falling back to deterministic fallback.")
         return extract_invoice_mock(file_path, mime_type)
 
