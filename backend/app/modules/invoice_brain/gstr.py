@@ -69,12 +69,15 @@ def prepare_gstr1_draft(
     supplier_state = supplier_gstin[:2] if len(supplier_gstin) >= 2 else "27"
     b2c_large_threshold = get_b2c_large_threshold(tax_period)
 
-    # 2. Fetch approved invoices for the period
+    # 2. Fetch approved invoices for the period with explicit statutory classifications
     inv_stmt = text("""
         SELECT 
             i.id, i.invoice_number, i.invoice_date, i.counterparty_name,
             i.counterparty_gstin, i.total_taxable_amount, i.cgst_amount,
-            i.sgst_amount, i.igst_amount, i.total_amount
+            i.sgst_amount, i.igst_amount, i.total_amount,
+            i.supply_category, i.is_sez_supply, i.is_deemed_export,
+            i.is_reverse_charge, i.document_type, i.recipient_registration_type,
+            i.classification_provenance
         FROM public.invoices i
         WHERE i.org_id = :org_id
           AND i.status = 'approved'
@@ -103,7 +106,9 @@ def prepare_gstr1_draft(
     has_table_15a_b2b = False
 
     for inv in invoices:
-        inv_id, inv_num, inv_date, cp_name, cp_gstin, taxable, cgst, sgst, igst, total = inv
+        (inv_id, inv_num, inv_date, cp_name, cp_gstin, taxable, cgst, sgst, igst, total,
+         supply_category, is_sez_supply, is_deemed_export, is_reverse_charge,
+         document_type, recipient_registration_type, classification_provenance) = inv
         invoice_numbers.append(inv_num)
         taxable_dec = Decimal(str(taxable))
         cgst_dec = Decimal(str(cgst))
@@ -120,7 +125,6 @@ def prepare_gstr1_draft(
             pos = cp_gstin[:2]
             is_interstate = (pos != supplier_state)
         elif igst_dec > Decimal("0.00") and (cgst_dec == Decimal("0.00") and sgst_dec == Decimal("0.00")):
-            # B2C Interstate supply characterized by IGST charging
             is_interstate = True
             pos = "29" if supplier_state != "29" else "27"
         else:
@@ -132,41 +136,42 @@ def prepare_gstr1_draft(
         if taxable_dec > 0:
             rate = (((cgst_dec + sgst_dec + igst_dec) / taxable_dec) * 100).quantize(Decimal("0.01"))
 
-        if cp_gstin and len(cp_gstin.strip()) == 15:
-            # Table 4 / Registered supplies
-            num_upper = inv_num.upper()
-            name_upper = (cp_name or "").upper()
+        is_registered = bool(cp_gstin and len(cp_gstin.strip()) == 15)
 
-            # Classify specific registered outward supply categories
-            if num_upper.startswith(("AMCN-", "AMDN-", "CDNRA-")):
+        if is_registered:
+            # Explicit Statutory Classification based on structured fields (No heuristics)
+            if document_type in ("revised_credit_note", "revised_debit_note"):
                 has_table_9c_b2b = True
                 inv_type = "CDNRA"
-            elif num_upper.startswith(("CN-", "CRN-", "DN-", "DBN-", "CDNR-")) or total_dec < 0:
+            elif document_type in ("credit_note", "debit_note"):
                 has_table_9b_b2b = True
                 inv_type = "CDNR"
-            elif num_upper.startswith(("AMD-", "REV-", "B2BA-")):
+            elif document_type == "revised_invoice":
                 has_table_9a_b2b = True
                 inv_type = "B2BA"
-            elif num_upper.startswith(("AMECO-", "ECOA-")):
+            elif supply_category == "ECO_AMENDMENT":
                 has_table_15a_b2b = True
                 inv_type = "ECOA"
-            elif num_upper.startswith(("ECO-",)) or "ECO" in name_upper:
+            elif supply_category == "ECO_SUPPLY":
                 has_table_15_b2b = True
                 inv_type = "ECO"
-            elif pos == "96" or "SEZ" in name_upper or "SEZ" in num_upper:
+            elif is_sez_supply or supply_category in ("SEZ_WITH_PAYMENT", "SEZ_WITHOUT_PAYMENT"):
                 has_table_6b = True
                 inv_type = "SEZ"
-            elif num_upper.startswith(("DE-", "EXP-")) or "DEEMED" in name_upper:
+            elif is_deemed_export or supply_category == "DEEMED_EXPORT":
                 has_table_6c = True
                 inv_type = "Deemed Export"
-            elif num_upper.startswith(("RCM-", "REV-CHG-")) or "RCM" in name_upper:
+            elif is_reverse_charge or supply_category == "B2B_REVERSE_CHARGE":
                 has_table_4b = True
                 inv_type = "Reverse Charge"
+            elif supply_category == "NIL_EXEMPT":
+                has_table_8_b2b = True
+                inv_type = "Nil/Exempt"
             else:
                 has_table_4a = True
                 inv_type = "Regular"
 
-            if rate == Decimal("0.00") or (taxable_dec > 0 and (cgst_dec + sgst_dec + igst_dec) == 0):
+            if supply_category == "NIL_EXEMPT":
                 has_table_8_b2b = True
 
             b2b_entries.append(GSTR1Table4Entry(
@@ -176,7 +181,7 @@ def prepare_gstr1_draft(
                 invoice_date=str(inv_date),
                 invoice_value=total_dec,
                 place_of_supply=pos,
-                reverse_charge="Y" if has_table_4b else "N",
+                reverse_charge="Y" if (is_reverse_charge or has_table_4b) else "N",
                 invoice_type=inv_type,
                 rate=rate,
                 taxable_value=taxable_dec,

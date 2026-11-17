@@ -93,24 +93,38 @@ def test_tenants():
     }
 
 
-def seed_invoice(cur, org_id, profile_id, user_id, inv_num, inv_date, cp_name, cp_gstin, taxable, cgst, sgst, igst, total, status='approved', lines=None):
+def seed_invoice(
+    cur, org_id, profile_id, user_id, inv_num, inv_date, cp_name, cp_gstin,
+    taxable, cgst, sgst, igst, total, status='approved', lines=None,
+    supply_category='B2B_REGULAR', is_sez_supply=False, is_deemed_export=False,
+    is_reverse_charge=False, document_type='invoice', recipient_registration_type='regular',
+    classification_provenance='source_document'
+):
     """
     Helper that creates an invoice starting with 'uploaded' and steps through
-    state transitions respecting database trigger constraints.
+    state transitions respecting database trigger constraints and statutory classifications.
     """
     inv_id = str(uuid.uuid4())
-    # 1. Insert with initial status 'uploaded'
+    # 1. Insert with initial status 'uploaded' and explicit statutory classifications
     cur.execute("""
         INSERT INTO public.invoices (
             id, org_id, profile_id, invoice_number, invoice_date,
             counterparty_name, counterparty_gstin, total_taxable_amount,
-            cgst_amount, sgst_amount, igst_amount, total_amount, status
+            cgst_amount, sgst_amount, igst_amount, total_amount, status,
+            supply_category, is_sez_supply, is_deemed_export, is_reverse_charge,
+            document_type, recipient_registration_type, classification_provenance
         ) VALUES (
             %s, %s, %s, %s, %s,
             %s, %s, %s,
-            %s, %s, %s, %s, 'uploaded'
+            %s, %s, %s, %s, 'uploaded',
+            %s, %s, %s, %s,
+            %s, %s, %s
         );
-    """, (inv_id, org_id, profile_id, inv_num, inv_date, cp_name, cp_gstin, taxable, cgst, sgst, igst, total))
+    """, (
+        inv_id, org_id, profile_id, inv_num, inv_date, cp_name, cp_gstin, taxable, cgst, sgst, igst, total,
+        supply_category, is_sez_supply, is_deemed_export, is_reverse_charge,
+        document_type, recipient_registration_type, classification_provenance
+    ))
 
     if lines:
         for line in lines:
@@ -1753,23 +1767,47 @@ def test_gstr1_table_12_b2b_mandatory_across_all_registered_supply_tables(test_t
 
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
-            # 1. Table 4B: Reverse Charge supply
-            seed_invoice(cur, org_id, profile_id, user_id, f"RCM-INV-{uuid.uuid4().hex[:6]}", "2026-11-05", "RCM Supplier Co", reg_gstin, 1000.00, 90.00, 90.00, 0.00, 1180.00, status='approved')
+            # 1. Table 4B: Explicit Reverse Charge supply
+            seed_invoice(
+                cur, org_id, profile_id, user_id, f"INV-RCM-{uuid.uuid4().hex[:6]}", "2026-11-05", "RCM Supplier Co", reg_gstin,
+                1000.00, 90.00, 90.00, 0.00, 1180.00, status='approved',
+                is_reverse_charge=True, supply_category='B2B_REVERSE_CHARGE'
+            )
 
-            # 2. Table 6B: SEZ outward supply
-            seed_invoice(cur, org_id, profile_id, user_id, f"SEZ-INV-{uuid.uuid4().hex[:6]}", "2026-11-06", "SEZ Developer Corp", reg_gstin, 2000.00, 0.00, 0.00, 360.00, 2360.00, status='approved')
+            # 2. Table 6B: Explicit SEZ outward supply
+            seed_invoice(
+                cur, org_id, profile_id, user_id, f"INV-SEZ-{uuid.uuid4().hex[:6]}", "2026-11-06", "SEZ Developer Corp", reg_gstin,
+                2000.00, 0.00, 0.00, 360.00, 2360.00, status='approved',
+                is_sez_supply=True, supply_category='SEZ_WITH_PAYMENT', recipient_registration_type='sez_developer'
+            )
 
-            # 3. Table 6C: Deemed Export
-            seed_invoice(cur, org_id, profile_id, user_id, f"DE-INV-{uuid.uuid4().hex[:6]}", "2026-11-07", "EOU Manufacturing Ltd", reg_gstin, 3000.00, 270.00, 270.00, 0.00, 3540.00, status='approved')
+            # 3. Table 6C: Explicit Deemed Export
+            seed_invoice(
+                cur, org_id, profile_id, user_id, f"INV-DE-{uuid.uuid4().hex[:6]}", "2026-11-07", "EOU Manufacturing Ltd", reg_gstin,
+                3000.00, 270.00, 270.00, 0.00, 3540.00, status='approved',
+                is_deemed_export=True, supply_category='DEEMED_EXPORT'
+            )
 
-            # 4. Table 8: Nil-rated supply to registered recipient
-            seed_invoice(cur, org_id, profile_id, user_id, f"NIL-INV-{uuid.uuid4().hex[:6]}", "2026-11-08", "Exempt Grains Trader", reg_gstin, 4000.00, 0.00, 0.00, 0.00, 4000.00, status='approved')
+            # 4. Table 8: Explicit Nil-rated supply to registered recipient
+            seed_invoice(
+                cur, org_id, profile_id, user_id, f"INV-NIL-{uuid.uuid4().hex[:6]}", "2026-11-08", "Exempt Grains Trader", reg_gstin,
+                4000.00, 0.00, 0.00, 0.00, 4000.00, status='approved',
+                supply_category='NIL_EXEMPT'
+            )
 
-            # 5. Table 9B: Credit Note to registered recipient
-            seed_invoice(cur, org_id, profile_id, user_id, f"CN-INV-{uuid.uuid4().hex[:6]}", "2026-11-09", "Acme Trading Co", reg_gstin, -500.00, -45.00, -45.00, 0.00, -590.00, status='approved')
+            # 5. Table 9B: Explicit Credit Note to registered recipient
+            seed_invoice(
+                cur, org_id, profile_id, user_id, f"INV-CN-{uuid.uuid4().hex[:6]}", "2026-11-09", "Acme Trading Co", reg_gstin,
+                -500.00, -45.00, -45.00, 0.00, -590.00, status='approved',
+                document_type='credit_note'
+            )
 
-            # 6. Table 15: ECO outward supply to registered recipient
-            seed_invoice(cur, org_id, profile_id, user_id, f"ECO-INV-{uuid.uuid4().hex[:6]}", "2026-11-10", "E-Commerce Marketplace Partner", reg_gstin, 1500.00, 135.00, 135.00, 0.00, 1770.00, status='approved')
+            # 6. Table 15: Explicit ECO outward supply to registered recipient
+            seed_invoice(
+                cur, org_id, profile_id, user_id, f"INV-ECO-{uuid.uuid4().hex[:6]}", "2026-11-10", "E-Commerce Marketplace Partner", reg_gstin,
+                1500.00, 135.00, 135.00, 0.00, 1770.00, status='approved',
+                supply_category='ECO_SUPPLY'
+            )
 
     headers = {"X-User-Id": user_id, "X-Org-Id": org_id}
     res = client.get("/api/v1/gst/gstr1-draft?period=2026-11", headers=headers)
@@ -1872,9 +1910,9 @@ def test_populated_data_downgrade_quarantine(test_tenants):
                 );
             """, (line_id, inv_id, org_id))
 
-    # Execute Alembic downgrade to 0009
+    # Execute Alembic downgrade specifically to 0009 (testing 0010 rollback quarantine)
     p_down = subprocess.run(
-        ["/opt/myca-venv/bin/alembic", "downgrade", "-1"],
+        ["/opt/myca-venv/bin/alembic", "downgrade", "0009_line_item_isolation"],
         cwd="/mnt/c/Users/notyo/.gemini/antigravity/scratch/myca/backend",
         capture_output=True, text=True
     )

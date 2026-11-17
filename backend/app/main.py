@@ -1,7 +1,16 @@
+import sys
+from pathlib import Path
+
+# Add local vendor packages to sys.path
+vendor_dir = Path(__file__).resolve().parent.parent / "vendor"
+if vendor_dir.exists() and str(vendor_dir) not in sys.path:
+    sys.path.insert(0, str(vendor_dir))
+
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.modules.invoice_brain.api import router as invoice_brain_router
+from app.modules.reconciliation.api import router as reconciliation_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -18,8 +27,9 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept", "X-User-Id", "X-Org-Id"],
 )
 
-# Mount Invoice Brain API
+# Mount Routers
 app.include_router(invoice_brain_router, prefix=settings.API_V1_STR)
+app.include_router(reconciliation_router, prefix=settings.API_V1_STR)
 
 @app.get("/health")
 def health_check():

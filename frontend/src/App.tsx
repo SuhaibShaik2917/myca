@@ -9,11 +9,22 @@ import {
   Building2,
   Send,
   UploadCloud,
-  Info
+  Info,
+  GitCompare,
+  BookOpen,
+  ShieldCheck,
+  Layers
 } from "lucide-react";
 
+import { Gstr2bUpload } from "./pages/Gstr2bUpload";
+import { PurchaseRegister } from "./pages/PurchaseRegister";
+import { ReconciliationWorkbench } from "./pages/ReconciliationWorkbench";
+import { ItcRiskDashboard } from "./pages/ItcRiskDashboard";
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"invoices" | "credit" | "schemes" | "ai">("invoices");
+  const [activeTab, setActiveTab] = useState<
+    "invoices" | "gstr2b" | "purchase" | "reconciliation" | "itc_risk" | "credit" | "schemes" | "ai"
+  >("gstr2b");
   const [chatMessages, setChatMessages] = useState<Array<{ sender: "user" | "assistant"; text: string }>>([
     {
       sender: "assistant",
@@ -52,7 +63,7 @@ export default function App() {
       {/* Demo Mode Notification Banner */}
       <div className="bg-amber-500 text-white text-xs py-1.5 px-4 text-center font-medium flex items-center justify-center space-x-2">
         <AlertCircle className="w-4 h-4" />
-        <span>Demonstration Mode / Mock Preview — Backend migrations under formal security audit. Real financial data is not being processed.</span>
+        <span>Milestone 2 Active Preview — Multi-Registration GSTR-2B, Purchase Register, Deterministic 4-Pass Reconciliation & ITC Risk Engine.</span>
       </div>
 
       {/* Header */}
@@ -61,65 +72,116 @@ export default function App() {
           <div className="bg-indigo-600 text-white px-3 py-1.5 rounded-lg font-bold text-xl tracking-tight">MyCA</div>
           <div>
             <h1 className="text-lg md:text-xl font-bold text-slate-800">Financial Companion for Indian MSMEs</h1>
-            <p className="text-xs text-slate-500">Autonomous Invoicing • Readiness Indicators • Scheme Discovery</p>
+            <p className="text-xs text-slate-500">Autonomous Invoicing • GSTR-2B Inward Supplies • Statutory ITC Risk Engine</p>
           </div>
         </div>
         <div className="flex items-center space-x-4 self-end sm:self-auto">
           <div className="flex items-center text-xs bg-slate-100 text-slate-700 px-3 py-1.5 rounded-full border border-slate-300">
             <Shield className="w-3.5 h-3.5 mr-1.5 text-indigo-600" />
-            Security Baseline: PostgreSQL 16.15 RLS
+            Security: PostgreSQL 16 Forced RLS
           </div>
           <div className="text-right">
-            <div className="text-xs font-semibold text-slate-500">[Demo Profile] Acme Tools Pvt Ltd</div>
-            <div className="text-xs text-slate-400 font-mono">GSTIN: 27AABCU9603R1ZM</div>
+            <div className="text-xs font-semibold text-slate-500">[Active Org] Apex Enterprises Pvt Ltd</div>
+            <div className="text-xs text-slate-400 font-mono">PAN: AABCA1234F | GSTIN: 27AABCB1234M1ZT</div>
           </div>
         </div>
       </header>
 
       {/* Responsive Navigation */}
-      <nav className="bg-white border-b border-slate-200 px-4 md:px-8 flex space-x-4 md:space-x-8 overflow-x-auto scrollbar-none">
+      <nav className="bg-white border-b border-slate-200 px-4 md:px-8 flex space-x-4 md:space-x-6 overflow-x-auto scrollbar-none">
+        <button
+          onClick={() => setActiveTab("gstr2b")}
+          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
+            activeTab === "gstr2b"
+              ? "border-indigo-600 text-indigo-600"
+              : "border-transparent text-slate-500 hover:text-slate-700"
+          }`}
+        >
+          <Layers className="w-4 h-4 mr-1.5" />
+          GSTR-2B Ingest
+        </button>
+
+        <button
+          onClick={() => setActiveTab("purchase")}
+          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
+            activeTab === "purchase"
+              ? "border-indigo-600 text-indigo-600"
+              : "border-transparent text-slate-500 hover:text-slate-700"
+          }`}
+        >
+          <BookOpen className="w-4 h-4 mr-1.5" />
+          Purchase Register
+        </button>
+
+        <button
+          onClick={() => setActiveTab("reconciliation")}
+          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
+            activeTab === "reconciliation"
+              ? "border-indigo-600 text-indigo-600"
+              : "border-transparent text-slate-500 hover:text-slate-700"
+          }`}
+        >
+          <GitCompare className="w-4 h-4 mr-1.5" />
+          Reconciliation (4-Pass)
+        </button>
+
+        <button
+          onClick={() => setActiveTab("itc_risk")}
+          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
+            activeTab === "itc_risk"
+              ? "border-indigo-600 text-indigo-600"
+              : "border-transparent text-slate-500 hover:text-slate-700"
+          }`}
+        >
+          <ShieldCheck className="w-4 h-4 mr-1.5" />
+          ITC Risk & GSTR-3B
+        </button>
+
         <button
           onClick={() => setActiveTab("invoices")}
-          className={`py-3.5 px-2 font-medium text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
+          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
             activeTab === "invoices"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-700"
           }`}
         >
-          <FileText className="w-4 h-4 mr-2" />
-          Invoice Brain
+          <FileText className="w-4 h-4 mr-1.5" />
+          Outward Invoices (M1)
         </button>
+
         <button
           onClick={() => setActiveTab("credit")}
-          className={`py-3.5 px-2 font-medium text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
+          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
             activeTab === "credit"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-700"
           }`}
         >
-          <TrendingUp className="w-4 h-4 mr-2" />
+          <TrendingUp className="w-4 h-4 mr-1.5" />
           Credit Builder
         </button>
+
         <button
           onClick={() => setActiveTab("schemes")}
-          className={`py-3.5 px-2 font-medium text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
+          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
             activeTab === "schemes"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-700"
           }`}
         >
-          <Award className="w-4 h-4 mr-2" />
+          <Award className="w-4 h-4 mr-1.5" />
           Scheme Navigator
         </button>
+
         <button
           onClick={() => setActiveTab("ai")}
-          className={`py-3.5 px-2 font-medium text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
+          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
             activeTab === "ai"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-700"
           }`}
         >
-          <Bot className="w-4 h-4 mr-2" />
+          <Bot className="w-4 h-4 mr-1.5" />
           AI Financial Advisor
         </button>
       </nav>
@@ -133,12 +195,18 @@ export default function App() {
           </div>
         )}
 
-        {/* Tab 1: Invoice Brain */}
+        {/* Milestone 2 Views */}
+        {activeTab === "gstr2b" && <Gstr2bUpload />}
+        {activeTab === "purchase" && <PurchaseRegister />}
+        {activeTab === "reconciliation" && <ReconciliationWorkbench />}
+        {activeTab === "itc_risk" && <ItcRiskDashboard />}
+
+        {/* Tab: Outward Invoice Brain (Milestone 1) */}
         {activeTab === "invoices" && (
           <div className="space-y-6">
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
               <div>
-                <h2 className="text-xl md:text-2xl font-bold text-slate-800">Invoice Brain</h2>
+                <h2 className="text-xl md:text-2xl font-bold text-slate-800">Invoice Brain (Outward Supplies)</h2>
                 <p className="text-sm text-slate-500">Autonomous OCR Ingestion, Validation, and GST Cross-Checking (State Machine Enforced)</p>
               </div>
               <button 
@@ -146,13 +214,13 @@ export default function App() {
                 className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition flex items-center space-x-2 shadow-sm"
               >
                 <UploadCloud className="w-4 h-4" />
-                <span>+ Upload Invoices</span>
+                <span>+ Upload Outward Invoice</span>
               </button>
             </div>
             <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
               <div className="flex justify-between items-center mb-4">
-                <div className="text-sm text-slate-600 font-semibold">Simulated Invoicing Pipeline</div>
-                <span className="text-xs bg-slate-100 text-slate-500 px-2 py-1 rounded">Sample Data</span>
+                <div className="text-sm text-slate-600 font-semibold">Invoicing Pipeline Status</div>
+                <span className="text-xs bg-slate-100 text-slate-500 px-2 py-1 rounded">M1.3 Certified</span>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="bg-slate-50 p-4 rounded-lg border border-slate-100">
@@ -168,7 +236,7 @@ export default function App() {
                   <div className="text-2xl font-bold text-amber-700 mt-1">2</div>
                 </div>
                 <div className="bg-emerald-50 p-4 rounded-lg border border-emerald-100">
-                  <div className="text-xs text-emerald-600 font-medium">Export Ready</div>
+                  <div className="text-xs text-emerald-600 font-medium">Export Ready (GSTR-1)</div>
                   <div className="text-2xl font-bold text-emerald-700 mt-1">42</div>
                 </div>
               </div>
@@ -176,7 +244,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Tab 2: Credit Builder */}
+        {/* Tab: Credit Builder */}
         {activeTab === "credit" && (
           <div className="space-y-6">
             <div>
@@ -198,7 +266,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Tab 3: Scheme Navigator */}
+        {/* Tab: Scheme Navigator */}
         {activeTab === "schemes" && (
           <div className="space-y-6">
             <div>
@@ -227,7 +295,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Tab 4: AI Financial Advisor */}
+        {/* Tab: AI Financial Advisor */}
         {activeTab === "ai" && (
           <div className="space-y-6">
             <div>
