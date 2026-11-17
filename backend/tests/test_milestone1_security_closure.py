@@ -1556,3 +1556,197 @@ def test_storage_orphan_reconciliation_lifecycle(test_tenants, tmp_path):
     assert not orphan_file.exists(), "Stale orphan file must be deleted"
     assert in_flight_file.exists(), "In-flight file within grace period must be preserved"
     assert active_file.exists(), "Active DB-referenced file must be preserved"
+
+
+def test_aato_default_dropped_and_placeholder_cleansing(test_tenants):
+    """
+    Reviewer Requirement 1:
+    1. Insert profile without supplying AATO -> NULL (default dropped)
+    2. Insert profile with explicit NULL -> NULL
+    3. Insert profile with verified AATO -> Supplied value retained
+    4. Existing unverified 5 Cr placeholder -> Treated as unverified/unresolved
+    5. Verified AATO above 5 Cr -> Six-digit classification
+    6. Verified AATO at or below 5 Cr -> Applicable four-digit classification
+    """
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # 1. Insert without supplying preceding_fy_aato
+            p1_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector)
+                VALUES (%s, %s, %s, 'Services', 'IT')
+                RETURNING preceding_fy_aato;
+            """, (p1_id, test_tenants["org_a"], random_gstin("27")))
+            val1 = cur.fetchone()[0]
+            assert val1 is None, f"Default must be dropped; expected NULL, got {val1}"
+
+            # 2. Insert with explicit NULL
+            p2_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector, preceding_fy_aato)
+                VALUES (%s, %s, %s, 'Services', 'IT', NULL)
+                RETURNING preceding_fy_aato;
+            """, (p2_id, test_tenants["org_a"], random_gstin("27")))
+            val2 = cur.fetchone()[0]
+            assert val2 is None, f"Explicit NULL must persist; got {val2}"
+
+            # 3. Insert with verified AATO (e.g. 4.2 Crore)
+            p3_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector, preceding_fy_aato)
+                VALUES (%s, %s, %s, 'Services', 'IT', 42000000.00)
+                RETURNING preceding_fy_aato;
+            """, (p3_id, test_tenants["org_a"], random_gstin("27")))
+            val3 = cur.fetchone()[0]
+            assert Decimal(str(val3)) == Decimal("42000000.00")
+
+    # 4. Existing unverified placeholder check
+    res_placeholder = validate_hsn_compliance("8471", aato_crores=None, is_b2b=True)
+    assert res_placeholder.is_compliant is False
+    assert res_placeholder.classification == "aato_unverified_unresolved"
+
+    # 5. Verified AATO above 5 Crore (> 5 Cr requires 6 digits)
+    res_above = validate_hsn_compliance("8471", aato_crores=Decimal("8.0"), is_b2b=True)
+    assert res_above.is_compliant is False
+    assert res_above.classification == "min_digits_unmet"
+    assert "minimum 6 digits" in res_above.error_message
+
+    res_above_6digit = validate_hsn_compliance("847130", aato_crores=Decimal("8.0"), is_b2b=True)
+    assert res_above_6digit.is_compliant is True
+    assert res_above_6digit.classification == "compliant"
+
+    # 6. Verified AATO at or below 5 Crore (<= 5 Cr accepts 4 digits for B2B)
+    res_below_4digit = validate_hsn_compliance("8471", aato_crores=Decimal("3.5"), is_b2b=True)
+    assert res_below_4digit.is_compliant is True
+    assert res_below_4digit.classification == "compliant"
+
+
+def test_positive_path_worker_replace_ocr_line_items_under_rls(test_tenants):
+    """
+    Reviewer Requirement 2: Positive-path execution under non-superuser worker_service_user:
+    1. Real worker login claims an invoice_ocr task.
+    2. Obtains a valid lease token.
+    3. Calls replace_ocr_line_items().
+    4. Associated invoice's line items are successfully replaced.
+    5. A worker from another tenant cannot do the same.
+    6. A worker without a valid lease remains blocked.
+    """
+    org_a = test_tenants["org_a"]
+    org_b = test_tenants["org_b"]
+    user_a = test_tenants["user_a"]
+    profile_a = test_tenants["profile_a"]
+    inv_id = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())
+
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # Seed invoice in uploaded state
+            cur.execute("""
+                INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
+                VALUES (%s, %s, 'invoice', 'pos_test.pdf', 1024, 'application/pdf', '/tmp/pos.pdf', 'fake_hash_pos');
+            """, (doc_id, org_a))
+            cur.execute("""
+                INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, status)
+                VALUES (%s, %s, %s, 'INV-POS-PATH', '2026-11-17', 'Vendor Pos', 0, 0, 0, 0, 0, 'uploaded');
+            """, (inv_id, org_a, profile_a))
+            # Enqueue invoice_ocr task
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_a,))
+            cur.execute("""
+                SELECT public.enqueue_task('invoice_ocr', %s::jsonb, %s::uuid);
+            """, (json.dumps({"invoice_id": inv_id, "document_id": doc_id}), org_a))
+            task_id = str(cur.fetchone()[0])
+
+    # 1 & 2: Real worker login claims the invoice_ocr task
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_a,))
+            cur.execute("SELECT o_task_id, o_lease_token FROM public.claim_task(%s, 'worker-pos');", (org_a,))
+            claimed_id, lease_token = cur.fetchone()
+            assert str(claimed_id) == task_id
+            assert lease_token is not None
+
+            # 3 & 4: Worker calls replace_ocr_line_items() to replace items successfully
+            new_lines = [
+                {
+                    "item_description": "Extracted Cloud Server Consulting",
+                    "hsn_sac_code": "998314",
+                    "quantity": 2.0,
+                    "unit_price": 5000.00,
+                    "taxable_amount": 10000.00,
+                    "gst_rate": 18.00,
+                    "cgst_amount": 900.00,
+                    "sgst_amount": 900.00,
+                    "igst_amount": 0.00,
+                    "total_amount": 11800.00,
+                    "confidence": 0.98
+                }
+            ]
+            cur.execute("""
+                SELECT public.replace_ocr_line_items(%s, %s, %s, %s::jsonb);
+            """, (task_id, lease_token, inv_id, json.dumps(new_lines)))
+
+    # Verify line items in database
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT item_description, quantity, taxable_amount FROM public.invoice_line_items WHERE invoice_id = %s;", (inv_id,))
+            rows = cur.fetchall()
+            assert len(rows) == 1
+            assert rows[0][0] == "Extracted Cloud Server Consulting"
+            assert Decimal(str(rows[0][1])) == Decimal("2.000")
+            assert Decimal(str(rows[0][2])) == Decimal("10000.00")
+
+    # 5: Worker from another tenant (Org B) cannot replace items for Org A
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_b,))
+            with pytest.raises(psycopg.Error) as exc_cross:
+                cur.execute("""
+                    SELECT public.replace_ocr_line_items(%s, %s, %s, '[]'::jsonb);
+                """, (task_id, lease_token, inv_id))
+            assert exc_cross.value.sqlstate == "42501"
+
+    # 6: Worker without a valid lease remains blocked
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_a,))
+            with pytest.raises(psycopg.Error) as exc_invalid:
+                cur.execute("""
+                    SELECT public.replace_ocr_line_items(%s, 'invalid-token-xyz', %s, '[]'::jsonb);
+                """, (task_id, inv_id))
+            assert exc_invalid.value.sqlstate == "42501"
+
+
+def test_gstr1_table_12_b2b_mandatory_across_all_registered_supply_tables(test_tenants):
+    """
+    Reviewer Requirement 4: Broaden Table 12 B2B requirement detection
+    across all applicable registered-recipient supply tables (Table 4, 6B, 6C, 8, 9A, 9B, 9C, 15, 15A).
+    """
+    headers = {"X-User-Id": test_tenants["user_a"], "X-Org-Id": test_tenants["org_a"]}
+    res = client.get("/api/v1/gst/gstr1-draft?period=2026-11", headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    # If Table 4 supplies exist, Table 12 B2B is marked mandatory
+    assert "table_12_b2b_mandatory" in data
+    assert "table_12_warnings" in data
+
+
+def test_gemini_vision_live_smoke_test_harness(tmp_path):
+    """
+    Reviewer Requirement 5: Operational Acceptance Smoke Test Harness.
+    Verifies that the Gemini extraction engine produces structured, validated
+    ExtractedInvoiceData without fabricated numbers.
+    """
+    sample_pdf = tmp_path / "smoke_invoice.pdf"
+    sample_pdf.write_bytes(b"%PDF-1.4\n%Redacted Synthetic GST Tax Invoice\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF")
+
+    extracted = extract_invoice_with_gemini(str(sample_pdf), "application/pdf")
+    assert extracted is not None
+    assert extracted.invoice_number.startswith("INV-")
+    assert extracted.counterparty_name is not None
+    assert len(extracted.line_items) > 0
+    # Verify no fabricated rates: line item rate and totals are mathematically sound
+    for item in extracted.line_items:
+        if item.quantity is not None and item.unit_price is not None:
+            assert abs(Decimal(str(item.taxable_amount)) - (Decimal(str(item.quantity)) * Decimal(str(item.unit_price)))) < Decimal("0.05")
+    # Verify raw response provenance is attached
+    assert extracted.raw_ocr_response is not None

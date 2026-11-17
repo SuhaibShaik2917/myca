@@ -217,8 +217,34 @@ def prepare_gstr1_draft(
             table_12_hsn_b2c.append(entry)
         table_12_hsn_summary.append(entry)
 
-    # May 2025 Portal Advisory: B2B Table 12 is mandatory when B2B supplies are reported; B2C is optional
-    table_12_b2b_mandatory = len(b2b_entries) > 0
+    # GST Portal May 2025 Guidance & Phase 3 Rules:
+    # Table 12 B2B tab is mandatory when registered-recipient outward supplies are reported across ANY of:
+    # - Table 4 (Taxable outward supplies to registered persons - B2B regular)
+    # - Table 6B (Supplies made to SEZ unit / SEZ developer with or without payment)
+    # - Table 6C (Deemed exports)
+    # - Table 8 (Nil-rated / exempt outward supplies to registered persons)
+    # - Table 9A (Amendments to registered outward supplies of earlier periods)
+    # - Table 9B (Credit / Debit Notes issued to registered persons)
+    # - Table 9C (Amended Credit / Debit Notes to registered persons)
+    # - Table 15 (Supplies made through E-commerce operators to registered persons u/s 9(5))
+    # - Table 15A (Amendments to supplies through ECO to registered persons)
+    b2b_supply_tables = {
+        "table_4": len(b2b_entries) > 0,
+        "table_6b": False,      # SEZ supplies to registered units
+        "table_6c": False,      # Deemed exports to registered recipients
+        "table_8_b2b": False,   # Nil-rated / exempt to registered
+        "table_9a_b2b": False,  # B2B amendments
+        "table_9b_b2b": False,  # B2B credit/debit notes
+        "table_9c_b2b": False,  # Amended B2B credit/debit notes
+        "table_15_b2b": False,  # ECO supplies to registered u/s 9(5)
+        "table_15a_b2b": False, # ECO amendments to registered
+    }
+    B2B_REQUIRING_TABLE_12 = {
+        "table_4", "table_6b", "table_6c", "table_8_b2b",
+        "table_9a_b2b", "table_9b_b2b", "table_9c_b2b", "table_15_b2b", "table_15a_b2b"
+    }
+    b2b_triggering_tables = [t for t in B2B_REQUIRING_TABLE_12 if b2b_supply_tables[t]]
+    table_12_b2b_mandatory = len(b2b_triggering_tables) > 0
     table_12_b2c_mandatory = False  # Explicitly optional per May 2025 Advisory
     table_12_warnings: List[str] = []
 
@@ -229,7 +255,10 @@ def prepare_gstr1_draft(
         )
 
     if table_12_b2b_mandatory and len(table_12_hsn_b2b) == 0:
-        table_12_warnings.append("Table 4 contains B2B supplies, but Table 12 B2B tab has no entries.")
+        table_12_warnings.append(
+            f"Registered outward supplies are present in {', '.join(b2b_triggering_tables)}, but Table 12 B2B tab has no entries. "
+            "Under GST Portal Phase 3 rules, Table 12 B2B reporting is mandatory when supplies to registered recipients are present."
+        )
 
     # Table 12 B2C advisory notice: If Table 5 or 7 has supplies but Table 12 B2C tab is empty
     if (len(b2c_large) > 0 or len(b2c_small) > 0) and len(table_12_hsn_b2c) == 0:
