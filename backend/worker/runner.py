@@ -155,5 +155,37 @@ class WorkerRunner:
             )
 
     def process_task(self, task_id: str, heartbeat: HeartbeatManager) -> dict:
-        # Stub for business logic: OCR, reconciliation, scoring
-        return {"status": "success", "processed_task": task_id}
+        """
+        Routes claimed task to the appropriate processing pipeline.
+        Invoice Brain: Executes OCR extraction and deterministic GST validation.
+        """
+        from app.modules.invoice_brain.service import process_invoice_ocr_task
+
+        with psycopg.connect(self.conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT set_config('app.current_org', %s, false);", (self.org_id,))
+                cur.execute("SELECT task_type, payload FROM public.worker_tasks WHERE id = %s;", (task_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError(f"Task {task_id} payload not found")
+                
+                task_type, payload = row[0], row[1]
+                logger.info(f"Processing task {task_id} of type '{task_type}'")
+
+                if task_type == "invoice_ocr":
+                    invoice_id = payload.get("invoice_id")
+                    document_id = payload.get("document_id")
+                    file_path = payload.get("file_path")
+                    mime_type = payload.get("mime_type", "application/pdf")
+                    
+                    return process_invoice_ocr_task(
+                        db_conn=conn,
+                        task_id=task_id,
+                        invoice_id=invoice_id,
+                        document_id=document_id,
+                        org_id=self.org_id,
+                        file_path=file_path,
+                        mime_type=mime_type
+                    )
+                else:
+                    return {"status": "success", "task_type": task_type, "processed_task": task_id}

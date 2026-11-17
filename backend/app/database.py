@@ -16,8 +16,10 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def verify_and_resolve_tenant_membership(db: Session, user_id: str, org_id: str) -> bool:
     """
     Server-side verification of active user membership before applying tenant context.
-    Prevents trusting client-supplied org_id.
+    Sets candidate org context so RLS policy org_memberships_tenant permits reading.
+    Clears context if candidate membership is invalid or inactive.
     """
+    set_tenant_context(db, org_id=org_id, user_id=user_id)
     stmt = text("""
         SELECT 1 
         FROM public.organization_memberships
@@ -26,7 +28,10 @@ def verify_and_resolve_tenant_membership(db: Session, user_id: str, org_id: str)
           AND status = 'active';
     """)
     result = db.execute(stmt, {"org_id": org_id, "user_id": user_id}).scalar()
-    return result is not None
+    if not result:
+        set_tenant_context(db, org_id=None, user_id=None)
+        return False
+    return True
 
 def set_tenant_context(session: Session, org_id: Optional[str], user_id: Optional[str]) -> None:
     """

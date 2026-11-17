@@ -203,7 +203,7 @@ def upgrade() -> None:
     END;
     $$;
 
-    -- Line Item Immutability Trigger (C1 Fix: Prevents moving line items out of or into approved/export-ready invoices)
+    -- Line Item Immutability Trigger (C1 Fix: Prevents moving line items out of or into approved/export-ready invoices with deterministic FOR UPDATE locking)
     CREATE OR REPLACE FUNCTION public.enforce_invoice_line_item_immutability()
     RETURNS trigger
     LANGUAGE plpgsql
@@ -217,7 +217,12 @@ def upgrade() -> None:
         IF TG_OP = 'INSERT' THEN
             SELECT status INTO v_new_status
             FROM public.invoices
-            WHERE id = NEW.invoice_id;
+            WHERE id = NEW.invoice_id
+            FOR UPDATE;
+
+            IF v_new_status IS NULL THEN
+                RAISE EXCEPTION 'Parent invoice % does not exist', NEW.invoice_id;
+            END IF;
 
             IF v_new_status IN ('approved', 'export_ready') THEN
                 RAISE EXCEPTION 'Cannot insert line items for approved/export-ready invoice % (42501)', NEW.invoice_id;
@@ -227,7 +232,8 @@ def upgrade() -> None:
         ELSIF TG_OP = 'DELETE' THEN
             SELECT status INTO v_old_status
             FROM public.invoices
-            WHERE id = OLD.invoice_id;
+            WHERE id = OLD.invoice_id
+            FOR UPDATE;
 
             IF v_old_status IN ('approved', 'export_ready') THEN
                 RAISE EXCEPTION 'Cannot delete line items from approved/export-ready invoice % (42501)', OLD.invoice_id;
@@ -235,20 +241,28 @@ def upgrade() -> None:
             RETURN OLD;
 
         ELSIF TG_OP = 'UPDATE' THEN
-            -- Check original parent invoice
-            SELECT status INTO v_old_status
-            FROM public.invoices
-            WHERE id = OLD.invoice_id;
-
-            IF v_old_status IN ('approved', 'export_ready') THEN
-                RAISE EXCEPTION 'Cannot modify or move line items out of approved/export-ready invoice % (42501)', OLD.invoice_id;
-            END IF;
-
-            -- If moving to a different invoice, also check destination invoice
-            IF NEW.invoice_id <> OLD.invoice_id THEN
-                SELECT status INTO v_new_status
+            IF OLD.invoice_id = NEW.invoice_id THEN
+                SELECT status INTO v_old_status
                 FROM public.invoices
-                WHERE id = NEW.invoice_id;
+                WHERE id = OLD.invoice_id
+                FOR UPDATE;
+
+                IF v_old_status IN ('approved', 'export_ready') THEN
+                    RAISE EXCEPTION 'Cannot modify or move line items out of approved/export-ready invoice % (42501)', OLD.invoice_id;
+                END IF;
+            ELSE
+                -- Moving between two distinct invoices: acquire locks in deterministic ID order to prevent deadlocks
+                IF OLD.invoice_id < NEW.invoice_id THEN
+                    SELECT status INTO v_old_status FROM public.invoices WHERE id = OLD.invoice_id FOR UPDATE;
+                    SELECT status INTO v_new_status FROM public.invoices WHERE id = NEW.invoice_id FOR UPDATE;
+                ELSE
+                    SELECT status INTO v_new_status FROM public.invoices WHERE id = NEW.invoice_id FOR UPDATE;
+                    SELECT status INTO v_old_status FROM public.invoices WHERE id = OLD.invoice_id FOR UPDATE;
+                END IF;
+
+                IF v_old_status IN ('approved', 'export_ready') THEN
+                    RAISE EXCEPTION 'Cannot modify or move line items out of approved/export-ready invoice % (42501)', OLD.invoice_id;
+                END IF;
 
                 IF v_new_status IN ('approved', 'export_ready') THEN
                     RAISE EXCEPTION 'Cannot move line items into approved/export-ready invoice % (42501)', NEW.invoice_id;

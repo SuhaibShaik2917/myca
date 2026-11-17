@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
+from app.modules.invoice_brain.api import router as invoice_brain_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -14,8 +15,11 @@ app.add_middleware(
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-User-Id", "X-Org-Id"],
 )
+
+# Mount Invoice Brain API
+app.include_router(invoice_brain_router, prefix=settings.API_V1_STR)
 
 @app.get("/health")
 def health_check():

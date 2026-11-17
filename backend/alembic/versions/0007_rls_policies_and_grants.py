@@ -218,6 +218,10 @@ def upgrade() -> None:
     -- Invoice transition rules lookup
     GRANT SELECT ON public.invoice_transition_rules TO app_user, worker_owner;
 
+    -- Search Path Security: Revoke CREATE on public from non-admin roles
+    REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+    REVOKE CREATE ON SCHEMA public FROM app_user, worker_owner, audit_writer, audit_reader, system_auditor;
+
     -- Privileges for v_org_users_owner (C5 Fix)
     GRANT SELECT ON public.global_users TO v_org_users_owner;
     GRANT SELECT ON public.organization_memberships TO v_org_users_owner;

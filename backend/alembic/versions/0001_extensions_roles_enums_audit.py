@@ -17,6 +17,9 @@ def upgrade() -> None:
     # 1. Extensions
     op.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
     op.execute('CREATE EXTENSION IF NOT EXISTS "pgcrypto";')
+    
+    # Secure public schema search path: prevent untrusted object creation
+    op.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC;")
 
     # 2. Database Roles
     op.execute("""

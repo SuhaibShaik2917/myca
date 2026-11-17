@@ -849,3 +849,113 @@ def test_h5_worker_authorization_two_distinct_logins():
             assert all(r["worker_role_name"] == "worker_service_user_2" for r in rows)
             assert any(str(r["org_id"]) == org_w2 for r in rows)
             assert not any(str(r["org_id"]) == org_w1 for r in rows)
+
+# -------------------------------------------------------------
+# Backlog Assurance Checks: Concurrency & Trusted Public Schema
+# -------------------------------------------------------------
+
+def test_c1_concurrent_approval_line_item_locking():
+    """
+    Check A (C1 Concurrency): Verify that enforce_invoice_line_item_immutability
+    locks parent invoice FOR UPDATE, serializing concurrent line item mutations
+    behind invoice approval and preventing race condition insertion.
+    """
+    import threading
+    import time
+
+    org_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+    profile_id = str(uuid.uuid4())
+    inv_id = str(uuid.uuid4())
+
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'Concurrency Test Org', %s);", (org_id, random_pan()))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Approver');", (user_id, random_email()))
+            cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_id, user_id))
+            cur.execute("INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector) VALUES (%s, %s, %s, 'Retail', 'Hardware');", (profile_id, org_id, random_gstin()))
+            cur.execute("""
+                INSERT INTO public.invoices (
+                    id, org_id, profile_id, invoice_number, invoice_date, counterparty_name,
+                    total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, status
+                ) VALUES (
+                    %s, %s, %s, 'INV-CONC-001', '2026-11-01', 'Test Counterparty',
+                    100.00, 9.00, 9.00, 0.00, 118.00, 'uploaded'
+                );
+            """, (inv_id, org_id, profile_id))
+            cur.execute("UPDATE public.invoices SET status = 'queued' WHERE id = %s;", (inv_id,))
+            cur.execute("UPDATE public.invoices SET status = 'processing' WHERE id = %s;", (inv_id,))
+            cur.execute("UPDATE public.invoices SET status = 'extracted' WHERE id = %s;", (inv_id,))
+            cur.execute("UPDATE public.invoices SET status = 'pending_review' WHERE id = %s;", (inv_id,))
+
+    line_thread_error = []
+    line_inserted = []
+
+    def insert_line_worker():
+        try:
+            with psycopg.connect(DB_APP, autocommit=True) as conn2:
+                with conn2.cursor() as cur2:
+                    cur2.execute("SELECT set_config('app.current_org', %s, false);", (org_id,))
+                    cur2.execute("SELECT set_config('app.current_user', %s, false);", (user_id,))
+                    # This will attempt to insert a line item while approval holds the invoice lock
+                    cur2.execute("""
+                        INSERT INTO public.invoice_line_items (
+                            id, invoice_id, org_id, item_description, quantity, unit_price, taxable_amount, gst_rate, total_amount
+                        ) VALUES (
+                            %s, %s, %s, 'Race Item', 1.0, 50.00, 50.00, 18.00, 59.00
+                        );
+                    """, (str(uuid.uuid4()), inv_id, org_id))
+                    line_inserted.append(True)
+        except Exception as e:
+            line_thread_error.append(e)
+
+    # Session 1: Approval transaction starts and holds lock
+    with psycopg.connect(DB_APP, autocommit=False) as conn1:
+        with conn1.cursor() as cur1:
+            cur1.execute("SELECT set_config('app.current_org', %s, false);", (org_id,))
+            cur1.execute("SELECT set_config('app.current_user', %s, false);", (user_id,))
+            cur1.execute("UPDATE public.invoices SET status = 'approved' WHERE id = %s;", (inv_id,))
+
+            # Spawn concurrent line insertion thread
+            t = threading.Thread(target=insert_line_worker)
+            t.start()
+
+            # Wait to ensure thread is blocked on the row lock
+            time.sleep(0.3)
+            assert len(line_inserted) == 0, "Line item inserted before approval committed - FOR UPDATE locking absent!"
+
+            # Commit approval
+            conn1.commit()
+
+            # Wait for thread to finish
+            t.join(timeout=3.0)
+
+    # Line item insert MUST fail with immutability violation
+    assert len(line_inserted) == 0, "Line item was unexpectedly inserted into approved invoice!"
+    assert len(line_thread_error) == 1, "Expected line item insertion to raise exception"
+    assert "Cannot insert line items for approved/export-ready invoice" in str(line_thread_error[0]) or "42501" in str(line_thread_error[0])
+
+
+def test_c3_public_schema_create_privilege_revocation():
+    """
+    Check B (C3 Public Schema Trust): Verify that CREATE on schema public is completely
+    revoked from PUBLIC, app_service_user, worker_service_user, and worker login roles,
+    ensuring public is a trusted schema for SECURITY DEFINER search_path = public, pg_temp.
+    """
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT 
+                    has_schema_privilege('public', 'public', 'CREATE') AS public_can_create,
+                    has_schema_privilege('app_service_user', 'public', 'CREATE') AS app_can_create,
+                    has_schema_privilege('worker_service_user', 'public', 'CREATE') AS worker_can_create,
+                    has_schema_privilege('worker_service_user_1', 'public', 'CREATE') AS worker1_can_create,
+                    has_schema_privilege('worker_service_user_2', 'public', 'CREATE') AS worker2_can_create;
+            """)
+            row = cur.fetchone()
+            assert not row["public_can_create"], "PUBLIC retains CREATE privilege on schema public!"
+            assert not row["app_can_create"], "app_service_user retains CREATE privilege on schema public!"
+            assert not row["worker_can_create"], "worker_service_user retains CREATE privilege on schema public!"
+            assert not row["worker1_can_create"], "worker_service_user_1 retains CREATE privilege on schema public!"
+            assert not row["worker2_can_create"], "worker_service_user_2 retains CREATE privilege on schema public!"
+
