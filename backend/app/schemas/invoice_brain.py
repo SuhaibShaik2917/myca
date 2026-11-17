@@ -7,14 +7,15 @@ from decimal import Decimal
 class LineItemBase(BaseModel):
     item_description: str = Field(..., min_length=1, max_length=500)
     hsn_sac_code: Optional[str] = Field(None, max_length=16)
-    quantity: Decimal = Field(default=Decimal("1.000"), ge=Decimal("0.001"))
-    unit_price: Decimal = Field(..., ge=Decimal("0.00"))
-    taxable_amount: Decimal = Field(..., ge=Decimal("0.00"))
-    gst_rate: Decimal = Field(default=Decimal("18.00"), ge=Decimal("0.00"), le=Decimal("100.00"))
-    cgst_amount: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
-    sgst_amount: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
-    igst_amount: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
-    total_amount: Decimal = Field(..., ge=Decimal("0.00"))
+    quantity: Optional[Decimal] = None
+    unit_price: Optional[Decimal] = None
+    taxable_amount: Optional[Decimal] = None
+    gst_rate: Optional[Decimal] = None
+    cgst_amount: Optional[Decimal] = None
+    sgst_amount: Optional[Decimal] = None
+    igst_amount: Optional[Decimal] = None
+    total_amount: Optional[Decimal] = None
+    extraction_confidence: Optional[Decimal] = None
 
 class LineItemCreate(LineItemBase):
     pass
@@ -161,7 +162,8 @@ class GSTR1DraftResponse(BaseModel):
     tax_period: str
     gstin: str
     legal_name: str
-    preceding_fy_aato: Decimal = Decimal("50000000.00")
+    preceding_fy_aato: Optional[Decimal] = None
+    aato_unverified: bool = False
     applicable_b2c_large_threshold: Decimal
     table_4_b2b: List[GSTR1Table4Entry] = []
     table_5_b2c_large: List[Dict[str, Any]] = []

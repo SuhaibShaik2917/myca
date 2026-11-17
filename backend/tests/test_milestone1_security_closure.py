@@ -1,6 +1,7 @@
 import os
 import sys
 import io
+import time
 import json
 import uuid
 import random
@@ -17,14 +18,18 @@ from psycopg.rows import dict_row
 
 from app.main import app
 from app.config import settings
+from app.database import SessionLocal
 from app.modules.invoice_brain.validator import (
-    calculate_gstin_checksum, validate_gstin_format_and_checksum
+    calculate_gstin_checksum, validate_gstin_format_and_checksum, validate_invoice_financials
 )
 from app.modules.invoice_brain.hsn_catalog import (
     lookup_hsn_code, validate_hsn_compliance
 )
 from app.modules.invoice_brain.gstr import (
     get_b2c_large_threshold, prepare_gstr1_draft, prepare_gstr3b_draft
+)
+from app.modules.invoice_brain.storage import (
+    reconcile_storage_orphans
 )
 from app.modules.invoice_brain.service import (
     process_invoice_ocr_task, update_invoice_fields, update_line_item,
@@ -1062,13 +1067,15 @@ def test_gstr3b_zero_placeholders_eliminated(test_tenants):
 
 def test_gemini_ocr_model_configuration_and_schema():
     """
-    Gemini OCR Compatibility:
-    Verify model is set to supported gemini-2.0-flash and extraction schema is consistent.
+    Milestone 1.3: Gemini OCR Compatibility (Late-2026 Models):
+    Verify model is set to currently active gemini-3.8-flash (primary) and gemini-3.5-flash-lite (fallback).
+    Verify schema supports nullable financial fields without fabricated defaults.
     """
-    assert settings.GEMINI_MODEL == "gemini-2.0-flash"
+    assert settings.GEMINI_MODEL == "gemini-3.8-flash"
+    assert settings.GEMINI_FALLBACK_MODEL == "gemini-3.5-flash-lite"
     
     from app.modules.invoice_brain.ocr import ExtractedInvoiceData, ExtractedLineItem
-    # Verify schema serialization
+    # Verify schema serialization with complete and incomplete fields
     sample_item = ExtractedLineItem(
         item_description="Test Item",
         hsn_sac_code="998311",
@@ -1079,7 +1086,16 @@ def test_gemini_ocr_model_configuration_and_schema():
         cgst_amount=18.0,
         sgst_amount=18.0,
         igst_amount=0.0,
-        total_amount=236.0
+        total_amount=236.0,
+        confidence=0.99
+    )
+    incomplete_item = ExtractedLineItem(
+        item_description="Unparsed Line",
+        quantity=None,
+        unit_price=None,
+        taxable_amount=None,
+        gst_rate=None,
+        total_amount=None
     )
     sample_data = ExtractedInvoiceData(
         invoice_number="INV-001",
@@ -1091,9 +1107,452 @@ def test_gemini_ocr_model_configuration_and_schema():
         sgst_amount=18.0,
         igst_amount=0.0,
         total_amount=236.0,
-        line_items=[sample_item]
+        confidence_score=0.98,
+        line_items=[sample_item, incomplete_item],
+        raw_ocr_response={"engine": "gemini-3.8-flash", "status": "success"}
     )
     json_str = sample_data.model_dump_json()
     reconstructed = ExtractedInvoiceData.model_validate_json(json_str)
     assert reconstructed.invoice_number == "INV-001"
-    assert len(reconstructed.line_items) == 1
+    assert len(reconstructed.line_items) == 2
+    assert reconstructed.line_items[1].quantity is None
+    assert reconstructed.raw_ocr_response["engine"] == "gemini-3.8-flash"
+
+
+# ==============================================================================
+# PART 8: Milestone 1.3 Security, Provenance & Statutory Corrections
+# ==============================================================================
+
+def test_replace_ocr_line_items_rejects_non_ocr_task_type(test_tenants):
+    """
+    Security Finding 1: Enforce OCR Task Type in replace_ocr_line_items().
+    Rejects any task where task_type IS DISTINCT FROM 'invoice_ocr'.
+    Worker claims a 'gst_validation' task; attempt to replace line items must raise 42501.
+    Proves existing line items remain untouched.
+    """
+    org_id = test_tenants["org_a"]
+    user_id = test_tenants["user_a"]
+    profile_id = test_tenants["profile_a"]
+
+    # Seed an invoice with initial line items
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            inv_id = seed_invoice(
+                cur, org_id, profile_id, user_id,
+                'INV-TYPE-ENFORCE', '2026-11-17', 'Vendor Enforce', '27AABCB1234M1ZT',
+                1000.00, 90.00, 90.00, 0, 1180.00,
+                status='extracted',
+                lines=[{
+                    "item_description": "Original Unmodified Item",
+                    "hsn_sac_code": "998311",
+                    "quantity": 1,
+                    "unit_price": 1000.00,
+                    "taxable_amount": 1000.00,
+                    "gst_rate": 18.00,
+                    "cgst_amount": 90.00,
+                    "sgst_amount": 90.00,
+                    "igst_amount": 0,
+                    "total_amount": 1180.00
+                }]
+            )
+
+            # Insert a worker task of type 'gst_validation' (NOT invoice_ocr)
+            val_task_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.worker_tasks (
+                    id, org_id, task_type, payload, status
+                ) VALUES (
+                    %s, %s, 'gst_validation', %s::jsonb, 'queued'
+                );
+            """, (val_task_id, org_id, json.dumps({"invoice_id": inv_id})))
+
+    # Claim task as worker_service_user
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_id,))
+            cur.execute("SELECT o_task_id, o_lease_token FROM public.claim_task(%s, 'worker-val');", (org_id,))
+            claimed = cur.fetchone()
+            assert claimed is not None
+            task_id, lease_token = claimed
+
+            # Attempt to invoke replace_ocr_line_items using this valid lease token
+            replacement_lines = [{
+                "item_description": "Malicious Injected Item",
+                "hsn_sac_code": "998311",
+                "quantity": 99,
+                "unit_price": 9999.00,
+                "taxable_amount": 9999.00,
+                "gst_rate": 18.00,
+                "cgst_amount": 899.91,
+                "sgst_amount": 899.91,
+                "igst_amount": 0,
+                "total_amount": 11798.82
+            }]
+
+            with pytest.raises(psycopg.Error) as exc_info:
+                cur.execute("""
+                    SELECT public.replace_ocr_line_items(%s, %s, %s, %s::jsonb);
+                """, (task_id, lease_token, inv_id, json.dumps(replacement_lines)))
+
+            assert exc_info.value.sqlstate == "42501"
+            assert "is not authorized for OCR line-item replacement" in str(exc_info.value)
+
+    # Verify original line items are completely untouched
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT item_description, quantity FROM public.invoice_line_items WHERE invoice_id = %s;", (inv_id,))
+            rows = cur.fetchall()
+            assert len(rows) == 1
+            assert rows[0][0] == "Original Unmodified Item"
+            assert Decimal(str(rows[0][1])) == Decimal("1.000")
+
+
+def test_replace_ocr_line_items_rejects_locked_by_mismatch(test_tenants):
+    """
+    Security Finding 1 (Lock Ownership):
+    Rejects invocation when the task was locked by a different database identity.
+    """
+    org_id = test_tenants["org_a"]
+    task_id = str(uuid.uuid4())
+    inv_id = str(uuid.uuid4())
+    token = str(uuid.uuid4())
+    import hashlib
+    token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # Seed invoice
+            seed_invoice(cur, org_id, test_tenants["profile_a"], test_tenants["user_a"],
+                         'INV-LOCK-MISMATCH', '2026-11-17', 'Vendor Lock', None,
+                         100.00, 9.00, 9.00, 0, 118.00, status='extracted')
+
+            # Insert an invoice_ocr task locked by someone else
+            cur.execute("""
+                INSERT INTO public.worker_tasks (
+                    id, org_id, task_type, payload, status, locked_by, lease_token_hash, lease_expire
+                ) VALUES (
+                    %s, %s, 'invoice_ocr', %s::jsonb, 'in_progress', 'foreign_worker_identity', %s, clock_timestamp() + interval '5 minutes'
+                );
+            """, (task_id, org_id, json.dumps({"invoice_id": inv_id}), token_hash))
+
+    # Worker attempts invocation with valid hash but locked_by mismatch
+    with psycopg.connect(DB_WORKER, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.current_org', %s, false);", (org_id,))
+            with pytest.raises(psycopg.Error) as exc_info:
+                cur.execute("""
+                    SELECT public.replace_ocr_line_items(%s, %s, %s, '[]'::jsonb);
+                """, (task_id, token, inv_id))
+
+            assert exc_info.value.sqlstate == "42501"
+            assert "is not locked by current worker" in str(exc_info.value)
+
+
+def test_invoice_ocr_writer_role_least_privilege():
+    """
+    Security Finding 2: Replace Superuser SECURITY DEFINER Ownership.
+    Verify invoice_ocr_writer is NOLOGIN NOINHERIT non-superuser role.
+    Verify replace_ocr_line_items is owned by invoice_ocr_writer (NOT postgres).
+    """
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # 1. Verify role attributes
+            cur.execute("""
+                SELECT rolcanlogin, rolsuper, rolinherit
+                FROM pg_roles
+                WHERE rolname = 'invoice_ocr_writer';
+            """)
+            role = cur.fetchone()
+            assert role is not None, "Role invoice_ocr_writer must exist"
+            rolcanlogin, rolsuper, rolinherit = role
+            assert rolcanlogin is False, "invoice_ocr_writer must be NOLOGIN"
+            assert rolsuper is False, "invoice_ocr_writer must NOT be superuser"
+            assert rolinherit is False, "invoice_ocr_writer must be NOINHERIT"
+
+            # 2. Verify function ownership
+            cur.execute("""
+                SELECT r.rolname
+                FROM pg_proc p
+                JOIN pg_roles r ON r.oid = p.proowner
+                WHERE p.proname = 'replace_ocr_line_items';
+            """)
+            owner_row = cur.fetchone()
+            assert owner_row is not None
+            assert owner_row[0] == "invoice_ocr_writer", f"Function owner must be invoice_ocr_writer, got {owner_row[0]}"
+
+            # 3. Verify role is not in superuser or platform_admin membership
+            cur.execute("""
+                SELECT b.rolname
+                FROM pg_auth_members m
+                JOIN pg_roles a ON a.oid = m.member
+                JOIN pg_roles b ON b.oid = m.roleid
+                WHERE a.rolname = 'invoice_ocr_writer';
+            """)
+            memberships = [r[0] for r in cur.fetchall()]
+            assert "postgres" not in memberships
+            assert "platform_admin" not in memberships
+
+
+def test_missing_ocr_fields_not_fabricated_and_block_approval(test_tenants):
+    """
+    Finding 3: Honest Missing-Value Handling & Approval Blockage.
+    1. Table defaults and unsafe NOT NULL eliminated.
+    2. Missing quantity, taxable_amount, gst_rate stored genuinely as NULL (not 1.0 or 18%).
+    3. Validator flags missing fields as critical discrepancy errors.
+    4. Transition to validation_failed strictly blocks approval.
+    """
+    org_id = test_tenants["org_a"]
+    user_id = test_tenants["user_a"]
+    profile_id = test_tenants["profile_a"]
+    inv_id = str(uuid.uuid4())
+    item_id = str(uuid.uuid4())
+
+    # 1. Insert invoice and line item with NULL financial fields (verifies schema allows nulls)
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.invoices (
+                    id, org_id, profile_id, invoice_number, invoice_date,
+                    counterparty_name, total_taxable_amount, cgst_amount,
+                    sgst_amount, igst_amount, total_amount, status
+                ) VALUES (
+                    %s, %s, %s, 'INV-MISSING-FIELDS', '2026-11-17',
+                    'Incomplete Extraction Vendor', 0.00, 0.00,
+                    0.00, 0.00, 0.00, 'uploaded'
+                );
+            """, (inv_id, org_id, profile_id))
+
+            cur.execute("""
+                INSERT INTO public.invoice_line_items (
+                    id, invoice_id, org_id, item_description, hsn_sac_code,
+                    quantity, unit_price, taxable_amount, gst_rate,
+                    cgst_amount, sgst_amount, igst_amount, total_amount
+                ) VALUES (
+                    %s, %s, %s, 'Unextracted Line Item', '998311',
+                    NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL
+                );
+            """, (item_id, inv_id, org_id))
+
+            # Verify values in database are genuinely NULL (no 1.0 or 18.0 defaults)
+            cur.execute("""
+                SELECT quantity, unit_price, taxable_amount, gst_rate, total_amount
+                FROM public.invoice_line_items
+                WHERE id = %s;
+            """, (item_id,))
+            q, p, t, r, tot = cur.fetchone()
+            assert q is None, "quantity must be NULL in DB without default"
+            assert p is None, "unit_price must be NULL in DB without default"
+            assert t is None, "taxable_amount must be NULL in DB without default"
+            assert r is None, "gst_rate must be NULL in DB without default"
+            assert tot is None, "total_amount must be NULL in DB without default"
+
+            # Transition to pending_review to test approval gate
+            cur.execute("UPDATE public.invoices SET status = 'queued' WHERE id = %s;", (inv_id,))
+            cur.execute("UPDATE public.invoices SET status = 'processing' WHERE id = %s;", (inv_id,))
+            cur.execute("UPDATE public.invoices SET status = 'extracted' WHERE id = %s;", (inv_id,))
+            cur.execute("UPDATE public.invoices SET status = 'pending_review' WHERE id = %s;", (inv_id,))
+
+    # 2. Test validator flags missing fields and marks is_valid = False
+    validation = validate_invoice_financials(
+        invoice={"total_taxable_amount": Decimal("0.00"), "total_amount": Decimal("0.00")},
+        line_items=[{
+            "item_description": "Unextracted Line Item",
+            "quantity": None,
+            "unit_price": None,
+            "taxable_amount": None,
+            "gst_rate": None,
+            "total_amount": None
+        }]
+    )
+    assert validation.is_valid is False
+    assert validation.has_critical_errors is True
+    flag_codes = [f.code for f in validation.flags]
+    assert "ERR_MISSING_QUANTITY" in flag_codes
+    assert "ERR_MISSING_TAXABLE_AMOUNT" in flag_codes
+    assert "ERR_MISSING_GST_RATE" in flag_codes
+
+    # 3. Test approval gate: Attempting to approve must fail
+    with SessionLocal() as db_session:
+        from sqlalchemy import text
+        db_session.execute(text("SELECT set_config('app.current_org', :org, false);"), {"org": org_id})
+        db_session.execute(text("SELECT set_config('app.current_user', :user, false);"), {"user": user_id})
+        with pytest.raises(InvoiceStatusError) as exc:
+            approve_invoice(db_session, org_id, user_id, inv_id)
+        assert "Cannot approve invoice" in str(exc.value)
+
+
+def test_gstr1_table_13_multi_table_outward_supplies_triggers(test_tenants):
+    """
+    Statutory Finding 5: Correct Table 13 Mandatory Logic across Outward Supply Tables.
+    Table 13 is mandatory from May 2025 onwards IF ANY outward supply table contains data:
+    Tables 4, 5, 6, 7, 8, 9, 10, 14, 15.
+    Must be FALSE for nil return or period < 2025-05.
+    Must include 'triggering_tables' list.
+    """
+    headers = {"X-User-Id": test_tenants["user_b"], "X-Org-Id": test_tenants["org_b"]}
+
+    # 1. Nil Return for Org B (no invoices): Table 13 is NOT mandatory
+    res_nil = client.get("/api/v1/gst/gstr1-draft?period=2026-11", headers=headers)
+    assert res_nil.status_code == 200
+    doc_nil = res_nil.json()["table_13_doc_summary"]
+    assert doc_nil["is_mandatory"] is False
+    assert doc_nil["has_outward_supplies"] is False
+    assert doc_nil["triggering_tables"] == []
+
+    # 2. Historical Period (< 2025-05) with supplies: Table 13 is NOT mandatory
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            seed_invoice(
+                cur, test_tenants["org_b"], test_tenants["profile_b"], test_tenants["user_b"],
+                'INV-HIST-T13', '2024-12-10', 'Vendor Hist', '27AABCB1234M1ZT',
+                5000.00, 450.00, 450.00, 0, 5900.00, status='approved',
+                lines=[{"item_description": "Consulting", "hsn_sac_code": "998311", "quantity": 1, "unit_price": 5000.00, "taxable_amount": 5000.00, "gst_rate": 18.00, "cgst_amount": 450.00, "sgst_amount": 450.00, "igst_amount": 0, "total_amount": 5900.00}]
+            )
+
+    res_hist = client.get("/api/v1/gst/gstr1-draft?period=2024-12", headers=headers)
+    assert res_hist.status_code == 200
+    doc_hist = res_hist.json()["table_13_doc_summary"]
+    assert doc_hist["is_mandatory"] is False
+    assert doc_hist["has_outward_supplies"] is True
+
+    # 3. Active Period (>= 2025-05) with B2C supplies (Table 7): Table 13 IS mandatory
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            seed_invoice(
+                cur, test_tenants["org_b"], test_tenants["profile_b"], test_tenants["user_b"],
+                'INV-ACT-T7', '2026-11-15', 'Consumer B2C', None,
+                2000.00, 180.00, 180.00, 0, 2360.00, status='approved',
+                lines=[{"item_description": "Consumer Item", "hsn_sac_code": "998311", "quantity": 1, "unit_price": 2000.00, "taxable_amount": 2000.00, "gst_rate": 18.00, "cgst_amount": 180.00, "sgst_amount": 180.00, "igst_amount": 0, "total_amount": 2360.00}]
+            )
+
+    res_act = client.get("/api/v1/gst/gstr1-draft?period=2026-11", headers=headers)
+    assert res_act.status_code == 200
+    doc_act = res_act.json()["table_13_doc_summary"]
+    assert doc_act["is_mandatory"] is True
+    assert doc_act["has_outward_supplies"] is True
+    assert "table_7" in doc_act["triggering_tables"]
+
+
+def test_gstr1_table_12_b2c_advisory_warning_when_hsn_empty(test_tenants):
+    """
+    Statutory Finding 5 (Advisory Warning):
+    Under GST Portal May 2025 Advisory, Table 12 B2C tab is optional.
+    When Table 5 or Table 7 contains B2C supplies but Table 12 B2C tab is empty,
+    an advisory notice must be returned in table_12_warnings.
+    """
+    org_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+    profile_id = str(uuid.uuid4())
+    gstin = random_gstin("27")
+    pan = gstin[2:12]
+
+    # Create new tenant with B2C supplies that have NO line items (hence empty Table 12 B2C)
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'Tenant B2C Warn', %s);", (org_id, pan))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner B2C');", (user_id, f"b2c_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_id, user_id))
+            cur.execute("INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector, preceding_fy_aato) VALUES (%s, %s, %s, 'Services', 'Retail', 40000000.00);", (profile_id, org_id, gstin))
+
+            # Seed B2C invoice without line items so Table 7 has data but Table 12 B2C is empty
+            seed_invoice(
+                cur, org_id, profile_id, user_id,
+                'INV-B2C-NO-HSN', '2026-11-12', 'Unregistered Buyer', None,
+                1500.00, 135.00, 135.00, 0, 1770.00, status='approved', lines=[]
+            )
+
+    headers = {"X-User-Id": user_id, "X-Org-Id": org_id}
+    res = client.get("/api/v1/gst/gstr1-draft?period=2026-11", headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["table_7_b2c_small"]) > 0
+    assert len(data["table_12_hsn_b2c"]) == 0
+    warnings = data["table_12_warnings"]
+    assert any("B2C outward supplies are present in Table 5/7, but Table 12 B2C HSN tab has no entries" in w for w in warnings)
+
+
+def test_preceding_fy_aato_unverified_unresolved(test_tenants):
+    """
+    Statutory Finding 6: PAN-Level Aggregate Annual Turnover (AATO) Missing-Value Handling.
+    Remove default 5 Crore assumption.
+    When preceding_fy_aato IS NULL:
+    1. GSTR-1 draft returns preceding_fy_aato: None and aato_unverified: True.
+    2. HSN compliance returns classification: 'aato_unverified_unresolved'.
+    """
+    org_id = test_tenants["org_a"]
+
+    # Set preceding_fy_aato to NULL in business_profiles
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE public.business_profiles SET preceding_fy_aato = NULL WHERE org_id = %s;", (org_id,))
+
+    headers = {"X-User-Id": test_tenants["user_a"], "X-Org-Id": org_id}
+    res = client.get("/api/v1/gst/gstr1-draft?period=2026-11", headers=headers)
+    assert res.status_code == 200
+    draft = res.json()
+    assert draft["preceding_fy_aato"] is None
+    assert draft["aato_unverified"] is True
+    assert any("Preceding financial-year Aggregate Annual Turnover (AATO) is unverified across PAN" in w for w in draft["table_12_warnings"])
+
+    # Test HSN compliance directly with aato_crores=None
+    hsn_res = validate_hsn_compliance("8471", aato_crores=None, is_b2b=True)
+    assert hsn_res.is_compliant is False
+    assert hsn_res.classification == "aato_unverified_unresolved"
+    assert "unverified across PAN" in hsn_res.error_message
+
+
+def test_storage_orphan_reconciliation_lifecycle(test_tenants, tmp_path):
+    """
+    Operational Finding 7: Storage Orphan Reconciliation Lifecycle.
+    1. Scans storage directory.
+    2. Grace period protects in-flight uploads (younger than 1800s).
+    3. Deletes unreferenced orphan files (older than 1800s).
+    4. Active DB-referenced files are preserved regardless of age.
+    """
+    storage_dir = tmp_path / "storage"
+    storage_dir.mkdir()
+
+    active_file = storage_dir / "active_doc.bin"
+    active_file.write_bytes(b"%PDF-1.4 active document")
+
+    in_flight_file = storage_dir / "in_flight.bin"
+    in_flight_file.write_bytes(b"%PDF-1.4 in flight document")
+    # In-flight: 5 minutes old (< 30 minutes grace period)
+    in_flight_mtime = time.time() - 300
+    os.utime(str(in_flight_file), (in_flight_mtime, in_flight_mtime))
+
+    orphan_file = storage_dir / "stale_orphan.bin"
+    orphan_file.write_bytes(b"%PDF-1.4 orphaned garbage")
+    # Orphan: 1 hour old (> 30 minutes grace period)
+    orphan_mtime = time.time() - 3600
+    os.utime(str(orphan_file), (orphan_mtime, orphan_mtime))
+
+    # Register active_doc in public.documents
+    doc_id = str(uuid.uuid4())
+    org_id = test_tenants["org_a"]
+    user_id = test_tenants["user_a"]
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.documents (
+                    id, org_id, doc_type, file_name, file_path, mime_type, file_size_bytes, sha256_checksum, uploaded_by
+                ) VALUES (
+                    %s, %s, 'invoice', 'active.pdf', %s, 'application/pdf', 24, 'active_sha256', %s
+                );
+            """, (doc_id, org_id, str(active_file), user_id))
+
+    with SessionLocal() as session:
+        from sqlalchemy import text
+        session.execute(text("SELECT set_config('app.current_org', :org, false);"), {"org": org_id})
+        session.execute(text("SELECT set_config('app.current_user', :user, false);"), {"user": user_id})
+        report = reconcile_storage_orphans(session, base_dir=str(storage_dir), grace_period_seconds=1800)
+
+    # Verifications
+    assert report["scanned_files"] == 3
+    assert report["orphaned_files_deleted"] == 1
+    assert report["in_flight_files"] == 1
+    assert report["reclaimed_bytes"] == len(b"%PDF-1.4 orphaned garbage")
+    assert not orphan_file.exists(), "Stale orphan file must be deleted"
+    assert in_flight_file.exists(), "In-flight file within grace period must be preserved"
+    assert active_file.exists(), "Active DB-referenced file must be preserved"

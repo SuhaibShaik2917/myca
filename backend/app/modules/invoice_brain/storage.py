@@ -1,7 +1,10 @@
 import os
+import time
 import hashlib
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any, List
 import uuid
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 ALLOWED_MIME_TYPES = {
     "application/pdf": b"%PDF",
@@ -94,3 +97,74 @@ def compute_stream_sha256_and_save(
             except OSError:
                 pass
         raise
+
+
+def reconcile_storage_orphans(
+    session: Session,
+    base_dir: str = "storage",
+    grace_period_seconds: int = 1800
+) -> Dict[str, Any]:
+    """
+    Periodic storage reconciliation mechanism:
+    1. Queries all active document file paths from PostgreSQL public.documents.
+    2. Recursively scans storage base directory.
+    3. Reclaims disk space by purging unreferenced orphan files whose age exceeds grace_period_seconds (default 30 mins).
+    4. Safely preserves in-flight uploads that are younger than grace_period_seconds.
+    """
+    if not os.path.exists(base_dir):
+        return {
+            "scanned_files": 0,
+            "active_db_files": 0,
+            "in_flight_files": 0,
+            "orphaned_files_deleted": 0,
+            "reclaimed_bytes": 0,
+            "deleted_file_paths": []
+        }
+
+    # 1. Fetch all registered document paths from DB
+    doc_stmt = text("SELECT file_path FROM public.documents WHERE file_path IS NOT NULL;")
+    rows = session.execute(doc_stmt).fetchall()
+    active_paths = {os.path.normcase(os.path.abspath(r[0])) for r in rows if r[0]}
+
+    now = time.time()
+    scanned_count = 0
+    in_flight_count = 0
+    orphan_count = 0
+    reclaimed_bytes = 0
+    deleted_files: List[str] = []
+
+    # 2. Walk storage directory
+    for root, dirs, files in os.walk(base_dir):
+        for f in files:
+            if f == ".gitkeep":
+                continue
+            scanned_count += 1
+            full_path = os.path.join(root, f)
+            norm_path = os.path.normcase(os.path.abspath(full_path))
+
+            if norm_path in active_paths:
+                continue
+
+            # Check file age for grace period
+            try:
+                st = os.stat(full_path)
+                file_age = now - st.st_mtime
+                if file_age >= grace_period_seconds:
+                    file_size = st.st_size
+                    os.remove(full_path)
+                    orphan_count += 1
+                    reclaimed_bytes += file_size
+                    deleted_files.append(full_path)
+                else:
+                    in_flight_count += 1
+            except OSError:
+                pass
+
+    return {
+        "scanned_files": scanned_count,
+        "active_db_files": len(active_paths),
+        "in_flight_files": in_flight_count,
+        "orphaned_files_deleted": orphan_count,
+        "reclaimed_bytes": reclaimed_bytes,
+        "deleted_file_paths": deleted_files
+    }

@@ -46,11 +46,12 @@ def prepare_gstr1_draft(
     Never submits to or represents as an official tax filing.
     """
     # 1. Fetch Organization profile, GSTIN, and Preceding FY AATO
+    # Remove assumed ₹5 Crore default: Aggregate Annual Turnover must be verified across PAN
     org_stmt = text("""
         SELECT 
             o.legal_name, 
             bp.gstin,
-            COALESCE(bp.preceding_fy_aato, bp.annual_turnover, 50000000.00) as preceding_fy_aato
+            bp.preceding_fy_aato
         FROM public.organizations o
         JOIN public.business_profiles bp ON bp.org_id = o.id
         WHERE o.id = :org_id
@@ -59,7 +60,9 @@ def prepare_gstr1_draft(
     org_row = session.execute(org_stmt, {"org_id": org_id}).fetchone()
     legal_name = org_row[0] if org_row else "Unknown Organization"
     supplier_gstin = org_row[1] if org_row else "Unregistered"
-    preceding_fy_aato = Decimal(str(org_row[2])) if org_row else Decimal("50000000.00")
+    raw_aato = org_row[2] if org_row else None
+    preceding_fy_aato = Decimal(str(raw_aato)) if raw_aato is not None else None
+    aato_unverified = (preceding_fy_aato is None)
 
     supplier_state = supplier_gstin[:2] if len(supplier_gstin) >= 2 else "27"
     b2c_large_threshold = get_b2c_large_threshold(tax_period)
@@ -219,8 +222,21 @@ def prepare_gstr1_draft(
     table_12_b2c_mandatory = False  # Explicitly optional per May 2025 Advisory
     table_12_warnings: List[str] = []
 
+    if aato_unverified:
+        table_12_warnings.append(
+            "Preceding financial-year Aggregate Annual Turnover (AATO) is unverified across PAN. "
+            "HSN reporting length requirements (4 digits vs 6 digits) cannot be statutory-verified until PAN AATO is confirmed."
+        )
+
     if table_12_b2b_mandatory and len(table_12_hsn_b2b) == 0:
         table_12_warnings.append("Table 4 contains B2B supplies, but Table 12 B2B tab has no entries.")
+
+    # Table 12 B2C advisory notice: If Table 5 or 7 has supplies but Table 12 B2C tab is empty
+    if (len(b2c_large) > 0 or len(b2c_small) > 0) and len(table_12_hsn_b2c) == 0:
+        table_12_warnings.append(
+            "B2C outward supplies are present in Table 5/7, but Table 12 B2C HSN tab has no entries. "
+            "Under GST Portal May 2025 Advisory, Table 12 B2C reporting is optional but generates this advisory notice."
+        )
 
     # Supply value mismatch: Non-blocking warning per Portal Phase 3 Advisory
     if abs(table_12_taxable_sum - total_taxable) > Decimal("1.00"):
@@ -229,8 +245,23 @@ def prepare_gstr1_draft(
             "Under GST Portal Phase 3 rules, this generates a warning but does not block filing."
         )
 
-    # 4. Table 13: Period-aware and Data-aware Document Details
-    is_table_13_mandatory = (tax_period >= "2025-05") and (len(invoices) > 0)
+    # 4. Table 13: Multi-table Outward Supplies Population Logic
+    # Statutorily mandatory from May 2025 (tax_period >= '2025-05') if ANY outward supply tables contain data:
+    # Tables 4, 5, 6, 7, 8, 9, 10, 14, 15.
+    table_has_data = {
+        "table_4": len(b2b_entries) > 0,
+        "table_5": len(b2c_large) > 0,
+        "table_6": False,  # Zero-rated / exports (requires customs shipping bill module)
+        "table_7": len(b2c_small) > 0,
+        "table_8": False,  # Nil rated / exempt
+        "table_9": False,  # Amendments
+        "table_10": False, # Amendments to unregistered
+        "table_14": False, # E-commerce supplies u/s 52
+        "table_15": False, # Supplies u/s 9(5)
+    }
+    REQUIRING_TABLE_13 = {"table_4", "table_5", "table_6", "table_7", "table_8", "table_9", "table_10", "table_14", "table_15"}
+    has_outward_supplies = any(table_has_data[t] for t in REQUIRING_TABLE_13)
+    is_table_13_mandatory = (tax_period >= "2025-05") and has_outward_supplies
 
     doc_categories = [
         {
@@ -283,7 +314,8 @@ def prepare_gstr1_draft(
     doc_summary = {
         "is_mandatory": is_table_13_mandatory,
         "tax_period": tax_period,
-        "has_outward_supplies": len(invoices) > 0,
+        "has_outward_supplies": has_outward_supplies,
+        "triggering_tables": [t for t in REQUIRING_TABLE_13 if table_has_data[t]],
         "total_number_issued": len(invoices),
         "from_serial_number": invoice_numbers[0] if invoice_numbers else None,
         "to_serial_number": invoice_numbers[-1] if invoice_numbers else None,
@@ -298,6 +330,7 @@ def prepare_gstr1_draft(
         gstin=supplier_gstin,
         legal_name=legal_name,
         preceding_fy_aato=preceding_fy_aato,
+        aato_unverified=aato_unverified,
         applicable_b2c_large_threshold=b2c_large_threshold,
         table_4_b2b=b2b_entries,
         table_5_b2c_large=b2c_large,

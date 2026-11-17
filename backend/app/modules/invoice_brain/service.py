@@ -236,7 +236,7 @@ def process_invoice_ocr_task(
         # Stage 2: OCR extraction
         extracted = extract_invoice_with_gemini(file_path, mime_type)
 
-        # Update invoice with extracted figures and transition to 'extracted'
+        # Update invoice with extracted figures, OCR provenance, and transition to 'extracted'
         cur.execute("""
             UPDATE public.invoices SET
                 invoice_number = %s,
@@ -249,6 +249,8 @@ def process_invoice_ocr_task(
                 sgst_amount = %s,
                 igst_amount = %s,
                 total_amount = %s,
+                ocr_raw_response = %s::jsonb,
+                ocr_confidence = %s,
                 status = 'extracted',
                 updated_at = clock_timestamp()
             WHERE id = %s;
@@ -263,6 +265,8 @@ def process_invoice_ocr_task(
             extracted.sgst_amount,
             extracted.igst_amount,
             extracted.total_amount,
+            json.dumps(extracted.raw_ocr_response or {}),
+            extracted.confidence_score,
             invoice_id
         ))
 
@@ -511,6 +515,16 @@ def approve_invoice(
             f"Cannot approve invoice: invoice failed validation with {validation.discrepancy_count} discrepancy issues. "
             "All critical validation errors must be resolved prior to approval."
         )
+
+    # Verify no line item contains unextracted or missing mandatory financial fields
+    check_lines_stmt = text("""
+        SELECT COUNT(*) FROM public.invoice_line_items
+        WHERE invoice_id = :id AND org_id = :org_id
+          AND (quantity IS NULL OR unit_price IS NULL OR taxable_amount IS NULL OR gst_rate IS NULL OR total_amount IS NULL);
+    """)
+    missing_count = session.execute(check_lines_stmt, {"id": invoice_id, "org_id": org_id}).scalar()
+    if missing_count and missing_count > 0:
+        raise InvoiceStatusError("Cannot approve invoice with missing or unextracted financial fields")
 
     approve_stmt = text("""
         UPDATE public.invoices

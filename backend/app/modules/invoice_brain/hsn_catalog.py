@@ -53,37 +53,72 @@ def lookup_hsn_code(code: str) -> Optional[HSNEntry]:
         return HSN_CATALOGUE[clean[:4]]
     return None
 
+class HSNValidationResult(tuple):
+    """
+    Tuple-compatible result preserving (is_compliant, error_message, catalog_entry)
+    while exposing statutory classification details.
+    """
+    def __new__(cls, is_compliant: bool, error_message: Optional[str], catalog_entry: Optional[HSNEntry], classification: str = "compliant"):
+        inst = super().__new__(cls, (is_compliant, error_message, catalog_entry))
+        inst._classification = classification
+        return inst
+
+    @property
+    def is_compliant(self) -> bool:
+        return self[0]
+
+    @property
+    def error_message(self) -> Optional[str]:
+        return self[1]
+
+    @property
+    def catalog_entry(self) -> Optional[HSNEntry]:
+        return self[2]
+
+    @property
+    def classification(self) -> str:
+        return self._classification
+
 def validate_hsn_compliance(
     code: Optional[str],
-    aato_crores: Decimal = Decimal("5.0"),
+    aato_crores: Optional[Decimal] = None,
     is_b2b: bool = True
-) -> Tuple[bool, Optional[str], Optional[HSNEntry]]:
+) -> HSNValidationResult:
     """
     Validates HSN compliance based on CBIC Notification No. 78/2020 and GST Phase 3 rules:
     - Preceding year turnover (AATO) <= 5 Cr: Minimum 4 digits required for B2B (optional for B2C).
     - Preceding year turnover (AATO) > 5 Cr: Minimum 6 digits required for all supplies.
     - Code must resolve to a valid entry in the official GST Tariff Catalogue.
-    Returns: (is_compliant, error_message, catalog_entry)
+    - If AATO is None (unverified across PAN), returns classification 'aato_unverified_unresolved'.
+    Returns: HSNValidationResult tuple (is_compliant, error_message, catalog_entry)
     """
+    if aato_crores is None:
+        return HSNValidationResult(
+            False,
+            "Preceding financial-year Aggregate Annual Turnover (AATO) is unverified across PAN. HSN length requirements cannot be resolved.",
+            None,
+            classification="aato_unverified_unresolved"
+        )
+
     if not code:
         if is_b2b or aato_crores > Decimal("5.0"):
-            return False, "HSN/SAC code is mandatory for this supply category", None
-        return True, None, None  # Optional for small turnover B2C
+            return HSNValidationResult(False, "HSN/SAC code is mandatory for this supply category", None, classification="mandatory_missing")
+        return HSNValidationResult(True, None, None, classification="optional_b2c")
 
     clean = str(code).strip()
     if not clean.isdigit():
-        return False, f"HSN/SAC code '{code}' must contain numeric digits only", None
+        return HSNValidationResult(False, f"HSN/SAC code '{code}' must contain numeric digits only", None, classification="invalid_format")
 
     # Check minimum required digits based on AATO
     if aato_crores > Decimal("5.0"):
         if len(clean) < 6:
-            return False, f"Taxpayers with AATO > 5 Cr must report minimum 6 digits (provided: {len(clean)} digits)", None
+            return HSNValidationResult(False, f"Taxpayers with AATO > 5 Cr must report minimum 6 digits (provided: {len(clean)} digits)", None, classification="min_digits_unmet")
     else:
         if is_b2b and len(clean) < 4:
-            return False, f"Taxpayers with AATO <= 5 Cr must report minimum 4 digits for B2B (provided: {len(clean)} digits)", None
+            return HSNValidationResult(False, f"Taxpayers with AATO <= 5 Cr must report minimum 4 digits for B2B (provided: {len(clean)} digits)", None, classification="min_digits_unmet")
 
     entry = lookup_hsn_code(clean)
     if not entry:
-        return False, f"HSN/SAC code '{clean}' is not recognized in official GST Tariff Catalogue", None
+        return HSNValidationResult(False, f"HSN/SAC code '{clean}' is not recognized in official GST Tariff Catalogue", None, classification="unrecognized_in_tariff")
 
-    return True, None, entry
+    return HSNValidationResult(True, None, entry, classification="compliant")

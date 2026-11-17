@@ -127,16 +127,18 @@ def validate_hsn_sac(code: Optional[str]) -> Tuple[bool, Optional[str]]:
 def validate_invoice_financials(
     invoice: Dict[str, Any],
     line_items: List[Dict[str, Any]],
-    supplier_gstin: Optional[str] = None
+    supplier_gstin: Optional[str] = None,
+    aato_crores: Optional[Decimal] = Decimal("5.0")
 ) -> ValidationReport:
     """
     Performs comprehensive deterministic validation of invoice data:
     1. GSTIN validation and counterparty verification.
     2. Line item math and rounding checks.
-    3. Intra-state vs Inter-state tax consistency.
-    4. Grand total aggregation.
-    5. HSN/SAC code validation.
-    6. ITC eligibility risk flags.
+    3. Missing field detection (no fabricated defaults).
+    4. Intra-state vs Inter-state tax consistency.
+    5. Grand total aggregation.
+    6. HSN/SAC code validation.
+    7. ITC eligibility risk flags.
     """
     flags: List[ValidationFlag] = []
     has_critical = False
@@ -207,6 +209,7 @@ def validate_invoice_financials(
     sum_igst = Decimal("0.00")
     sum_total = Decimal("0.00")
     all_hsn_valid = True
+    has_missing_line_fields = False
 
     # Determine Place of Supply logic (Interstate vs Intrastate)
     is_interstate = False
@@ -216,14 +219,46 @@ def validate_invoice_financials(
 
     for idx, item in enumerate(line_items):
         item_prefix = f"line_items[{idx}]"
-        qty = Decimal(str(item.get("quantity", 1)))
-        price = Decimal(str(item.get("unit_price", 0)))
-        taxable = Decimal(str(item.get("taxable_amount", 0)))
-        rate = Decimal(str(item.get("gst_rate", 18)))
-        cgst = Decimal(str(item.get("cgst_amount", 0)))
-        sgst = Decimal(str(item.get("sgst_amount", 0)))
-        igst = Decimal(str(item.get("igst_amount", 0)))
-        tot = Decimal(str(item.get("total_amount", 0)))
+        
+        # Check for genuine missing extraction fields (no fabricated defaults)
+        raw_qty = item.get("quantity")
+        raw_price = item.get("unit_price")
+        raw_taxable = item.get("taxable_amount")
+        raw_rate = item.get("gst_rate")
+        raw_tot = item.get("total_amount")
+
+        missing_fields = []
+        if raw_qty is None:
+            missing_fields.append("quantity")
+        if raw_price is None:
+            missing_fields.append("unit_price")
+        if raw_taxable is None:
+            missing_fields.append("taxable_amount")
+        if raw_rate is None:
+            missing_fields.append("gst_rate")
+        if raw_tot is None:
+            missing_fields.append("total_amount")
+
+        if missing_fields:
+            has_missing_line_fields = True
+            has_critical = True
+            for f in missing_fields:
+                flags.append(ValidationFlag(
+                    code=f"ERR_MISSING_{f.upper()}",
+                    severity="error",
+                    field=f"{item_prefix}.{f}",
+                    message=f"Line item {idx+1} is missing mandatory field {f} from OCR extraction"
+                ))
+            continue
+
+        qty = Decimal(str(raw_qty))
+        price = Decimal(str(raw_price))
+        taxable = Decimal(str(raw_taxable))
+        rate = Decimal(str(raw_rate))
+        cgst = Decimal(str(item.get("cgst_amount") if item.get("cgst_amount") is not None else 0))
+        sgst = Decimal(str(item.get("sgst_amount") if item.get("sgst_amount") is not None else 0))
+        igst = Decimal(str(item.get("igst_amount") if item.get("igst_amount") is not None else 0))
+        tot = Decimal(str(raw_tot))
 
         # Math check: taxable == qty * price
         expected_taxable = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -270,15 +305,18 @@ def validate_invoice_financials(
 
         # HSN/SAC statutory compliance check (Notification No. 78/2020 & Phase 3 rules)
         hsn = item.get("hsn_sac_code")
-        hsn_ok, hsn_err, _ = validate_hsn_compliance(hsn, aato_crores=Decimal("5.0"), is_b2b=bool(cp_gstin))
-        if not hsn_ok:
+        hsn_res = validate_hsn_compliance(hsn, aato_crores=aato_crores, is_b2b=bool(cp_gstin))
+        if not hsn_res.is_compliant:
+            sev = "error" if hsn_res.classification == "aato_unverified_unresolved" else "warning"
             flags.append(ValidationFlag(
-                code="WARN_INVALID_HSN",
-                severity="warning",
+                code="WARN_INVALID_HSN" if sev == "warning" else "ERR_INVALID_HSN",
+                severity=sev,
                 field=f"{item_prefix}.hsn_sac_code",
-                message=f"Line {idx+1} HSN compliance issue: {hsn_err}"
+                message=f"Line {idx+1} HSN compliance issue: {hsn_res.error_message}"
             ))
             all_hsn_valid = False
+            if sev == "error":
+                has_critical = True
 
         sum_taxable += taxable
         sum_cgst += cgst
@@ -293,7 +331,7 @@ def validate_invoice_financials(
     inv_igst = Decimal(str(invoice.get("igst_amount", 0)))
     inv_total = Decimal(str(invoice.get("total_amount", 0)))
 
-    arithmetic_valid = True
+    arithmetic_valid = not has_missing_line_fields
     if abs(sum_taxable - inv_taxable) > Decimal("0.50"):
         flags.append(ValidationFlag(
             code="ERR_SUM_TAXABLE_MISMATCH",

@@ -23,9 +23,10 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "dev-insecure-secret-key-replace-in-production-with-min-32-chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
     
-    # Gemini AI
+    # Gemini AI (Currently operational models for late 2026: Gemini 3.8 Flash & Gemini 3.5 Flash-Lite)
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-2.0-flash"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
+    GEMINI_FALLBACK_MODEL: str = "gemini-3.5-flash-lite"
     
     @field_validator("SECRET_KEY")
     def validate_secret_key(cls, v, info):
