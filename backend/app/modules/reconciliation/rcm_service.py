@@ -33,6 +33,32 @@ GTA_SPECIFIED_RECIPIENT_CONSTITUTIONS = {
     "SOCIETY", "COOPERATIVE_SOCIETY", "PARTNERSHIP_FIRM", "CASUAL_TAXABLE_PERSON"
 }
 
+# Indian PAN 4th character legal entity classification map
+PAN_CONSTITUTION_MAP = {
+    "C": "COMPANY",
+    "P": "INDIVIDUAL_PROPRIETOR",
+    "F": "PARTNERSHIP_FIRM_LLP",
+    "G": "GOVERNMENT_AGENCY",
+    "A": "ASSOCIATION_OF_PERSONS",
+    "B": "BODY_OF_INDIVIDUALS",
+    "H": "HINDU_UNDIVIDED_FAMILY",
+    "L": "LOCAL_AUTHORITY",
+    "J": "ARTIFICIAL_JURIDICAL_PERSON",
+    "T": "TRUST"
+}
+
+
+def parse_pan_constitution(gstin: Optional[str]) -> str:
+    """
+    Parses the 4th character of the PAN embedded in a 15-digit GSTIN (index 5)
+    to determine the legal constitution of the entity according to the Indian
+    Income Tax Department and GST registration schema.
+    """
+    if not gstin or len(gstin.strip()) < 6:
+        return "UNKNOWN"
+    char = gstin.strip()[5].upper()
+    return PAN_CONSTITUTION_MAP.get(char, "OTHER")
+
 
 def validate_rcm_and_gta_eligibility(
     service_type: str,

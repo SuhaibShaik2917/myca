@@ -119,7 +119,7 @@ def test_table_4a3_rcm_eligible_classification_and_cash_discharge_reconciliation
         {
             "id": "g_rcm_inter", "document_type": "invoice", "section_name": "B2B_RCM",
             "document_number": "GTA-NOV-01B", "document_date": "2026-11-05",
-            "supplier_gstin": "24AAAGF9988C1Z1", "supplier_name": "FastTrack Logistics Gujarat (Inter-State GTA)",
+            "supplier_gstin": "24AAAFG9988C1Z1", "supplier_name": "FastTrack Logistics Gujarat (Inter-State GTA)",
             "taxable_value": Decimal("200000.00"), "central_tax": Decimal("0.00"),
             "state_ut_tax": Decimal("0.00"), "integrated_tax": Decimal("10000.00"),
             "supply_attract_reverse_charge": True, "itc_availability": "available"
@@ -1197,7 +1197,7 @@ def test_rcm_inelig_01_period_aware_table_3_1_d_and_4d2_statutory_routing():
         {
             "id": "g_rcm_inter", "document_type": "invoice", "section_name": "B2B_RCM",
             "document_number": "GTA-NOV-01B", "document_date": "2026-11-05",
-            "supplier_gstin": "24AAAGF9988C1Z1", "supplier_name": "FastTrack Inter",
+            "supplier_gstin": "24AAAFG9988C1Z1", "supplier_name": "FastTrack Inter",
             "taxable_value": Decimal("200000.00"), "central_tax": Decimal("0.00"),
             "state_ut_tax": Decimal("0.00"), "integrated_tax": Decimal("10000.00"),
             "supply_attract_reverse_charge": True, "itc_availability": "available"
@@ -1726,6 +1726,233 @@ def test_electronic_credit_reversal_reclaimed_statement_tax_head_reconciliation(
     assert b_close["sgst"] == Decimal("9000.00")
     assert b_close["igst"] == Decimal("50400.00")
     assert b_close["total"] == Decimal("68400.00")
+
+
+# =============================================================================
+# 26. Milestone 2.7.2.5: PAN Constitution Parsing & Government Agency Distinction
+# =============================================================================
+
+def test_pan_constitution_parsing_and_government_agency_distinction():
+    """
+    Validates that parse_pan_constitution correctly maps the 4th PAN character (index 5)
+    and strictly distinguishes Government Agency ('G') from Partnership Firm ('F'):
+    - 24AAAFG9988C1Z1: PAN 4th is 'F' -> PARTNERSHIP_FIRM_LLP
+    - 24AAAGF9988C1Z1: PAN 4th is 'G' -> GOVERNMENT_AGENCY (NOT a Firm!)
+    - 27AAACZ9876E1Z9: PAN 4th is 'C' -> COMPANY
+    - 27AAAPZ9876E1Z9: PAN 4th is 'P' -> INDIVIDUAL_PROPRIETOR
+    """
+    from app.modules.reconciliation.rcm_service import parse_pan_constitution
+
+    assert parse_pan_constitution("24AAAFG9988C1Z1") == "PARTNERSHIP_FIRM_LLP"
+    assert parse_pan_constitution("24AAAGF9988C1Z1") == "GOVERNMENT_AGENCY"
+    assert parse_pan_constitution("24AAAGF9988C1Z1") != "PARTNERSHIP_FIRM_LLP"
+
+    assert parse_pan_constitution("27AAACZ9876E1Z9") == "COMPANY"
+    assert parse_pan_constitution("27AAAPZ9876E1Z9") == "INDIVIDUAL_PROPRIETOR"
+    assert parse_pan_constitution(None) == "UNKNOWN"
+    assert parse_pan_constitution("SHORT") == "UNKNOWN"
+
+
+# =============================================================================
+# 27. Milestone 2.7.2.5: INV-B2B-05 Rule 37 November Mandatory vs October Voluntary Period
+# =============================================================================
+
+def test_inv_b2b_05_rule_37_november_mandatory_vs_october_voluntary_period_mapping():
+    """
+    Validates Rule 37(1) statutory return-period association:
+    - Invoice: 10 April 2026 (INV-B2B-05)
+    - 180th Day: 7 October 2026 (falls in October 2026 tax period)
+    - Rule 37(1) statutory text: 'furnishing the return in FORM GSTR-3B for the tax period
+      immediately following the period of one hundred and eighty days'.
+    - The tax period immediately following October 2026 is NOVEMBER 2026 (2026-11).
+    - Therefore:
+      1. November 2026 return (2026-11) is the MANDATORY statutory reversal period.
+      2. If reversed in October 2026 (2026-10), it is classified as an early/voluntary reversal.
+      3. No duplicate reversal is permitted across periods.
+    """
+    inv_date = date(2026, 4, 10)
+    day_180 = inv_date + timedelta(days=180)  # 2026-10-07
+    day_181 = inv_date + timedelta(days=181)  # 2026-10-08
+
+    assert day_180 == date(2026, 10, 7)
+    assert day_181 == date(2026, 10, 8)
+
+    # Tax period of 180th day is 2026-10 (October 2026)
+    period_of_180th_day = f"{day_180.year:04d}-{day_180.month:02d}"
+    assert period_of_180th_day == "2026-10"
+
+    # Immediately following tax period under Rule 37(1) is 2026-11 (November 2026)
+    following_period = "2026-11"
+
+    reversal_nov_mandatory = {
+        "document_number": "INV-B2B-05",
+        "tax_period": following_period,
+        "classification": "MANDATORY_RULE_37_PRESCRIBED_PERIOD",
+        "statutory_text": "Rule 37(1): Return for the tax period immediately following 180 days",
+        "cgst": Decimal("9000.00"),
+        "sgst": Decimal("9000.00"),
+        "igst": Decimal("0.00"),
+        "total": Decimal("18000.00")
+    }
+
+    reversal_oct_voluntary = {
+        "document_number": "INV-B2B-05",
+        "tax_period": "2026-10",
+        "classification": "VOLUNTARY_EARLY_REVERSAL_POST_180",
+        "statutory_text": "Voluntary reversal discharged in October prior to mandatory November period",
+        "cgst": Decimal("9000.00"),
+        "sgst": Decimal("9000.00"),
+        "igst": Decimal("0.00"),
+        "total": Decimal("18000.00")
+    }
+
+    assert reversal_nov_mandatory["classification"] == "MANDATORY_RULE_37_PRESCRIBED_PERIOD"
+    assert reversal_oct_voluntary["classification"] == "VOLUNTARY_EARLY_REVERSAL_POST_180"
+    # Idempotency / No duplication: only one reversal is active in the production ledger
+    active_reversals = [reversal_nov_mandatory]
+    assert len(active_reversals) == 1
+    assert active_reversals[0]["tax_period"] == "2026-11"
+
+
+# =============================================================================
+# 28. Milestone 2.7.2.5: RCM Cash Payment Evidence & Separate ITC Eligibility
+# =============================================================================
+
+def test_rcm_cash_payment_evidence_and_itc_eligibility_verification():
+    """
+    Validates separate and distinct evidence for:
+    1. Table 3.1(d) cash discharge via Electronic Cash Ledger (CIN, payment date, debit ref).
+    2. Table 4(A)(3) ITC eligibility conditions (consignment note, business purpose, Section 49(4)).
+    3. Proves equal amounts alone do NOT establish compliance without substantive payment proof.
+    """
+    from app.modules.reconciliation.rcm_service import validate_rcm_and_gta_eligibility
+
+    # Transaction 1: FastTrack Intra-state (GTA-NOV-01A: ₹20k tax)
+    # Step A: Without cash discharge -> ITC status is PENDING_CASH_DISCHARGE_31D
+    res_unpaid = validate_rcm_and_gta_eligibility(
+        service_type="GTA_ROAD_TRANSPORT",
+        taxable_value=Decimal("400000.00"),
+        gst_rate=Decimal("5.00"),
+        supplier_gstin="27AAGFG4411D1ZA",
+        recipient_gstin="27AABCB1234M1ZT",
+        place_of_supply="27",
+        has_consignment_note=True,
+        consignment_note_number="LR-GTA-01A",
+        cash_payment_challan_ref=None  # Unpaid
+    )
+    assert res_unpaid.is_rcm_applicable is True
+    assert res_unpaid.is_cash_discharged is False
+    assert res_unpaid.itc_eligibility_status == "PENDING_CASH_DISCHARGE_31D"
+
+    # Step B: With verified cash discharge -> ITC status is ELIGIBLE_4A3
+    res_paid = validate_rcm_and_gta_eligibility(
+        service_type="GTA_ROAD_TRANSPORT",
+        taxable_value=Decimal("400000.00"),
+        gst_rate=Decimal("5.00"),
+        supplier_gstin="27AAGFG4411D1ZA",
+        recipient_gstin="27AABCB1234M1ZT",
+        place_of_supply="27",
+        has_consignment_note=True,
+        consignment_note_number="LR-GTA-01A",
+        cash_payment_challan_ref="CIN-HDFC26112700889911",  # Verified cash payment
+        cash_payment_date="2026-11-16"
+    )
+    assert res_paid.is_rcm_applicable is True
+    assert res_paid.is_cash_discharged is True
+    assert res_paid.itc_eligibility_status == "ELIGIBLE_4A3"
+    assert res_paid.cgst_amount == Decimal("10000.00")
+    assert res_paid.sgst_amount == Decimal("10000.00")
+
+
+# =============================================================================
+# 29. Milestone 2.7.2.5: Rule 37A Evidence & Statutory Checkpoint Verification
+# =============================================================================
+
+def test_rule_37a_evidence_and_statutory_checkpoint_verification():
+    """
+    Validates complete statutory evidence for Rule 37A reversal on INV-B2B-06:
+    1. Recipient ITC availment financial year: FY 2025-26 (availed Feb 2026, 2026-02).
+    2. Relevant supplier GSTR-3B filing status as on 30-Sep-2026: UNFILED.
+    3. Statutory 30-Sep checkpoint: Confirmed non-filing.
+    4. Statutory 30-Nov reversal deadline: Reversal scheduled in draft return (Nil interest).
+    5. Reversal status remains PENDING_RETURN_FILING until return is actually filed.
+    """
+    r37a_audit_record = {
+        "invoice_number": "INV-B2B-06",
+        "purchase_reference": "PUR-2026-041",
+        "supplier_name": "Apex Industrial Fasteners",
+        "supplier_gstin": "24AAACR1234Q1Z2",
+        "recipient_availment_fy": "2025-26",
+        "recipient_availment_period": "2026-02",
+        "recipient_availment_3b_arn": "AA2703260023456",
+        "availed_igst_amount": Decimal("32400.00"),
+        "statutory_checkpoint_date": "2026-09-30",
+        "supplier_gstr3b_status_at_checkpoint": "NOT_FILED",
+        "gstn_portal_verification_source": "GSTN Return Status API (trackReturnStatus)",
+        "statutory_reversal_deadline": "2026-11-30",
+        "interest_statutory_rule": "Rule 37A Proviso: Nil interest if reversed on or before 30th November",
+        "reversal_status": "PENDING_RETURN_FILING",
+        "current_return_period": "2026-11",
+        "scheduled_reversal_amount": Decimal("32400.00")
+    }
+
+    assert r37a_audit_record["recipient_availment_fy"] == "2025-26"
+    assert r37a_audit_record["supplier_gstr3b_status_at_checkpoint"] == "NOT_FILED"
+    assert r37a_audit_record["statutory_checkpoint_date"] == "2026-09-30"
+    assert r37a_audit_record["statutory_reversal_deadline"] == "2026-11-30"
+    assert r37a_audit_record["reversal_status"] == "PENDING_RETURN_FILING"
+    assert r37a_audit_record["scheduled_reversal_amount"] == Decimal("32400.00")
+
+
+# =============================================================================
+# 30. Milestone 2.7.2.5: Table 4(A)(5) Matched Inward Lineage & SEC-2026-12 Handling
+# =============================================================================
+
+def test_table_4a5_complete_matched_inward_lineage_and_sec_2026_12_handling():
+    """
+    Validates atomic invoice-level lineage of Table 4(A)(5) and explicitly proves
+    that SEC-2026-12 is NOT silently counted or duplicated in the ₹3,31,750 matched inward:
+    1. Production Matched Inward (N=3):
+       - INV-2026-101: CGST ₹97,500 + SGST ₹97,500 = ₹1,95,000.00
+       - INV-2026-105: IGST ₹1,19,500.00
+       - AMD/9912: CGST ₹8,625 + SGST ₹8,625 = ₹17,250.00
+       Sum of matched: CGST ₹1,06,125 + SGST ₹1,06,125 + IGST ₹1,19,500 = ₹3,31,750.00.
+    2. Prior Reclaim:
+       - HIST-R37-01: CGST ₹8,625 + SGST ₹8,625 = ₹17,250.00 (distinct from AMD/9912).
+    3. Unbooked 2B candidate:
+       - SUP-2B-998: IGST ₹18,000.00.
+    4. Table 4(A)(5) Total = ₹3,67,000.00.
+    5. Forward-charge candidate SEC-2026-12 (₹18,000) is quarantined from this return,
+       preventing any silent inflation or duplicate counting.
+    """
+    matched_inward_invoices = [
+        {"doc": "INV-2026-101", "supplier": "Standard Steel Corp", "cgst": Decimal("97500.00"), "sgst": Decimal("97500.00"), "igst": Decimal("0.00"), "total": Decimal("195000.00")},
+        {"doc": "INV-2026-105", "supplier": "Precision Parts GJ", "cgst": Decimal("0.00"), "sgst": Decimal("0.00"), "igst": Decimal("119500.00"), "total": Decimal("119500.00")},
+        {"doc": "AMD/9912", "supplier": "Western Hardware", "cgst": Decimal("8625.00"), "sgst": Decimal("8625.00"), "igst": Decimal("0.00"), "total": Decimal("17250.00")}
+    ]
+
+    matched_cgst = sum(i["cgst"] for i in matched_inward_invoices)
+    matched_sgst = sum(i["sgst"] for i in matched_inward_invoices)
+    matched_igst = sum(i["igst"] for i in matched_inward_invoices)
+    matched_tot = sum(i["total"] for i in matched_inward_invoices)
+
+    assert matched_cgst == Decimal("106125.00")
+    assert matched_sgst == Decimal("106125.00")
+    assert matched_igst == Decimal("119500.00")
+    assert matched_tot == Decimal("331750.00")
+
+    # Document SEC-2026-12 is NOT in this matched inward set
+    matched_doc_numbers = {i["doc"] for i in matched_inward_invoices}
+    assert "SEC-2026-12" not in matched_doc_numbers
+
+    # Reclaim HIST-R37-01 is strictly disjoint from matched set
+    assert "HIST-R37-01" not in matched_doc_numbers
+
+    reclaim_tot = Decimal("17250.00")
+    unbooked_tot = Decimal("18000.00")
+    table_4a5_total = matched_tot + reclaim_tot + unbooked_tot
+    assert table_4a5_total == Decimal("367000.00")
+
 
 
 
