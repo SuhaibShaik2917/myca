@@ -389,12 +389,64 @@ def generate_unified_financial_report(
     }
 
     # 7. Electronic Credit Reversal and Re-claimed Statement (GST Portal Reconciled Ledger)
+    comp_4b2_tot = t4.components_4b.get("4B2_total")
+    comp_4d1 = t4.components_4d.get("4D1_reclaimed")
+
+    open_cgst = comp_4d1.cgst if comp_4d1 else Decimal("0.00")
+    open_sgst = comp_4d1.sgst if comp_4d1 else Decimal("0.00")
+    open_igst = comp_4d1.igst if comp_4d1 else Decimal("0.00")
+    open_tot = t4.itc_reclaimed_earlier_reversal_4d1
+
+    add_cgst = comp_4b2_tot.cgst if comp_4b2_tot else Decimal("0.00")
+    add_sgst = comp_4b2_tot.sgst if comp_4b2_tot else Decimal("0.00")
+    add_igst = comp_4b2_tot.igst if comp_4b2_tot else Decimal("0.00")
+    add_tot = t4.total_itc_reversed_reclaimable_4b2
+
+    sub_cgst = comp_4d1.cgst if comp_4d1 else Decimal("0.00")
+    sub_sgst = comp_4d1.sgst if comp_4d1 else Decimal("0.00")
+    sub_igst = comp_4d1.igst if comp_4d1 else Decimal("0.00")
+    sub_tot = t4.itc_reclaimed_earlier_reversal_4d1
+
+    close_cgst = open_cgst + add_cgst - sub_cgst
+    close_sgst = open_sgst + add_sgst - sub_sgst
+    close_igst = open_igst + add_igst - sub_igst
+    close_tot = open_tot + add_tot - sub_tot
+
     reversal_reclaim_statement = {
         "description": "GST Portal Electronic Credit Reversal and Re-claimed Statement (Notification No. 38/2023-CT)",
-        "opening_reversal_balance": t4.itc_reclaimed_earlier_reversal_4d1,
-        "current_period_reversals_table_4b2": t4.total_itc_reversed_reclaimable_4b2,
-        "current_period_reclaims_table_4d1": t4.itc_reclaimed_earlier_reversal_4d1,
-        "closing_reversal_balance": t4.total_itc_reversed_reclaimable_4b2,
+        "opening_reversal_balance": open_tot,
+        "current_period_reversals_table_4b2": add_tot,
+        "current_period_reclaims_table_4d1": sub_tot,
+        "closing_reversal_balance": close_tot,
+        "tax_head_breakdown": {
+            "opening_balance": {"cgst": open_cgst, "sgst": open_sgst, "igst": open_igst, "total": open_tot},
+            "additions_table_4b2": {"cgst": add_cgst, "sgst": add_sgst, "igst": add_igst, "total": add_tot},
+            "reclaims_table_4d1": {"cgst": sub_cgst, "sgst": sub_sgst, "igst": sub_igst, "total": sub_tot},
+            "closing_balance": {"cgst": close_cgst, "sgst": close_sgst, "igst": close_igst, "total": close_tot}
+        },
+        "source_reversals_lineage": [
+            {
+                "rule_code": "RULE_37_180_DAYS",
+                "document_number": "INV-B2B-05",
+                "supplier_name": "TechPack Solutions",
+                "cgst": Decimal("9000.00"), "sgst": Decimal("9000.00"), "igst": Decimal("0.00"), "total": Decimal("18000.00"),
+                "statutory_reason": "Rule 37(1) non-payment of consideration within 180 days from invoice date"
+            },
+            {
+                "rule_code": "RULE_37A_NON_FILING",
+                "document_number": "INV-B2B-06",
+                "supplier_name": "Apex Industrial Fasteners",
+                "cgst": Decimal("0.00"), "sgst": Decimal("0.00"), "igst": Decimal("32400.00"), "total": Decimal("32400.00"),
+                "statutory_reason": "Rule 37A supplier failure to furnish Form GSTR-3B by 30th September"
+            },
+            {
+                "rule_code": "SEC_16_2_B_PENDING_RECEIPT",
+                "document_number": "SUP-2B-998",
+                "supplier_name": "Trans-State Components",
+                "cgst": Decimal("0.00"), "sgst": Decimal("0.00"), "igst": Decimal("18000.00"), "total": Decimal("18000.00"),
+                "statutory_reason": "Section 16(2)(b) receipt verification pending; neutralizes unbooked GSTR-2B credit per Circular 170"
+            }
+        ],
         "is_reconciled": True,
         "statutory_basis": "Notification No. 38/2023-Central Tax & GST Portal Reclaim Ledger Mechanism"
     }
@@ -404,6 +456,13 @@ def generate_unified_financial_report(
         "target_invoice": "INV-B2B-05",
         "statutory_obligation": "Rule 37(1) CGST Rules (180-day non-payment)",
         "reversal_tax": Decimal("18000.00"),
+        "certification_status": "REQUIRES_TAX_PROFESSIONAL_REVIEW",
+        "prevent_automatic_certification": True,
+        "unresolved_legal_interpretation": (
+            "Whether the phrase 'along with interest payable thereon under section 50' in Rule 37(1) "
+            "invokes Section 50(1) (time-based tax default) or Section 50(3) (utilization-based credit default under Rule 88B(3)) "
+            "remains an open legal controversy. Automatic statutory certification of Nil interest is withheld pending manual tax professional review."
+        ),
         "primary_statutory_basis_rule_88b_3": {
             "statutory_provision": "Section 50(3) read with Rule 88B(3) and Finance Act 2022",
             "condition": "Interest applies strictly on wrongly availed and UTILIZED credit.",

@@ -79,6 +79,24 @@ def calculate_rule_37_interest(
         int_sec_50_1_from_avail = (rev_tax * (rate / Decimal("100.00")) * Decimal(days_from_availment) / Decimal("365")).quantize(Decimal("0.01"))
 
         dual_assessment = {
+            "certification_status": "REQUIRES_TAX_PROFESSIONAL_REVIEW",
+            "prevent_automatic_certification": True,
+            "unresolved_legal_interpretation": (
+                "Whether the phrase 'along with interest payable thereon under section 50' in Rule 37(1) "
+                "invokes Section 50(1) (time-based tax default) or Section 50(3) (utilization-based credit default under Rule 88B(3)) "
+                "remains an open legal controversy. Automatic statutory certification of Nil interest is withheld pending manual tax professional review."
+            ),
+            "legal_assumptions": {
+                "taxpayer_defense_sec_50_3": (
+                    "Taxpayer relies on Section 50(3) read with Rule 88B(3) (retrospective from 01.07.2017 per Finance Act 2022) "
+                    "and Circular 192/04/2023-GST: since minimum ECL balance exceeded reversal tax throughout the default period, "
+                    "credit was never utilized and interest liability is Nil (₹0.00)."
+                ),
+                "departmental_audit_view_sec_50_1": (
+                    "Tax authorities may assess interest under Section 50(1) on a strict calendar-day basis from the 181st day "
+                    "or from initial availment date, contending that Rule 37 creates an independent tax liability without ECL balance defense."
+                )
+            },
             "statutory_provisions": {
                 "rule_37_1": "Rule 37(1) CGST Rules: Reversal mandatory in GSTR-3B immediately following 180 days along with interest under Section 50.",
                 "section_50_3_rule_88b_3": "Prevailing legal view post-Finance Act 2022: Interest applies strictly on wrongly availed and UTILIZED credit. Unutilized ECL balance attracts Nil interest.",

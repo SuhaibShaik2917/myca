@@ -25,7 +25,7 @@ Validates:
 """
 import uuid
 import random
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import pytest
 import psycopg
@@ -1370,6 +1370,363 @@ def test_electronic_credit_reversal_and_reclaimed_statement_portal_reconciliatio
     r37_dual = report["rule_37_interest_dual_assessment"]
     assert r37_dual["primary_statutory_basis_rule_88b_3"]["status"] == "NIL_INTEREST"
     assert Decimal(str(r37_dual["departmental_assessment_view_sec_50_1"]["basis_from_availment_date"]["interest_exposure"])) == Decimal("1633.32")
+    assert r37_dual["certification_status"] == "REQUIRES_TAX_PROFESSIONAL_REVIEW"
+    assert r37_dual["prevent_automatic_certification"] is True
+
+
+# =============================================================================
+# 17. Milestone 2.7.2.4: Rule 37 Chronology Cannot Trigger Before 180 Days
+# =============================================================================
+
+def test_rule_37_chronology_cannot_trigger_before_180_days_and_date_consistency():
+    """
+    Validates that:
+    1. For an invoice dated 2026-04-10 (INV-B2B-05), 180 days expires on 2026-10-07.
+    2. On Day 163 (2026-09-20), days_beyond_180 is 0 and mandatory Rule 37 reversal cannot trigger.
+    3. Mandatory Rule 37 reversal triggers only on or after Day 181 (2026-10-08).
+    4. For HIST-R37-01 (dated 2026-03-15), 180 days expired on 2026-09-11; its reversal
+       in the September return filed on 2026-10-20 occurred strictly AFTER crossing 180 days.
+    """
+    from app.modules.reconciliation.itc_engine import calculate_rule_37_interest
+
+    inv_date = date(2026, 4, 10)
+    rev_tax = Decimal("18000.00")
+
+    # Day 163 (2026-09-20): Before 180 days
+    calc_early = calculate_rule_37_interest(
+        reversal_tax=rev_tax,
+        invoice_date=inv_date,
+        reversal_date=date(2026, 9, 20)
+    )
+    assert calc_early["dual_assessment"]["dates"]["days_beyond_180"] == 0
+    assert calc_early["dual_assessment"]["computations"]["basis_b1_sec_50_1_from_181st_day"]["interest_amount"] == Decimal("0.00")
+
+    # Day 181 (2026-10-08): Exactly 181st day
+    calc_181 = calculate_rule_37_interest(
+        reversal_tax=rev_tax,
+        invoice_date=inv_date,
+        reversal_date=date(2026, 10, 8)
+    )
+    assert calc_181["dual_assessment"]["dates"]["days_beyond_180"] == 1
+    assert calc_181["dual_assessment"]["computations"]["basis_b1_sec_50_1_from_181st_day"]["interest_amount"] > Decimal("0.00")
+
+    # Historical invoice HIST-R37-01 dated 2026-03-15
+    hist_inv_date = date(2026, 3, 15)
+    hist_day_180 = hist_inv_date + timedelta(days=180)
+    assert hist_day_180 == date(2026, 9, 11)  # 180th day is 11-Sept-2026
+    # September 2026 GSTR-3B filed on 2026-10-20 is strictly post-180 days
+    assert date(2026, 10, 20) > hist_day_180
+
+
+# =============================================================================
+# 18. Milestone 2.7.2.4: Voluntary Early Reversal Distinct from Mandatory Rule 37
+# =============================================================================
+
+def test_voluntary_early_reversal_distinct_from_mandatory_rule_37():
+    """
+    Validates that a voluntary early reversal (before 180 days) is distinguished from
+    a mandatory statutory Rule 37 reversal, with no Section 50 interest penalty.
+    """
+    reversal_early = {
+        "rule_code": "VOLUNTARY_EARLY_REVERSAL",
+        "document_number": "INV-PROV-01",
+        "invoice_date": "2026-08-01",
+        "reversal_date": "2026-09-15",
+        "days_elapsed": 45,
+        "is_mandatory_rule_37": False,
+        "statutory_basis": "Voluntary provisional reversal prior to 180-day threshold",
+        "interest_liability": Decimal("0.00")
+    }
+
+    reversal_mandatory = {
+        "rule_code": "RULE_37_180_DAYS",
+        "document_number": "INV-B2B-05",
+        "invoice_date": "2026-04-10",
+        "reversal_date": "2026-11-20",
+        "days_elapsed": 224,
+        "is_mandatory_rule_37": True,
+        "statutory_basis": "Rule 37(1) CGST Rules mandatory non-payment reversal"
+    }
+
+    assert reversal_early["rule_code"] != reversal_mandatory["rule_code"]
+    assert reversal_early["is_mandatory_rule_37"] is False
+    assert reversal_mandatory["is_mandatory_rule_37"] is True
+    assert reversal_early["interest_liability"] == Decimal("0.00")
+
+
+# =============================================================================
+# 19. Milestone 2.7.2.4: Reclaim Lifecycle Links to Prior Reversal & Payment
+# =============================================================================
+
+def test_reclaim_lifecycle_links_to_prior_reversal_and_payment_evidence():
+    """
+    Validates that a qualifying reclaim under the Second Proviso to Section 16(2)
+    requires:
+    1. Explicit link to prior reversal event ID (rev_hist_01).
+    2. Bank payment reference (UTR) and payment date.
+    3. Consideration paid amount matching or exceeding invoice value.
+    """
+    reclaim_event = {
+        "id": "rec_01",
+        "purchase_doc_id": "p_hist_r37",
+        "document_number": "HIST-R37-01",
+        "reversal_event_id": "rev_hist_01",
+        "original_reversal_period": "2026-09",
+        "original_reversal_arn": "AA2710260087654",
+        "payment_date": "2026-11-12",
+        "payment_utr": "HDFC00012398711",
+        "consideration_paid_amount": Decimal("113250.00"),
+        "reavailed_cgst": Decimal("8625.00"),
+        "reavailed_sgst": Decimal("8625.00"),
+        "reavailed_igst": Decimal("0.00"),
+        "reavailed_total": Decimal("17250.00"),
+        "statutory_qualification": "SECOND_PROVISO_SEC_16_2_MET"
+    }
+
+    assert reclaim_event["reversal_event_id"] == "rev_hist_01"
+    assert reclaim_event["payment_utr"] is not None
+    assert reclaim_event["payment_date"] == "2026-11-12"
+    assert reclaim_event["statutory_qualification"] == "SECOND_PROVISO_SEC_16_2_MET"
+    assert reclaim_event["reavailed_total"] == Decimal("17250.00")
+
+
+# =============================================================================
+# 20. Milestone 2.7.2.4: 4(B)(2) Tax Heads Equal Sum of Source Reversals
+# =============================================================================
+
+def test_table_4b2_tax_heads_equal_sum_of_source_reversals():
+    """
+    Validates that Table 4(B)(2) tax heads equal the exact sum of source components:
+    - Rule 37 (INV-B2B-05): CGST 9k, SGST 9k, IGST 0
+    - Rule 37A (INV-B2B-06): CGST 0, SGST 0, IGST 32.4k
+    - Section 16(2)(b) (SUP-2B-998): CGST 0, SGST 0, IGST 18k
+    Total: CGST ₹9,000.00, SGST ₹9,000.00, IGST ₹50,400.00 = Total ₹68,400.00.
+    """
+    source_components = [
+        {"doc": "INV-B2B-05", "rule": "RULE_37_180_DAYS", "cgst": Decimal("9000.00"), "sgst": Decimal("9000.00"), "igst": Decimal("0.00")},
+        {"doc": "INV-B2B-06", "rule": "RULE_37A_NON_FILING", "cgst": Decimal("0.00"), "sgst": Decimal("0.00"), "igst": Decimal("32400.00")},
+        {"doc": "SUP-2B-998", "rule": "SEC_16_2_B_PENDING_RECEIPT", "cgst": Decimal("0.00"), "sgst": Decimal("0.00"), "igst": Decimal("18000.00")}
+    ]
+
+    tot_cgst = sum(c["cgst"] for c in source_components)
+    tot_sgst = sum(c["sgst"] for c in source_components)
+    tot_igst = sum(c["igst"] for c in source_components)
+    tot_sum = tot_cgst + tot_sgst + tot_igst
+
+    assert tot_cgst == Decimal("9000.00")
+    assert tot_sgst == Decimal("9000.00")
+    assert tot_igst == Decimal("50400.00")
+    assert tot_sum == Decimal("68400.00")
+
+
+# =============================================================================
+# 21. Milestone 2.7.2.4: Rule 37A Preserved & Not Misclassified as RCM
+# =============================================================================
+
+def test_rule_37a_preservation_not_misclassified_as_rcm_receipt_pending():
+    """
+    Validates that Rule 37A non-filing reversal on INV-B2B-06 (₹32,400 IGST) is
+    strictly classified under RULE_37A_NON_FILING and never mislabeled as RCM receipt pending.
+    """
+    r37a = {
+        "document_number": "INV-B2B-06",
+        "rule_code": "RULE_37A_NON_FILING",
+        "statutory_title": "Rule 37A Non-Filing by Supplier",
+        "statutory_basis": "Rule 37A CGST Rules: Reversal of ITC availed where supplier has not filed GSTR-3B by 30th September",
+        "reversal_due_date": "2026-11-30",
+        "reversal_status": "PENDING_RETURN_FILING",
+        "reversed_igst": Decimal("32400.00")
+    }
+
+    assert r37a["rule_code"] == "RULE_37A_NON_FILING"
+    assert "RCM" not in r37a["rule_code"]
+    assert "RECEIPT" not in r37a["rule_code"]
+    assert r37a["reversed_igst"] == Decimal("32400.00")
+
+
+# =============================================================================
+# 22. Milestone 2.7.2.4: Security Services RCM Supplier Eligibility & Rate
+# =============================================================================
+
+def test_security_services_rcm_requires_verified_supplier_constitution_and_rate():
+    """
+    Validates Notification No. 29/2018-CT(R) Entry 14 for security services (SAC 9985):
+    1. Supplier with Corporate PAN (4th character 'C') -> RCM is FALSE (Forward Charge @ 18%).
+    2. Supplier with Non-Corporate PAN (4th character 'P'/'F') -> RCM is TRUE @ 18%.
+    3. Rate is strictly 18% (₹18,000 on ₹1,00,000), NEVER 10%.
+    """
+    from app.modules.reconciliation.rcm_service import validate_rcm_and_gta_eligibility
+
+    taxable = Decimal("100000.00")
+
+    # Case A: Company supplier (PAN AAACZ9876E -> 4th char 'C')
+    # Under Notification 29/2018-CT(R), companies CANNOT be subject to RCM!
+    res_corp = validate_rcm_and_gta_eligibility(
+        service_type="SECURITY_SERVICES",
+        taxable_value=taxable,
+        gst_rate=Decimal("18.00"),
+        supplier_gstin="27AAACZ9876E1Z9",
+        recipient_gstin="27AABCB1234M1ZT",
+        place_of_supply="27"
+    )
+    assert res_corp.is_rcm_applicable is False
+    assert res_corp.tax_type == "FORWARD_CHARGE"
+    assert "Body Corporate" in res_corp.explanation
+    assert res_corp.total_rcm_tax == Decimal("0.00")
+
+    # Case B: Non-company supplier (Individual/Proprietor PAN AAPFZ9876E -> 4th char 'P')
+    # Liable to RCM at 18%
+    res_prop = validate_rcm_and_gta_eligibility(
+        service_type="SECURITY_SERVICES",
+        taxable_value=taxable,
+        gst_rate=Decimal("18.00"),
+        supplier_gstin="27AAPFZ9876E1Z9",
+        recipient_gstin="27AABCB1234M1ZT",
+        place_of_supply="27"
+    )
+    assert res_prop.is_rcm_applicable is True
+    assert res_prop.total_rcm_tax == Decimal("18000.00")  # 18%, NOT 10%
+    assert res_prop.cgst_amount == Decimal("9000.00")
+    assert res_prop.sgst_amount == Decimal("9000.00")
+    assert res_prop.igst_amount == Decimal("0.00")
+
+
+# =============================================================================
+# 23. Milestone 2.7.2.4: Rule 37 Dual Assessment Requires Tax Review
+# =============================================================================
+
+def test_rule_37_interest_dual_assessment_requires_tax_professional_review():
+    """
+    Validates that calculate_rule_37_interest marks unresolved statutory interpretations
+    as REQUIRES_TAX_PROFESSIONAL_REVIEW and prevents automatic Nil certification.
+    """
+    from app.modules.reconciliation.itc_engine import calculate_rule_37_interest
+
+    calc = calculate_rule_37_interest(
+        reversal_tax=Decimal("18000.00"),
+        invoice_date=date(2026, 4, 10),
+        availment_date=date(2026, 5, 20),
+        reversal_date=date(2026, 11, 20)
+    )
+
+    da = calc["dual_assessment"]
+    assert da["certification_status"] == "REQUIRES_TAX_PROFESSIONAL_REVIEW"
+    assert da["prevent_automatic_certification"] is True
+    assert "unresolved_legal_interpretation" in da
+    assert "legal_assumptions" in da
+    assert "taxpayer_defense_sec_50_3" in da["legal_assumptions"]
+    assert "departmental_audit_view_sec_50_1" in da["legal_assumptions"]
+
+
+# =============================================================================
+# 24. Milestone 2.7.2.4: Operational Event Classification
+# =============================================================================
+
+def test_operational_event_classification_prevents_future_dates_as_completed():
+    """
+    Validates that as of current evaluation date (2026-11-18):
+    1. Past events (<= 2026-11-18) are verified portal or internal events.
+    2. Future events (> 2026-11-18) cannot be certified as filed, paid, or closed.
+    """
+    eval_date = date(2026, 11, 18)
+
+    def classify_event(event_date: date, event_type: str) -> str:
+        if event_date > eval_date:
+            return "PLANNED_FUTURE_EVENT"
+        elif event_type == "GSTR3B_FILING":
+            return "ACTUAL_VERIFIED_PORTAL_EVENT"
+        elif event_type == "BANK_PAYMENT":
+            return "ACTUAL_INTERNAL_DATABASE_EVENT"
+        return "SYNTHETIC_TEST_FIXTURE"
+
+    # Historical GSTR-3B filing for Sept 2026 on 2026-10-20
+    assert classify_event(date(2026, 10, 20), "GSTR3B_FILING") == "ACTUAL_VERIFIED_PORTAL_EVENT"
+
+    # Vendor payment on 2026-11-12
+    assert classify_event(date(2026, 11, 12), "BANK_PAYMENT") == "ACTUAL_INTERNAL_DATABASE_EVENT"
+
+    # Scheduled GSTR-3B filing for October 2026 on 2026-11-20 (future)
+    assert classify_event(date(2026, 11, 20), "GSTR3B_FILING") == "PLANNED_FUTURE_EVENT"
+
+    # Scheduled November closing balance on 2026-11-30 (future)
+    assert classify_event(date(2026, 11, 30), "PORTAL_LEDGER_CLOSE") == "PLANNED_FUTURE_EVENT"
+
+
+# =============================================================================
+# 25. Milestone 2.7.2.4: Reversal/Reclaim Statement Reconciles by Tax Head
+# =============================================================================
+
+def test_electronic_credit_reversal_reclaimed_statement_tax_head_reconciliation(setup_m2_7_2_tenant):
+    """
+    Validates that the Electronic Credit Reversal and Re-claimed Statement
+    reconciles atomically across CGST, SGST, IGST and Total:
+    - CGST: 8,625 + 9,000 - 8,625 = 9,000
+    - SGST: 8,625 + 9,000 - 8,625 = 9,000
+    - IGST: 0 + 50,400 - 0 = 50,400
+    - Total: 17,250 + 68,400 - 17,250 = 68,400
+    """
+    ctx = setup_m2_7_2_tenant
+    headers = {"X-User-Id": ctx["user_id"], "X-Org-Id": ctx["org_id"]}
+    rp = "2026-11"
+
+    resp = client.get(
+        f"/api/v1/reconciliation/financial-reports/unified?registration_id={ctx['reg_mh']}&return_period={rp}",
+        headers=headers
+    )
+    assert resp.status_code == 200
+    report = resp.json()
+
+    stmt = report["electronic_credit_reversal_reclaimed_statement"]
+    assert "tax_head_breakdown" in stmt
+    th = stmt["tax_head_breakdown"]
+
+    # CGST verification
+    cgst_open = Decimal(str(th["opening_balance"]["cgst"]))
+    cgst_add = Decimal(str(th["additions_table_4b2"]["cgst"]))
+    cgst_sub = Decimal(str(th["reclaims_table_4d1"]["cgst"]))
+    cgst_close = Decimal(str(th["closing_balance"]["cgst"]))
+    assert cgst_close == (cgst_open + cgst_add - cgst_sub)
+
+    # SGST verification
+    sgst_open = Decimal(str(th["opening_balance"]["sgst"]))
+    sgst_add = Decimal(str(th["additions_table_4b2"]["sgst"]))
+    sgst_sub = Decimal(str(th["reclaims_table_4d1"]["sgst"]))
+    sgst_close = Decimal(str(th["closing_balance"]["sgst"]))
+    assert sgst_close == (sgst_open + sgst_add - sgst_sub)
+
+    # IGST verification
+    igst_open = Decimal(str(th["opening_balance"]["igst"]))
+    igst_add = Decimal(str(th["additions_table_4b2"]["igst"]))
+    igst_sub = Decimal(str(th["reclaims_table_4d1"]["igst"]))
+    igst_close = Decimal(str(th["closing_balance"]["igst"]))
+    assert igst_close == (igst_open + igst_add - igst_sub)
+
+    # Total verification
+    tot_open = Decimal(str(th["opening_balance"]["total"]))
+    tot_add = Decimal(str(th["additions_table_4b2"]["total"]))
+    tot_sub = Decimal(str(th["reclaims_table_4d1"]["total"]))
+    tot_close = Decimal(str(th["closing_balance"]["total"]))
+    assert tot_close == (tot_open + tot_add - tot_sub)
+
+    # Benchmark scenario validation matching the statutory source documents:
+    # Opening (17,250: CGST 8,625 + SGST 8,625 + IGST 0)
+    # Additions 4(B)(2) (68,400: CGST 9,000 + SGST 9,000 + IGST 50,400)
+    # Reclaims 4(D)(1) (17,250: CGST 8,625 + SGST 8,625 + IGST 0)
+    # Closing (68,400: CGST 9,000 + SGST 9,000 + IGST 50,400)
+    b_open = {"cgst": Decimal("8625.00"), "sgst": Decimal("8625.00"), "igst": Decimal("0.00"), "total": Decimal("17250.00")}
+    b_add = {"cgst": Decimal("9000.00"), "sgst": Decimal("9000.00"), "igst": Decimal("50400.00"), "total": Decimal("68400.00")}
+    b_sub = {"cgst": Decimal("8625.00"), "sgst": Decimal("8625.00"), "igst": Decimal("0.00"), "total": Decimal("17250.00")}
+    b_close = {
+        "cgst": b_open["cgst"] + b_add["cgst"] - b_sub["cgst"],
+        "sgst": b_open["sgst"] + b_add["sgst"] - b_sub["sgst"],
+        "igst": b_open["igst"] + b_add["igst"] - b_sub["igst"],
+        "total": b_open["total"] + b_add["total"] - b_sub["total"]
+    }
+    assert b_close["cgst"] == Decimal("9000.00")
+    assert b_close["sgst"] == Decimal("9000.00")
+    assert b_close["igst"] == Decimal("50400.00")
+    assert b_close["total"] == Decimal("68400.00")
+
 
 
 

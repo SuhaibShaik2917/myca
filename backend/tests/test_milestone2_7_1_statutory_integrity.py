@@ -68,8 +68,8 @@ def setup_m2_7_1_tenant():
                 INSERT INTO public.global_users (id, email, full_name)
                 VALUES (%s, %s, 'Chief Accountant M271'),
                        (%s, %s, 'Auditor M271');
-            """, (user_id, f"acct_{rand_digits}@m271.test",
-                  user_id_2, f"auditor_{rand_digits}@m271.test"))
+            """, (user_id, f"acct_{org_id[:8]}@m271.test",
+                  user_id_2, f"auditor_{org_id[:8]}@m271.test"))
 
             cur.execute("""
                 INSERT INTO public.organization_memberships (org_id, user_id, role, status)

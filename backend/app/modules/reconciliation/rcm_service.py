@@ -58,7 +58,67 @@ def validate_rcm_and_gta_eligibility(
     rate = Decimal(str(gst_rate or 5.00))
     total_tax = (taxable * rate / Decimal("100.00")).quantize(Decimal("0.01"))
 
-    # 1. Non-GTA services
+    # 1. Security Services (Supply of Security Personnel) under Notification No. 29/2018-CT(R) Entry 14:
+    if srv in {"SECURITY_SERVICES", "SECURITY_PERSONNEL", "SAC_9985", "SAC_998529", "SECURITY"}:
+        # Check supplier constitution from PAN 4th character:
+        # A GSTIN is 15 chars: State(2) + PAN(10) + Entity(1) + 'Z' + Checksum(1)
+        # 4th character of PAN is index 5 of GSTIN (supplier_gstin[5])
+        supp_pan_4th = (supplier_gstin[5].upper() if supplier_gstin and len(supplier_gstin) >= 6 else "")
+        is_body_corporate = supp_pan_4th in {"C", "U"}
+
+        # Under Notification No. 29/2018-CT(R) Entry 14, RCM applies ONLY if supplier is "any person other than a body corporate"
+        if is_body_corporate or supp_pan_4th == "C":
+            return RCMValidationResult(
+                is_rcm_applicable=False,
+                tax_type="FORWARD_CHARGE",
+                cgst_amount=Decimal("0.00"),
+                sgst_amount=Decimal("0.00"),
+                igst_amount=Decimal("0.00"),
+                total_rcm_tax=Decimal("0.00"),
+                is_cash_discharged=False,
+                itc_eligibility_status="FORWARD_CHARGE_VENDOR_INVOICE",
+                statutory_basis="Notification No. 29/2018-Central Tax (Rate) Entry 14",
+                explanation=(
+                    f"Supplier GSTIN {supplier_gstin} has PAN 4th character '{supp_pan_4th}', indicating a Body Corporate (Company). "
+                    "Entry 14 of Notification 13/2017-CT(R) restricts security services RCM strictly to persons other than a body corporate. "
+                    "The supply is under Forward Charge; recipient cannot discharge under RCM or include in Table 3.1(d). "
+                    "Vendor must charge 18% GST on tax invoice reportable under Table 4(A)(5)."
+                )
+            )
+
+        # Non-body corporate supplier: check recipient eligibility and 18% rate
+        actual_rate = Decimal("18.00") if rate in {Decimal("5.00"), Decimal("10.00")} else rate
+        actual_total_tax = (taxable * actual_rate / Decimal("100.00")).quantize(Decimal("0.01"))
+
+        rec_state = recipient_gstin[:2] if len(recipient_gstin) >= 2 else place_of_supply
+        supp_state = (supplier_gstin[:2] if supplier_gstin and len(supplier_gstin) >= 2 else rec_state)
+        is_intra = (supp_state == place_of_supply)
+
+        c = (actual_total_tax / Decimal("2.00")).quantize(Decimal("0.01")) if is_intra else Decimal("0.00")
+        s = (actual_total_tax / Decimal("2.00")).quantize(Decimal("0.01")) if is_intra else Decimal("0.00")
+        i = actual_total_tax if not is_intra else Decimal("0.00")
+
+        cash_discharged = bool(cash_payment_challan_ref)
+        status = "ELIGIBLE_4A3" if cash_discharged else "PENDING_CASH_DISCHARGE_31D"
+
+        return RCMValidationResult(
+            is_rcm_applicable=True,
+            tax_type="INTRA_STATE" if is_intra else "INTER_STATE",
+            cgst_amount=c,
+            sgst_amount=s,
+            igst_amount=i,
+            total_rcm_tax=actual_total_tax,
+            is_cash_discharged=cash_discharged,
+            itc_eligibility_status=status,
+            statutory_basis="Notification No. 29/2018-Central Tax (Rate) Entry 14",
+            explanation=(
+                f"Statutory RCM applies on Security Services from non-body corporate supplier (PAN 4th '{supp_pan_4th}'). "
+                f"Tax rate: 18% (CGST ₹{c:,.2f}, SGST ₹{s:,.2f}, IGST ₹{i:,.2f}). "
+                f"Must be discharged in cash via Table 3.1(d) before claiming Table 4(A)(3) ITC."
+            )
+        )
+
+    # 2. Non-GTA other services (Legal services by advocate, Director remuneration, etc.)
     if srv != "GTA_ROAD_TRANSPORT":
         # General RCM service (e.g. Legal services by advocate, Director services, etc.)
         # Section 12 PoS check
