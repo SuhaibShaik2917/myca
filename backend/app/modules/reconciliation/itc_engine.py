@@ -554,7 +554,7 @@ def calculate_rule_37_interest(
 def simulate_sequential_ecl_cross_utilization(
     opening_balances: Dict[str, Any],
     output_liabilities: Dict[str, Any],
-    igst_offset_order: str = "CGST_THEN_SGST"
+    igst_offset_order: Any = "CGST_THEN_SGST"
 ) -> Dict[str, Any]:
     """
     Simulates sequential tax liability offset and Electronic Credit Ledger (ECL) cross-utilization
@@ -564,10 +564,10 @@ def simulate_sequential_ecl_cross_utilization(
     1. IGST Credit Utilization:
        - Must be utilized FIRST towards payment of IGST output liability.
        - Any remaining IGST credit can be utilized towards payment of CGST and SGST liabilities
-         in any order / proportion (default: CGST then SGST, or EQUAL).
-       - Crucially: Entire IGST credit must be fully exhausted before ANY CGST or SGST credit
+         in any order / proportion (e.g. CGST_THEN_SGST, SGST_THEN_CGST, EQUAL, or custom proportion).
+       - Crucially: Entire IGST credit must be fully exhausted (to ₹0.00) before ANY CGST or SGST credit
          can be utilized (Rule 88A mandate).
-       - When IGST credit is consumed by CGST, the available IGST pool is depleted, preventing
+       - When IGST credit is consumed by CGST, the available IGST pool is depleted sequentially, preventing
          the same IGST balance from being double-counted as simultaneously available against SGST (DEF-05).
     2. CGST Credit Utilization:
        - Utilized towards payment of remaining CGST output liability.
@@ -601,54 +601,162 @@ def simulate_sequential_ecl_cross_utilization(
     rem_sgst_liab = l_sgst
     rem_cess_liab = l_cess
 
+    debit_history: List[Dict[str, Any]] = []
+
     # Step 1: Offset IGST liability with IGST credit
     igst_used_for_igst = min(rem_igst_bal, rem_igst_liab)
     rem_igst_bal -= igst_used_for_igst
     rem_igst_liab -= igst_used_for_igst
+    if igst_used_for_igst > Decimal("0.00"):
+        debit_history.append({
+            "step": 1,
+            "action": "IGST_CREDIT_FOR_IGST_LIABILITY",
+            "debit_amount": igst_used_for_igst,
+            "credit_head_used": "IGST",
+            "liability_head_offset": "IGST",
+            "remaining_igst_credit": rem_igst_bal,
+            "remaining_igst_liability": rem_igst_liab
+        })
 
     # Step 2: Offset CGST and SGST liabilities with remaining IGST credit (Rule 88A)
     # The pool must deplete sequentially, preventing double-counting!
-    if igst_offset_order == "EQUAL":
-        half = (rem_igst_bal / Decimal("2.00")).quantize(Decimal("0.01"))
-        igst_used_for_cgst = min(half, rem_cgst_liab)
-        rem_igst_bal -= igst_used_for_cgst
-        rem_cgst_liab -= igst_used_for_cgst
+    igst_used_for_cgst = Decimal("0.00")
+    igst_used_for_sgst = Decimal("0.00")
 
-        igst_used_for_sgst = min(rem_igst_bal, rem_sgst_liab)
-        rem_igst_bal -= igst_used_for_sgst
-        rem_sgst_liab -= igst_used_for_sgst
-    else:  # CGST_THEN_SGST
-        igst_used_for_cgst = min(rem_igst_bal, rem_cgst_liab)
-        rem_igst_bal -= igst_used_for_cgst
-        rem_cgst_liab -= igst_used_for_cgst
+    if rem_igst_bal > Decimal("0.00"):
+        if igst_offset_order == "EQUAL":
+            half = (rem_igst_bal / Decimal("2.00")).quantize(Decimal("0.01"))
+            igst_used_for_cgst = min(half, rem_cgst_liab)
+            rem_igst_bal -= igst_used_for_cgst
+            rem_cgst_liab -= igst_used_for_cgst
 
-        igst_used_for_sgst = min(rem_igst_bal, rem_sgst_liab)
-        rem_igst_bal -= igst_used_for_sgst
-        rem_sgst_liab -= igst_used_for_sgst
+            igst_used_for_sgst = min(rem_igst_bal, rem_sgst_liab)
+            rem_igst_bal -= igst_used_for_sgst
+            rem_sgst_liab -= igst_used_for_sgst
+        elif igst_offset_order == "SGST_THEN_CGST":
+            igst_used_for_sgst = min(rem_igst_bal, rem_sgst_liab)
+            rem_igst_bal -= igst_used_for_sgst
+            rem_sgst_liab -= igst_used_for_sgst
+
+            igst_used_for_cgst = min(rem_igst_bal, rem_cgst_liab)
+            rem_igst_bal -= igst_used_for_cgst
+            rem_cgst_liab -= igst_used_for_cgst
+        elif isinstance(igst_offset_order, dict):
+            cgst_req = Decimal(str(igst_offset_order.get("cgst") or 0))
+            sgst_req = Decimal(str(igst_offset_order.get("sgst") or 0))
+            igst_used_for_cgst = min(min(rem_igst_bal, cgst_req), rem_cgst_liab)
+            rem_igst_bal -= igst_used_for_cgst
+            rem_cgst_liab -= igst_used_for_cgst
+
+            igst_used_for_sgst = min(min(rem_igst_bal, sgst_req), rem_sgst_liab)
+            rem_igst_bal -= igst_used_for_sgst
+            rem_sgst_liab -= igst_used_for_sgst
+        else:  # CGST_THEN_SGST (default)
+            igst_used_for_cgst = min(rem_igst_bal, rem_cgst_liab)
+            rem_igst_bal -= igst_used_for_cgst
+            rem_cgst_liab -= igst_used_for_cgst
+
+            igst_used_for_sgst = min(rem_igst_bal, rem_sgst_liab)
+            rem_igst_bal -= igst_used_for_sgst
+            rem_sgst_liab -= igst_used_for_sgst
+
+        if igst_used_for_cgst > Decimal("0.00"):
+            debit_history.append({
+                "step": 2,
+                "action": "REMAINING_IGST_FOR_CGST_LIABILITY",
+                "debit_amount": igst_used_for_cgst,
+                "credit_head_used": "IGST",
+                "liability_head_offset": "CGST",
+                "remaining_igst_credit": rem_igst_bal,
+                "remaining_cgst_liability": rem_cgst_liab
+            })
+        if igst_used_for_sgst > Decimal("0.00"):
+            debit_history.append({
+                "step": 2,
+                "action": "REMAINING_IGST_FOR_SGST_LIABILITY",
+                "debit_amount": igst_used_for_sgst,
+                "credit_head_used": "IGST",
+                "liability_head_offset": "SGST",
+                "remaining_igst_credit": rem_igst_bal,
+                "remaining_sgst_liability": rem_sgst_liab
+            })
+
+    # Rule 88A Exhaustion Gate Check:
+    rule_88a_exhaustion_satisfied = (rem_igst_bal == Decimal("0.00")) or (rem_cgst_liab == Decimal("0.00") and rem_sgst_liab == Decimal("0.00"))
 
     # Step 3: Offset remaining CGST liability with CGST credit
     cgst_used_for_cgst = min(rem_cgst_bal, rem_cgst_liab)
     rem_cgst_bal -= cgst_used_for_cgst
     rem_cgst_liab -= cgst_used_for_cgst
+    if cgst_used_for_cgst > Decimal("0.00"):
+        debit_history.append({
+            "step": 3,
+            "action": "CGST_CREDIT_FOR_CGST_LIABILITY",
+            "debit_amount": cgst_used_for_cgst,
+            "credit_head_used": "CGST",
+            "liability_head_offset": "CGST",
+            "remaining_cgst_credit": rem_cgst_bal,
+            "remaining_cgst_liability": rem_cgst_liab
+        })
 
     # Step 4: Offset remaining SGST liability with SGST credit
     sgst_used_for_sgst = min(rem_sgst_bal, rem_sgst_liab)
     rem_sgst_bal -= sgst_used_for_sgst
     rem_sgst_liab -= sgst_used_for_sgst
+    if sgst_used_for_sgst > Decimal("0.00"):
+        debit_history.append({
+            "step": 4,
+            "action": "SGST_CREDIT_FOR_SGST_LIABILITY",
+            "debit_amount": sgst_used_for_sgst,
+            "credit_head_used": "SGST",
+            "liability_head_offset": "SGST",
+            "remaining_sgst_credit": rem_sgst_bal,
+            "remaining_sgst_liability": rem_sgst_liab
+        })
 
     # Step 5: If IGST liability still remains, offset with CGST credit then SGST credit
     cgst_used_for_igst = min(rem_cgst_bal, rem_igst_liab)
     rem_cgst_bal -= cgst_used_for_igst
     rem_igst_liab -= cgst_used_for_igst
+    if cgst_used_for_igst > Decimal("0.00"):
+        debit_history.append({
+            "step": 5,
+            "action": "CGST_CREDIT_FOR_REMAINING_IGST_LIABILITY",
+            "debit_amount": cgst_used_for_igst,
+            "credit_head_used": "CGST",
+            "liability_head_offset": "IGST",
+            "remaining_cgst_credit": rem_cgst_bal,
+            "remaining_igst_liability": rem_igst_liab
+        })
 
     sgst_used_for_igst = min(rem_sgst_bal, rem_igst_liab)
     rem_sgst_bal -= sgst_used_for_igst
     rem_igst_liab -= sgst_used_for_igst
+    if sgst_used_for_igst > Decimal("0.00"):
+        debit_history.append({
+            "step": 5,
+            "action": "SGST_CREDIT_FOR_REMAINING_IGST_LIABILITY",
+            "debit_amount": sgst_used_for_igst,
+            "credit_head_used": "SGST",
+            "liability_head_offset": "IGST",
+            "remaining_sgst_credit": rem_sgst_bal,
+            "remaining_igst_liability": rem_igst_liab
+        })
 
     # Step 6: Cess
     cess_used_for_cess = min(rem_cess_bal, rem_cess_liab)
     rem_cess_bal -= cess_used_for_cess
     rem_cess_liab -= cess_used_for_cess
+    if cess_used_for_cess > Decimal("0.00"):
+        debit_history.append({
+            "step": 6,
+            "action": "CESS_CREDIT_FOR_CESS_LIABILITY",
+            "debit_amount": cess_used_for_cess,
+            "credit_head_used": "CESS",
+            "liability_head_offset": "CESS",
+            "remaining_cess_credit": rem_cess_bal,
+            "remaining_cess_liability": rem_cess_liab
+        })
 
     return {
         "opening_balances": {"igst": b_igst, "cgst": b_cgst, "sgst": b_sgst, "cess": b_cess},
@@ -682,6 +790,8 @@ def simulate_sequential_ecl_cross_utilization(
             "cess": rem_cess_liab,
             "total": rem_igst_liab + rem_cgst_liab + rem_sgst_liab + rem_cess_liab
         },
+        "debit_history": debit_history,
+        "rule_88a_exhaustion_satisfied": rule_88a_exhaustion_satisfied,
         "cross_head_double_counting_prevented": True,
         "statutory_authority": "Sections 49, 49A, 49B of CGST Act read with Rule 88A CGST Rules"
     }

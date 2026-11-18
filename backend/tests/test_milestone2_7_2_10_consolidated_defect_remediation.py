@@ -278,7 +278,7 @@ def test_def06_gta_canonical_supplier_identity_and_five_point_validation():
         "GTA-NOV-01A": {
             "canonical_supplier_name": "FastTrack Logistics (Intra-State GTA)",
             "canonical_supplier_gstin": "27AAGFG4411D1ZA",
-            "historical_synthetic_alias": "Mahaveer Freight Carriers (27AAAFM1122D1Z4)",
+            "separate_distinct_entity": "Mahaveer Freight Carriers (27AAAFM1122D1Z4) is an independent distinct entity with different PAN (AAAFM1122D vs AAGFG4411D) - NEVER an alias",
             "classification": "SYNTHETIC_TEST_FIXTURE",
             "consignment_note": "LR-GTA-01A",
             "taxable_value": Decimal("400000.00"),
@@ -289,7 +289,7 @@ def test_def06_gta_canonical_supplier_identity_and_five_point_validation():
         "GTA-NOV-01B": {
             "canonical_supplier_name": "FastTrack Logistics Gujarat (Inter-State GTA)",
             "canonical_supplier_gstin": "24AAAFG9988C1Z1",
-            "historical_synthetic_alias": None,
+            "separate_distinct_entity": None,
             "classification": "SYNTHETIC_TEST_FIXTURE",
             "consignment_note": "LR-GTA-01B",
             "taxable_value": Decimal("200000.00"),
