@@ -224,10 +224,15 @@ def generate_gstr3b_table4_summary(
                 "availed_period": p_doc.get("availed_period", rev.get("reversal_period", "N/A")),
                 "is_availed_in_3b": p_doc.get("is_availed_in_3b", True),
                 "rule_code": rule,
+                "reversal_status": rev.get("reversal_status") or ("DISCHARGED" if rev.get("filing_arn") else "PENDING_RETURN_FILING"),
+                "reversal_due_date": rev.get("reversal_due_date"),
+                "reversal_scheduled_date": rev.get("reversal_scheduled_date"),
+                "filing_arn": rev.get("filing_arn"),
                 "reversal_amount": rc + rs + ri + rcs,
                 "cgst": rc, "sgst": rs, "igst": ri, "cess": rcs,
                 "interest_liability": Decimal(str(rev.get("interest_liability") or 0)),
-                "interest_basis": rev.get("interest_basis") or "Section 50(3) conditional on utilization"
+                "interest_basis": rev.get("interest_basis") or "Section 50(3) conditional on utilization",
+                "interest_calculation_inputs": rev.get("interest_calculation_inputs")
             })
     else:
         for a in assessments:
@@ -301,12 +306,22 @@ def generate_gstr3b_table4_summary(
                     "document_date": str(u_doc.get("document_date", "")),
                     "supplier_gstin": u_doc.get("supplier_gstin", "N/A"),
                     "availed_period": return_period,
-                    "is_availed_in_3b": True,
+                    "is_availed_in_3b": False,
                     "rule_code": "SEC_16_2_B_PENDING_RECEIPT",
+                    "reversal_status": "AUTO_NEUTRALIZED_UNBOOKED",
+                    "reversal_due_date": None,
+                    "reversal_scheduled_date": str(return_period),
+                    "filing_arn": None,
                     "reversal_amount": uc + us + ui + ucs,
                     "cgst": uc, "sgst": us, "igst": ui, "cess": ucs,
                     "interest_liability": Decimal("0.00"),
-                    "interest_basis": "Section 50(3) Nil - Not utilized in cash offset"
+                    "interest_basis": "Section 50(3) Nil - Not utilized in cash offset; neutralizes gross Table 4(A)(5) pending physical receipt per Circular 170/02/2022-GST",
+                    "interest_calculation_inputs": {
+                        "statutory_basis": "Circular 170/02/2022-GST",
+                        "days_in_default": 0,
+                        "utilized_amount": "0.00",
+                        "interest_rate": "18% p.a."
+                    }
                 })
 
     comp_4b2_total = ComponentTaxAmount(

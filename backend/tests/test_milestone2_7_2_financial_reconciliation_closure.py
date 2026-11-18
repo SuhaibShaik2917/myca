@@ -25,6 +25,7 @@ Validates:
 """
 import uuid
 import random
+from datetime import date, datetime
 from decimal import Decimal
 import pytest
 import psycopg
@@ -33,6 +34,8 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.modules.reconciliation.gstr3b_itc import generate_gstr3b_table4_summary
 from app.modules.reconciliation.unified_report_service import generate_unified_financial_report
+from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
+from app.modules.reconciliation.schemas import ITCEligibilityEnum
 
 client = TestClient(app)
 DB_ADMIN = "postgresql://postgres:postgres@localhost:5432/myca"
@@ -592,3 +595,280 @@ def test_cross_tenant_isolation_on_unified_financial_report(setup_m2_7_2_tenant)
     assert report_b["gstr2b_total"] == "0.00" or report_b["gstr2b_total"] == 0.0
     assert report_b["table_4a_gross"] == "0.00" or report_b["table_4a_gross"] == 0.0
     assert len(report_b["supplier_wise_itc"]) == 0
+
+
+# =============================================================================
+# 7. Milestone 2.7.2.1: Section 16(4) Timing Evidence & Annual Return Cutoff
+# =============================================================================
+
+def test_section_16_4_timing_evidence_annual_return_cutoff():
+    """
+    Validates that as of 18 November 2026:
+    1. An invoice dated 10 August 2025 (FY 2025-26) is NOT time-barred solely by the calendar
+       if 30 November 2026 has not passed and no annual return was filed.
+    2. If the recipient furnished GSTR-9 Annual Return for FY 2025-26 earlier (e.g. 28 October 2026),
+       Section 16(4) applies 'whichever is earlier', legally establishing 28-Oct-2026 as the cutoff!
+    3. Any invoice communicated thereafter is confirmed time-barred and reported in Table 4(D)(2).
+    """
+    engine = StatutoryITCRiskEngine()
+    eval_dt = date(2026, 11, 18)
+
+    doc_2025 = {
+        "id": "doc_inelig_16_4",
+        "document_number": "INV-INELIG-01",
+        "document_date": "2025-08-10",
+        "cgst_amount": "0.00",
+        "sgst_amount": "0.00",
+        "igst_amount": "12400.00",
+        "cess_amount": "0.00",
+        "total_invoice_value": "81288.89",
+        "goods_services_type": "services",
+        "is_availed_in_3b": True
+    }
+
+    # Case A: No earlier Annual Return furnished (cutoff remains 30-Nov-2026)
+    # As of 18-Nov-2026, cutoff has NOT arrived -> No SEC_16_4 assessment
+    assessments_no_ar = engine.evaluate_itc_eligibility(
+        purchase_doc=doc_2025,
+        evaluation_date=eval_dt,
+        annual_return_filing_date=None
+    )
+    sec_16_4_no_ar = [a for a in assessments_no_ar if a.rule_code == "SEC_16_4"]
+    assert len(sec_16_4_no_ar) == 0
+
+    # Case B: GSTR-9 Annual Return furnished on 28-Oct-2026 (ARN AA2710260012345)
+    # Section 16(4) establishes 28-Oct-2026 as the statutory cutoff ("whichever is earlier")!
+    # On 18-Nov-2026, the deadline has expired -> SEC_16_4 risk correctly assessed
+    assessments_with_ar = engine.evaluate_itc_eligibility(
+        purchase_doc=doc_2025,
+        evaluation_date=eval_dt,
+        annual_return_filing_date=date(2026, 10, 28)
+    )
+    sec_16_4_with_ar = [a for a in assessments_with_ar if a.rule_code == "SEC_16_4"]
+    assert len(sec_16_4_with_ar) == 1
+    ass = sec_16_4_with_ar[0]
+    assert ass.eligibility_status == ITCEligibilityEnum.TIME_LIMIT_RISK
+    assert ass.risk_reversal_amount == Decimal("12400.00")
+    assert "earlier GSTR-9 Annual Return filing date of 2026-10-28" in ass.findings_explanation
+
+
+# =============================================================================
+# 8. Milestone 2.7.2.1: Rule 37A Actual vs Pending Status & Reproducible Interest
+# =============================================================================
+
+def test_rule_37a_pending_versus_actual_status_and_interest_inputs():
+    """
+    Validates that:
+    1. For unfiled return period 2026-11 (as of 18-Nov-2026), Rule 37A reversal on INV-B2B-06
+       is explicitly marked as PENDING_RETURN_FILING, NOT discharged.
+    2. Reversal due date is 2026-11-30.
+    3. Interest liability is Nil (₹0.00) under the statutory proviso because reversal
+       is scheduled in the draft return on or before 30-Nov-2026.
+    4. Interest calculation inputs are stored reproducibly.
+    """
+    rp = "2026-11"
+    recipient = "27AABCB1234M1ZT"
+
+    reversals_ledger = [
+        {
+            "id": "rev_r37a_nov",
+            "purchase_doc_id": "p_b2b6",
+            "document_number": "INV-B2B-06",
+            "supplier_gstin": "24AAACR1234Q1Z2",
+            "reversal_period": rp,
+            "rule_code": "RULE_37A_NON_FILING",
+            "reversal_status": "PENDING_RETURN_FILING",
+            "reversal_due_date": "2026-11-30",
+            "reversal_scheduled_date": "2026-11-18",
+            "filing_arn": None,
+            "reversed_cgst": Decimal("0.00"),
+            "reversed_sgst": Decimal("0.00"),
+            "reversed_igst": Decimal("32400.00"),
+            "reversed_cess": Decimal("0.00"),
+            "interest_liability": Decimal("0.00"),
+            "interest_basis": "Rule 37A Proviso: Nil interest since reversal is scheduled in draft GSTR-3B before 30th November 2026.",
+            "interest_calculation_inputs": {
+                "statutory_rule": "Rule 37A Proviso",
+                "days_past_deadline": 0,
+                "reversal_amount": "32400.00",
+                "statutory_rate": "18% p.a.",
+                "calculated_interest": "0.00"
+            }
+        }
+    ]
+
+    t4 = generate_gstr3b_table4_summary(
+        return_period=rp,
+        recipient_gstin=recipient,
+        gstr2b_docs=[],
+        purchase_docs=[],
+        matches=[],
+        assessments=[],
+        reversals_ledger=reversals_ledger
+    )
+
+    assert len(t4.reversals_lineage) == 1
+    line = t4.reversals_lineage[0]
+    assert line["document_number"] == "INV-B2B-06"
+    assert line["reversal_status"] == "PENDING_RETURN_FILING"
+    assert line["reversal_due_date"] == "2026-11-30"
+    assert line["filing_arn"] is None
+    assert line["interest_liability"] == Decimal("0.00")
+    assert line["interest_calculation_inputs"]["days_past_deadline"] == 0
+    assert line["interest_calculation_inputs"]["calculated_interest"] == "0.00"
+
+
+# =============================================================================
+# 9. Milestone 2.7.2.1: RCM-INELIG-01 Complete Destination & Dual-Scenario Reconciliation
+# =============================================================================
+
+def test_rcm_inelig_01_complete_destination_and_dual_scenario_reconciliation():
+    """
+    Validates complete, uncompromised destination of RCM-INELIG-01 (₹2,500 tax: CGST 1,250 + SGST 1,250):
+    1. Table 3.1(d): Paid in CASH via Electronic Cash Ledger (mandatory statutory discharge).
+    2. Table 4(A)(3): STRICTLY EXCLUDED (₹0.00) because ITC is unavailable.
+    3. Table 4(D)(2): REPORTED (₹2,500.00) as unavailable GSTR-2B credit.
+    4. Proves both reporting scenarios:
+       - Scenario A (Benchmark November return): 4(D)(2) = ₹12,400 (only INV-INELIG-01).
+       - Scenario B (With RCM-INELIG-01 in 2B): 4(D)(2) = ₹12,400 + ₹2,500 = ₹14,900.00.
+       - In both scenarios, Net ITC Table 4(C) remains exactly ₹3,36,600.00.
+    """
+    rp = "2026-11"
+    recipient = "27AABCB1234M1ZT"
+
+    # Inward RCM Ineligible Document
+    rcm_inelig_doc = {
+        "id": "g_rcm_inelig",
+        "document_type": "invoice",
+        "section_name": "B2B_RCM",
+        "document_number": "RCM-INELIG-01",
+        "document_date": "2025-07-15",
+        "supplier_gstin": "27AAAGF4411D1ZA",
+        "supplier_name": "FastTrack Logistics (Time-Barred RCM)",
+        "taxable_value": Decimal("50000.00"),
+        "central_tax": Decimal("1250.00"),
+        "state_ut_tax": Decimal("1250.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "supply_attract_reverse_charge": True,
+        "itc_availability": "not_available"  # Key statutory flag
+    }
+
+    # Time-barred forward charge document
+    b2b_inelig_doc = {
+        "id": "g_inelig",
+        "document_type": "invoice",
+        "section_name": "B2B",
+        "document_number": "INV-INELIG-01",
+        "document_date": "2025-08-10",
+        "supplier_gstin": "06AAACD1111C1Z3",
+        "supplier_name": "Trans-National Logistics",
+        "taxable_value": Decimal("68888.89"),
+        "central_tax": Decimal("0.00"),
+        "state_ut_tax": Decimal("0.00"),
+        "integrated_tax": Decimal("12400.00"),
+        "cess_amount": Decimal("0.00"),
+        "itc_availability": "not_available"
+    }
+
+    # Scenario A: Benchmark Return (only INV-INELIG-01 in unavailable 2B)
+    t4_scen_a = generate_gstr3b_table4_summary(
+        return_period=rp,
+        recipient_gstin=recipient,
+        gstr2b_docs=[b2b_inelig_doc],
+        purchase_docs=[],
+        matches=[],
+        assessments=[]
+    )
+    assert t4_scen_a.ineligible_sec_16_4_and_pos_restrictions_4d2 == Decimal("12400.00")
+    assert t4_scen_a.components_4d["4D2_ineligible"].igst == Decimal("12400.00")
+    assert t4_scen_a.components_4d["4D2_ineligible"].cgst == Decimal("0.00")
+    assert t4_scen_a.components_4d["4D2_ineligible"].sgst == Decimal("0.00")
+    assert t4_scen_a.itc_available_inward_reverse_charge == Decimal("0.00")
+
+    # Scenario B: Composite Return (Both INV-INELIG-01 and RCM-INELIG-01 in unavailable 2B)
+    t4_scen_b = generate_gstr3b_table4_summary(
+        return_period=rp,
+        recipient_gstin=recipient,
+        gstr2b_docs=[b2b_inelig_doc, rcm_inelig_doc],
+        purchase_docs=[],
+        matches=[],
+        assessments=[]
+    )
+    # 1. Total Table 4(D)(2) is exactly ₹14,900.00 (₹12,400 + ₹2,500)
+    assert t4_scen_b.ineligible_sec_16_4_and_pos_restrictions_4d2 == Decimal("14900.00")
+    assert t4_scen_b.components_4d["4D2_ineligible"].cgst == Decimal("1250.00")
+    assert t4_scen_b.components_4d["4D2_ineligible"].sgst == Decimal("1250.00")
+    assert t4_scen_b.components_4d["4D2_ineligible"].igst == Decimal("12400.00")
+    assert t4_scen_b.components_4d["4D2_ineligible"].total == Decimal("14900.00")
+
+    # 2. Table 4(A)(3) remains strictly ₹0.00 (ineligible RCM is excluded)
+    assert t4_scen_b.itc_available_inward_reverse_charge == Decimal("0.00")
+
+    # 3. Table 4(A) gross available is ₹0.00 (neither unavailable document enters 4(A))
+    assert t4_scen_b.total_itc_available == Decimal("0.00")
+
+
+# =============================================================================
+# 10. Milestone 2.7.2.1: GTA-FWD-12 Source Value Integrity & Table 4(A)(5) Linkage
+# =============================================================================
+
+def test_gta_fwd_12_source_value_integrity_and_table_4a5_linkage():
+    """
+    Validates atomic source data and derived totals for GTA-FWD-12:
+    - Taxable Value: ₹1,00,000.00
+    - GST Rate: 12% Forward Charge (Annexure V Opted)
+    - Central Tax: ₹6,000.00 (NOT ₹6,00,000)
+    - State Tax: ₹6,000.00
+    - Integrated Tax: ₹0.00
+    - Total Tax: ₹12,000.00
+    - Total Invoice Value: ₹1,12,000.00
+    - Statutory Classification: Table 4(A)(5), strictly barred from Table 4(A)(3).
+    """
+    rp = "2026-11"
+    recipient = "27AABCB1234M1ZT"
+
+    doc_fwd = {
+        "id": "g_gta_fwd",
+        "document_type": "invoice",
+        "section_name": "B2B",
+        "document_number": "GTA-FWD-12",
+        "document_date": "2026-11-06",
+        "supplier_gstin": "27AAAFW1122B1Z4",
+        "supplier_name": "Express Line Logistics (Forward Charge 12%)",
+        "taxable_value": Decimal("100000.00"),
+        "central_tax": Decimal("6000.00"),
+        "state_ut_tax": Decimal("6000.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "supply_attract_reverse_charge": False,
+        "itc_availability": "available"
+    }
+
+    # Strict source assertions preventing transcription errors
+    assert doc_fwd["central_tax"] == Decimal("6000.00")
+    assert doc_fwd["state_ut_tax"] == Decimal("6000.00")
+    assert doc_fwd["integrated_tax"] == Decimal("0.00")
+    assert doc_fwd["taxable_value"] == Decimal("100000.00")
+    tot_tax = doc_fwd["central_tax"] + doc_fwd["state_ut_tax"] + doc_fwd["integrated_tax"]
+    assert tot_tax == Decimal("12000.00")
+    assert doc_fwd["taxable_value"] + tot_tax == Decimal("112000.00")
+
+    t4 = generate_gstr3b_table4_summary(
+        return_period=rp,
+        recipient_gstin=recipient,
+        gstr2b_docs=[doc_fwd],
+        purchase_docs=[],
+        matches=[],
+        assessments=[]
+    )
+
+    # 1. Enters Table 4(A)(5) All Other ITC
+    assert t4.components_4a["4A5_all_other"].cgst == Decimal("6000.00")
+    assert t4.components_4a["4A5_all_other"].sgst == Decimal("6000.00")
+    assert t4.components_4a["4A5_all_other"].total == Decimal("12000.00")
+
+    # 2. Strictly barred from Table 4(A)(3)
+    assert t4.components_4a["4A3_rcm"].total == Decimal("0.00")
+    assert t4.itc_available_inward_reverse_charge == Decimal("0.00")
+

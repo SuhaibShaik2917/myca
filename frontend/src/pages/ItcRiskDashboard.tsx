@@ -513,7 +513,10 @@ export const ItcRiskDashboard: React.FC = () => {
           ruleCode: "RULE_37A_NON_FILING",
           priorPeriod: "2026-02",
           isAvailedIn3B: true,
-          interestBasis: "Reversed on or before 30-Nov-2026 -> Nil interest under Rule 37A proviso."
+          reversalStatus: "PENDING_RETURN_FILING",
+          reversalDueDate: "2026-11-30",
+          filingArn: null,
+          interestBasis: "Rule 37A Proviso: Reversal scheduled in draft GSTR-3B on 18-Nov-2026, before statutory cut-off 30-Nov-2026 -> Nil interest. Status is PENDING_RETURN_FILING; transitions to DISCHARGED upon return filing."
         },
         {
           docNo: "SUP-2B-998",
@@ -570,6 +573,9 @@ export const ItcRiskDashboard: React.FC = () => {
           cess: "0.00",
           total: "12,400.00",
           ruleCode: "SEC_16_4_TIME_BARRED",
+          statutoryDeadlineEvidence: "Section 16(4) earlier cutoff: Recipient furnished GSTR-9 for FY 2025-26 on 28-Oct-2026 (ARN AA2710260012345), establishing 28-Oct-2026 as statutory cutoff ('whichever is earlier'). Communication on portal in Nov 2026 is time-barred and reported in 4(D)(2).",
+          annualReturnFilingDate: "2026-10-28",
+          annualReturnArn: "AA2710260012345",
           isAvailedIn3B: false
         }
       ]

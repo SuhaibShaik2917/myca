@@ -210,7 +210,8 @@ class StatutoryITCRiskEngine:
         evaluation_date: Optional[date] = None,
         ecl_minimum_balance: Optional[Decimal] = None,
         utilisation_date: Optional[date] = None,
-        reversal_date: Optional[date] = None
+        reversal_date: Optional[date] = None,
+        annual_return_filing_date: Optional[date] = None
     ) -> List[ITCAssessmentOut]:
         eval_dt = evaluation_date or date.today()
         assessments: List[ITCAssessmentOut] = []
@@ -278,13 +279,22 @@ class StatutoryITCRiskEngine:
             ))
 
         # -------------------------------------------------------------
-        # 3. Section 16(4): Statutory Time Limit (30th November following FY)
+        # 3. Section 16(4): Statutory Time Limit (30th November following FY or Annual Return, whichever is earlier)
         # -------------------------------------------------------------
         inv_year = p_date.year
         inv_month = p_date.month
         # FY end is March 31 of current/next year
         fy_end_year = inv_year if inv_month <= 3 else inv_year + 1
-        cutoff_date = date(fy_end_year, 11, 30)
+        statutory_nov30 = date(fy_end_year, 11, 30)
+
+        # Section 16(4) applies "whichever is earlier"
+        if annual_return_filing_date and annual_return_filing_date < statutory_nov30:
+            cutoff_date = annual_return_filing_date
+            deadline_source = f"earlier GSTR-9 Annual Return filing date of {annual_return_filing_date} (whichever is earlier per Section 16(4))"
+        else:
+            cutoff_date = statutory_nov30
+            deadline_source = f"30th November {fy_end_year}"
+
         if eval_dt > cutoff_date:
             assessments.append(ITCAssessmentOut(
                 purchase_doc_id=p_id,
@@ -294,7 +304,7 @@ class StatutoryITCRiskEngine:
                 eligibility_status=ITCEligibilityEnum.TIME_LIMIT_RISK,
                 potential_itc=total_tax,
                 risk_reversal_amount=total_tax,
-                findings_explanation=f"Invoice date {p_date} exceeds Section 16(4) statutory time limit of 30th November {fy_end_year}.",
+                findings_explanation=f"Invoice date {p_date} exceeds Section 16(4) statutory time limit of {deadline_source}.",
                 missing_evidence_required="Check whether special statutory extension or Section 16(5)/16(6) retrospective relief applies.",
                 evaluation_date=str(eval_dt)
             ))
