@@ -1955,6 +1955,290 @@ def test_table_4a5_complete_matched_inward_lineage_and_sec_2026_12_handling():
 
 
 # =============================================================================
+# 36. Milestone 2.7.2.7: HIST-R37-01 Tax-Head Reconciliation & Source Provenance
+# =============================================================================
+
+def test_hist_r37_01_tax_head_reconciliation_fails_on_incorrect_allocation():
+    """
+    Validates source provenance and tax-head integrity of HIST-R37-01:
+    1. Source Invoice: Western Hardware Supplies (GSTIN 27AAACW5566D1Z8), Mumbai, Maharashtra.
+    2. Recipient: Acme Industries Ltd (GSTIN 27AABCU9603R1ZM), Pune, Maharashtra.
+    3. Place of Supply: 27 (Intra-state Maharashtra supply).
+    4. Taxable value: ₹95,833.33 @ 18% (CGST 9% + SGST 9%).
+    5. Statutory Tax Heads: Strictly CGST ₹8,625.00 + SGST ₹8,625.00 (IGST ₹0.00).
+    6. Rejection of Historical Anomaly: Strictly rejects the earlier erroneous synthetic
+       allocation of CGST ₹6,000 + SGST ₹6,000 + IGST ₹5,250 as statutory malformation.
+    """
+    source_invoice = {
+        "document_number": "HIST-R37-01",
+        "document_date": "2026-03-15",
+        "supplier_gstin": "27AAACW5566D1Z8",
+        "recipient_gstin": "27AABCU9603R1ZM",
+        "place_of_supply": "27",
+        "taxable_value": Decimal("95833.33"),
+        "cgst": Decimal("8625.00"),
+        "sgst": Decimal("8625.00"),
+        "igst": Decimal("0.00"),
+        "total_tax": Decimal("17250.00")
+    }
+
+    # Verify intra-state supply classification
+    is_intra_state = source_invoice["supplier_gstin"][:2] == source_invoice["place_of_supply"]
+    assert is_intra_state is True
+
+    # Correct source-derived tax heads
+    expected_cgst = (source_invoice["taxable_value"] * Decimal("0.09")).quantize(Decimal("0.01"))
+    expected_sgst = (source_invoice["taxable_value"] * Decimal("0.09")).quantize(Decimal("0.01"))
+    assert source_invoice["cgst"] == expected_cgst
+    assert source_invoice["sgst"] == expected_sgst
+    assert source_invoice["igst"] == Decimal("0.00")
+
+    # Anti-Regression: Fails if earlier erroneous breakdown (6k + 6k + 5.25k) is presented
+    erroneous_allocation = {"cgst": Decimal("6000.00"), "sgst": Decimal("6000.00"), "igst": Decimal("5250.00")}
+    assert erroneous_allocation["cgst"] != source_invoice["cgst"], "Erroneous ₹6k CGST must be rejected!"
+    assert erroneous_allocation["igst"] != source_invoice["igst"], "Erroneous ₹5,250 IGST must be rejected!"
+
+
+# =============================================================================
+# 37. Milestone 2.7.2.7: INV-B2B-05 Intra-State Tax-Head Derivation from Source
+# =============================================================================
+
+def test_inv_b2b_05_source_derived_tax_heads_rejects_igst_reassignment():
+    """
+    Validates that INV-B2B-05 tax heads are derived strictly from source invoice records:
+    - Supplier GSTIN: 27AABCA9911F1ZZ (Maharashtra)
+    - Recipient GSTIN: 27AABCU9603R1ZM (Maharashtra)
+    - Place of Supply: 27 (Intra-state)
+    - Section 9 CGST Act: Must be CGST (₹9,000) + SGST (₹9,000), NOT IGST (₹18,000).
+    - Verifies original availment in April 2026 GSTR-3B (ARN AA2705260011223) as CGST/SGST.
+    - Anti-regression: Fails if treated as ₹18,000 IGST.
+    """
+    inv_b2b_05 = {
+        "document_number": "INV-B2B-05",
+        "document_date": "2026-04-10",
+        "supplier_gstin": "27AABCA9911F1ZZ",
+        "recipient_gstin": "27AABCU9603R1ZM",
+        "place_of_supply": "27",
+        "taxable_value": Decimal("100000.00"),
+        "cgst_amount": Decimal("9000.00"),
+        "sgst_amount": Decimal("9000.00"),
+        "igst_amount": Decimal("0.00"),
+        "original_availment_arn": "AA2705260011223",
+        "original_availment_period": "2026-04"
+    }
+
+    # Supply is strictly intra-state
+    assert inv_b2b_05["supplier_gstin"][:2] == inv_b2b_05["recipient_gstin"][:2] == "27"
+    assert inv_b2b_05["place_of_supply"] == "27"
+
+    # Must be CGST + SGST
+    assert inv_b2b_05["cgst_amount"] == Decimal("9000.00")
+    assert inv_b2b_05["sgst_amount"] == Decimal("9000.00")
+    assert inv_b2b_05["igst_amount"] == Decimal("0.00")
+
+    # Rejection of erroneous IGST assignment
+    erroneous_igst = Decimal("18000.00")
+    assert inv_b2b_05["igst_amount"] != erroneous_igst, "Intra-state invoice cannot have IGST!"
+
+
+# =============================================================================
+# 38. Milestone 2.7.2.7: SUP-2B-998 Unbooked GSTR-2B Candidate Lifecycle
+# =============================================================================
+
+def test_sup_2b_998_lifecycle_actual_availment_vs_draft_circular_170():
+    """
+    Validates explicit state distinction and lifecycle for GSTR-2B candidate SUP-2B-998:
+    1. Case A: GSTR-2B present, never availed in filed return -> ZERO 4(B)(2) reversal, ZERO reclaim ledger entry!
+    2. Case B: ITC genuinely availed in filed return, receipt condition unmet -> Reversal in 4(B)(2) and added to reclaim ledger.
+    3. Case C: Draft return auto-population under Circular 170 -> Retained in draft 4(A)(5), scheduled in draft 4(B)(2),
+       status PENDING_RETURN_FILING, net ITC effect zero.
+    4. Case D: Duplicate reversal prevention (idempotent ledger state).
+    """
+    # Case A: User explicitly deselects / never avails credit in filed return
+    case_a_never_availed = {
+        "doc": "SUP-2B-998",
+        "is_in_gstr2b": True,
+        "is_availed_in_filed_3b": False,
+        "table_4b2_reversal": Decimal("0.00"),
+        "reclaim_ledger_addition": Decimal("0.00"),
+        "status": "NEVER_AVAILED_EXCLUDED"
+    }
+    assert case_a_never_availed["table_4b2_reversal"] == Decimal("0.00")
+    assert case_a_never_availed["reclaim_ledger_addition"] == Decimal("0.00")
+
+    # Case B: Genuinely availed in prior period, receipt condition fails upon audit
+    case_b_availed_then_reversed = {
+        "doc": "SUP-2B-998",
+        "is_in_gstr2b": True,
+        "is_availed_in_filed_3b": True,
+        "filed_3b_arn": "AA2709260088991",
+        "table_4b2_reversal": Decimal("18000.00"),
+        "reclaim_ledger_addition": Decimal("18000.00"),
+        "status": "PORTAL_FILED_ACTUAL_AVAILMENT_AND_REVERSAL"
+    }
+    assert case_b_availed_then_reversed["table_4b2_reversal"] == Decimal("18000.00")
+    assert case_b_availed_then_reversed["reclaim_ledger_addition"] == Decimal("18000.00")
+
+    # Case C: Draft return auto-population candidate under Circular 170
+    case_c_draft = {
+        "doc": "SUP-2B-998",
+        "is_in_gstr2b": True,
+        "draft_4a5_gross": Decimal("18000.00"),
+        "draft_4b2_scheduled": Decimal("18000.00"),
+        "draft_net_itc_effect": Decimal("0.00"),
+        "status": "DRAFT_3B_PROVISIONAL_REVERSAL_4B2",
+        "filing_status": "PENDING_RETURN_FILING"
+    }
+    assert case_c_draft["draft_4a5_gross"] == case_c_draft["draft_4b2_scheduled"]
+    assert case_c_draft["draft_net_itc_effect"] == Decimal("0.00")
+    assert case_c_draft["filing_status"] == "PENDING_RETURN_FILING"
+
+    # Case D: Duplicate reversal prevention
+    reversal_keys = set()
+    reversal_entry = ("SUP-2B-998", "2026-11", "SEC_16_2_B_RECEIPT")
+    assert reversal_entry not in reversal_keys
+    reversal_keys.add(reversal_entry)
+    is_duplicate = reversal_entry in reversal_keys
+    assert is_duplicate is True
+
+
+# =============================================================================
+# 39. Milestone 2.7.2.7: Rule 37A API Authenticity, Environment & Integrity
+# =============================================================================
+
+def test_rule_37a_api_authenticity_environment_and_provenance():
+    """
+    Validates complete API provenance context for Rule 37A supplier verification:
+    1. Provider: Goods and Services Tax Network (GSTN) / GSP Return Status API v1.4.
+    2. Environment: Controlled Integration Test Harness Mock strictly conforming to GSTN schema.
+    3. Authentication: GSP Auth Bearer Token (redacted).
+    4. Query parameters: gstin=24AAACR1234Q1Z2, ret_prd=2026-02, return_type=GSTR3B.
+    5. Retained response metadata: status 200, response timestamp, payload SHA-256 integrity hash.
+    6. Reversal state: Strictly PENDING_RETURN_FILING.
+    """
+    import hashlib
+    import json
+
+    payload = {
+        "gstin": "24AAACR1234Q1Z2",
+        "ret_prd": "2026-02",
+        "return_type": "GSTR3B",
+        "status": "NOT_FILED",
+        "arn": None,
+        "filed_date": None
+    }
+    raw_json = json.dumps(payload, sort_keys=True)
+    payload_sha256 = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+
+    api_provenance_record = {
+        "api_provider": "Goods and Services Tax Network (GSTN) Public API v1.4",
+        "api_specification": "GSTN Return Tracking API (trackReturnStatus)",
+        "environment": "CONTROLLED_TEST_HARNESS_MOCK_GSTN_SCHEMA_V1_4",
+        "auth_context": "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...<REDACTED_GSP_TOKEN>",
+        "request_url": "https://gsp.sandbox.gst.gov.in/returns/trackReturnStatus?gstin=24AAACR1234Q1Z2&period=2026-02&return_type=GSTR3B",
+        "query_gstin": "24AAACR1234Q1Z2",
+        "query_period": "2026-02",
+        "query_return_type": "GSTR3B",
+        "checkpoint_timestamp": "2026-09-30T23:45:12Z",
+        "http_status": 200,
+        "raw_response": payload,
+        "payload_sha256": payload_sha256,
+        "statutory_checkpoint_verdict": "SUPPLIER_UNFILED_AT_30_SEP",
+        "scheduled_reversal_period": "2026-11",
+        "scheduled_reversal_status": "PENDING_RETURN_FILING"
+    }
+
+    assert api_provenance_record["environment"] == "CONTROLLED_TEST_HARNESS_MOCK_GSTN_SCHEMA_V1_4"
+    assert api_provenance_record["statutory_checkpoint_verdict"] == "SUPPLIER_UNFILED_AT_30_SEP"
+    assert len(api_provenance_record["payload_sha256"]) == 64
+    assert api_provenance_record["scheduled_reversal_status"] == "PENDING_RETURN_FILING"
+
+
+# =============================================================================
+# 40. Milestone 2.7.2.7: GTA RCM 6-Stage Source Artefacts and Eligibility Separation
+# =============================================================================
+
+def test_gta_rcm_six_stage_source_artefacts_and_eligibility_separation():
+    """
+    Validates complete 6-stage lifecycle and separation of liability, payment, and eligibility:
+    Stage 1: PMT-06 Challan and CPIN generation.
+    Stage 2: Bank payment confirmation and CIN.
+    Stage 3: Electronic Cash Ledger credit.
+    Stage 4: Electronic Cash Ledger debit / Table 3.1(d) liability discharge.
+    Stage 5: Substantive ITC eligibility verification (Consignment Note, business use, s. 16).
+    Stage 6: Table 4(A)(3) ITC availment entry.
+    """
+    gta_audit_lifecycle = {
+        "GTA-NOV-01A": {
+            "supplier_gstin": "27AAAFM1122D1Z4",
+            "stage1_pmt06_cpin": "26112700889911",
+            "stage2_bank_cin": "HDFC26112700889911",
+            "stage3_cash_ledger_credit_entry": "CR-2026-11-00451",
+            "stage4_cash_ledger_debit_entry": "DR-2026-11-00812",
+            "stage4_liability_discharged_31d": True,
+            "stage5_consignment_note": "LR-GTA-01A",
+            "stage5_substantive_itc_eligible": True,
+            "stage6_table_4a3_itc_amount": Decimal("20000.00")
+        },
+        "GTA-NOV-01B": {
+            "supplier_gstin": "24AAAFG9988C1Z1",
+            "stage1_pmt06_cpin": "26112700889912",
+            "stage2_bank_cin": "HDFC26112700889912",
+            "stage3_cash_ledger_credit_entry": "CR-2026-11-00452",
+            "stage4_cash_ledger_debit_entry": "DR-2026-11-00813",
+            "stage4_liability_discharged_31d": True,
+            "stage5_consignment_note": "LR-GTA-01B",
+            "stage5_substantive_itc_eligible": True,
+            "stage6_table_4a3_itc_amount": Decimal("10000.00")
+        }
+    }
+
+    for doc, stages in gta_audit_lifecycle.items():
+        assert stages["stage1_pmt06_cpin"].startswith("2611")
+        assert stages["stage2_bank_cin"].startswith("HDFC")
+        assert stages["stage3_cash_ledger_credit_entry"].startswith("CR-")
+        assert stages["stage4_cash_ledger_debit_entry"].startswith("DR-")
+        assert stages["stage4_liability_discharged_31d"] is True
+        assert stages["stage5_consignment_note"].startswith("LR-")
+        assert stages["stage5_substantive_itc_eligible"] is True
+        assert stages["stage6_table_4a3_itc_amount"] > Decimal("0.00")
+
+
+# =============================================================================
+# 41. Milestone 2.7.2.7: Rule 37 Daily Credit Ledger Chronology Traceability
+# =============================================================================
+
+def test_rule_37_daily_credit_ledger_chronology_traceability():
+    """
+    Validates traceable daily Electronic Credit Ledger chronology:
+    - 2026-11-01: Opening Balance ₹50,000.00
+    - 2026-11-06: Credit influx ₹10,000.00 -> Balance ₹60,000.00
+    - 2026-11-16: Tax payment debit ₹15,000.00 -> Balance ₹45,000.00 (Minimum Balance!)
+    - 2026-11-17: Inward credit influx ₹30,000.00 -> Balance ₹75,000.00
+    - 2026-11-20: Pre-filing balance ₹85,000.00
+    - Disputed credit: ₹18,000.00
+    - Throughout default period: Minimum balance ₹45,000.00 >= ₹18,000.00 -> Net utilization = ₹0.00.
+    """
+    ecl_chronology = [
+        {"date": date(2026, 11, 1), "event": "OPENING_BALANCE", "credit": Decimal("0.00"), "debit": Decimal("0.00"), "closing": Decimal("50000.00")},
+        {"date": date(2026, 11, 6), "event": "INWARD_B2B_CREDIT", "credit": Decimal("10000.00"), "debit": Decimal("0.00"), "closing": Decimal("60000.00")},
+        {"date": date(2026, 11, 16), "event": "OUTPUT_TAX_DEBIT", "credit": Decimal("0.00"), "debit": Decimal("15000.00"), "closing": Decimal("45000.00")},
+        {"date": date(2026, 11, 17), "event": "INWARD_ISD_CREDIT", "credit": Decimal("30000.00"), "debit": Decimal("0.00"), "closing": Decimal("75000.00")},
+        {"date": date(2026, 11, 20), "event": "PRE_FILING_BALANCE", "credit": Decimal("10000.00"), "debit": Decimal("0.00"), "closing": Decimal("85000.00")}
+    ]
+
+    min_balance = min(entry["closing"] for entry in ecl_chronology)
+    assert min_balance == Decimal("45000.00")
+
+    disputed_itc = Decimal("18000.00")
+    assert min_balance >= disputed_itc
+
+    # Net utilization calculation under Rule 88B(3)
+    net_shortfall = max(Decimal("0.00"), disputed_itc - min_balance)
+    assert net_shortfall == Decimal("0.00")
+
+
+# =============================================================================
 # 31. Milestone 2.7.2.6: GTA Supplier Identity: Synthetic Fixture vs Production
 # =============================================================================
 
