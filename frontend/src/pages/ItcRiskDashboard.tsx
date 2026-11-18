@@ -314,20 +314,34 @@ export const ItcRiskDashboard: React.FC = () => {
     },
     "4A3": {
       sectionCode: "Table 4(A)(3)",
-      title: "Inward Supplies Attracting Reverse Charge (RCM)",
+      title: "Inward Supplies Liable to Reverse Charge (Eligible RCM — Discharged in Cash via Table 3.1(d))",
       items: [
         {
-          docNo: "GTA-NOV-01",
+          docNo: "GTA-NOV-01A",
           docDate: "2026-11-05",
           supplierGstin: "27AAGFG4411D1ZA",
-          supplierName: "FastTrack Logistics (Goods Transport)",
-          taxable: "1,11,111.11",
+          supplierName: "FastTrack Logistics (Intra-State GTA Consignment)",
+          taxable: "4,00,000.00",
           cgst: "10,000.00",
           sgst: "10,000.00",
+          igst: "0.00",
+          cess: "0.00",
+          total: "20,000.00",
+          ruleCode: "SEC_9_3_RCM_GTA (Intra-State 5% RCM, Discharged in Cash via Table 3.1(d))",
+          isAvailedIn3B: true
+        },
+        {
+          docNo: "GTA-NOV-01B",
+          docDate: "2026-11-05",
+          supplierGstin: "24AAAGF9988C1Z1",
+          supplierName: "FastTrack Logistics Gujarat (Inter-State GTA Consignment)",
+          taxable: "2,00,000.00",
+          cgst: "0.00",
+          sgst: "0.00",
           igst: "10,000.00",
           cess: "0.00",
-          total: "30,000.00",
-          ruleCode: "SEC_9_3_RCM_GTA",
+          total: "10,000.00",
+          ruleCode: "SEC_9_3_RCM_GTA (Inter-State 5% RCM, Discharged in Cash via Table 3.1(d))",
           isAvailedIn3B: true
         }
       ]
@@ -439,12 +453,12 @@ export const ItcRiskDashboard: React.FC = () => {
           supplierGstin: "27AAACM4433E1Z2",
           supplierName: "Sai Motors Dealership",
           taxable: "3,61,111.11",
-          cgst: "0.00",
-          sgst: "0.00",
-          igst: "65,000.00",
+          cgst: "32,500.00",
+          sgst: "32,500.00",
+          igst: "0.00",
           cess: "0.00",
           total: "65,000.00",
-          ruleCode: "SEC_17_5_MOTOR",
+          ruleCode: "SEC_17_5_MOTOR (Intra-State Ineligible Passenger Motor Vehicle)",
           isAvailedIn3B: true
         },
         {
@@ -458,7 +472,7 @@ export const ItcRiskDashboard: React.FC = () => {
           igst: "0.00",
           cess: "0.00",
           total: "12,500.00",
-          ruleCode: "SEC_17_5_FOOD",
+          ruleCode: "SEC_17_5_FOOD (Intra-State Ineligible Food & Catering Services)",
           isAvailedIn3B: true
         }
       ]
@@ -963,7 +977,7 @@ export const ItcRiskDashboard: React.FC = () => {
                 onClick={() => setDrillDownModal(provenanceMap["4A3"])}
                 className="hover:bg-slate-50 cursor-pointer transition-colors"
               >
-                <td className="px-4 py-2 pl-8 font-sans text-slate-700">(3) Inward Supplies Attracting Reverse Charge (RCM)</td>
+                <td className="px-4 py-2 pl-8 font-sans text-slate-700">(3) Inward Supplies Liable to Reverse Charge (Eligible RCM — Discharged in Cash via Table 3.1(d))</td>
                 <td className="px-4 py-2 text-right">10,000.00</td>
                 <td className="px-4 py-2 text-right">10,000.00</td>
                 <td className="px-4 py-2 text-right">10,000.00</td>

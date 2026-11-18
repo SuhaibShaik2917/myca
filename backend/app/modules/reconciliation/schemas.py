@@ -680,6 +680,11 @@ class UnifiedFinancialReportOut(BaseModel):
     exceptions_by_category: Dict[str, int]
     tax_head_summary: Dict[str, Dict[str, Decimal]]
     supplier_wise_itc: List[Dict[str, Any]] = []
+    calculated_net_itc_label: Optional[str] = "calculated net ITC in this scenario, subject to all applicable statutory conditions and human review"
+    table_3_1_d_rcm_reconciliation: Optional[Dict[str, Any]] = None
+    reversals_lineage: Optional[List[Dict[str, Any]]] = []
+    unbooked_gstr2b_documents: Optional[List[Dict[str, Any]]] = []
+    itc_accounting_states: Optional[Dict[str, Any]] = None
 
 
 
