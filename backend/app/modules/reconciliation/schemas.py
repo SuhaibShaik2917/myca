@@ -448,12 +448,18 @@ class Rule37InterestCalculationRequest(BaseModel):
     utilisation_date: Optional[str] = None  # YYYY-MM-DD
     reversal_date: Optional[str] = None     # YYYY-MM-DD
     interest_rate_pct: Decimal = Decimal("18.00")
+    tax_head: Optional[str] = "TOTAL"       # 'IGST', 'CGST', 'SGST', 'CESS', 'TOTAL'
+    ecl_head_balances: Optional[Dict[str, Decimal]] = None
+    ecl_transactions: Optional[List[Dict[str, Any]]] = None
 
 
 class Rule37InterestCalculationResponse(BaseModel):
     purchase_doc_id: str
     reversal_amount: Decimal
     ecl_minimum_balance: Optional[Decimal] = None
+    relevant_ecl_balance: Optional[Decimal] = None
+    tax_head: str = "TOTAL"
+    cess_excluded: bool = True
     utilised_amount: Decimal = Decimal("0.00")
     utilisation_date: Optional[str] = None
     reversal_date: Optional[str] = None
@@ -463,5 +469,6 @@ class Rule37InterestCalculationResponse(BaseModel):
     is_utilised: bool = False
     statutory_basis: str
     explanation: str
+    source_ecl_transactions: Optional[List[Dict[str, Any]]] = None
 
 

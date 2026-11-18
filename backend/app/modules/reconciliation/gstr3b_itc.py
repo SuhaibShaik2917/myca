@@ -92,14 +92,36 @@ def generate_gstr3b_table4_summary(
 
         if itc_status == "available":
             subtotal_portal_avail += tax
-            if sec in ("IMPG", "IMPGA", "IMPGSEZ", "IMPGSEZA"):
+            doc_type = (doc.get("document_type") or "").lower()
+            supply_cat = (doc.get("supply_category") or "").lower()
+
+            # Explicit source-based statutory classification per GST Portal & CBIC Circular 170:
+            # 1. Table 4(A)(1): Import of Goods (via ICEGATE Bill of Entry or SEZ inward goods)
+            if (sec in ("IMPG", "IMPGA", "IMPGSEZ", "IMPGSEZA") or
+                doc_type in ("bill_of_entry", "boe", "import_goods") or
+                supply_cat in ("import_goods", "boe")):
                 comp_4a1 = _add_component(comp_4a1, c, s, i, cs)
-            elif sec in ("IMPS", "IMPSA") or sec == "IMPORT_SERVICES":
+
+            # 2. Table 4(A)(2): Import of Services (foreign service procurement under RCM)
+            elif (sec in ("IMPS", "IMPSA", "IMPORT_SERVICES") or
+                  doc_type in ("import_service", "import_services") or
+                  supply_cat in ("import_service", "import_services")):
                 comp_4a2 = _add_component(comp_4a2, c, s, i, cs)
-            elif doc.get("supply_attract_reverse_charge") or sec == "RCM":
+
+            # 3. Table 4(A)(3): Inward supplies liable to reverse charge (domestic RCM)
+            elif (doc.get("supply_attract_reverse_charge") or
+                  sec in ("RCM", "B2B_RCM") or
+                  supply_cat in ("reverse_charge", "rcm")):
                 comp_4a3 = _add_component(comp_4a3, c, s, i, cs)
-            elif sec in ("ISD", "ISDA"):
+
+            # 4. Table 4(A)(4): Inward supplies from ISD (GSTR-6 distribution)
+            elif (sec in ("ISD", "ISDA") or
+                  doc_type in ("isd_invoice", "isd") or
+                  supply_cat in ("isd", "isd_distribution")):
                 comp_4a4 = _add_component(comp_4a4, c, s, i, cs)
+
+            # 5. Table 4(A)(5): All other eligible ITC
+            # Note: Domestic capital goods from registered suppliers belong under 4(A)(5), NOT 4(A)(2)!
             else:
                 comp_4a5 = _add_component(comp_4a5, c, s, i, cs)
 

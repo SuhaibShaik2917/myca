@@ -1366,13 +1366,19 @@ def calculate_rule37_interest_endpoint(
         ecl_minimum_balance=payload.ecl_minimum_balance,
         utilisation_date=u_date,
         reversal_date=r_date,
-        interest_rate_pct=payload.interest_rate_pct
+        interest_rate_pct=payload.interest_rate_pct,
+        tax_head=payload.tax_head or "TOTAL",
+        ecl_head_balances=payload.ecl_head_balances,
+        ecl_transactions=payload.ecl_transactions
     )
 
     return Rule37InterestCalculationResponse(
         purchase_doc_id=payload.purchase_doc_id,
         reversal_amount=payload.reversal_amount,
-        ecl_minimum_balance=payload.ecl_minimum_balance,
+        ecl_minimum_balance=calc.get("ecl_minimum_balance"),
+        relevant_ecl_balance=calc.get("relevant_ecl_balance"),
+        tax_head=calc.get("tax_head", "TOTAL"),
+        cess_excluded=calc.get("cess_excluded", True),
         utilised_amount=calc["utilised_amount"],
         utilisation_date=str(calc["utilisation_date"]) if calc["utilisation_date"] else None,
         reversal_date=str(calc["reversal_date"]) if calc["reversal_date"] else None,
@@ -1381,7 +1387,8 @@ def calculate_rule37_interest_endpoint(
         interest_amount=calc["interest_amount"],
         is_utilised=calc["is_utilised"],
         statutory_basis=calc["statutory_basis"],
-        explanation=calc["explanation"]
+        explanation=calc["explanation"],
+        source_ecl_transactions=calc.get("source_ecl_transactions")
     )
 
 

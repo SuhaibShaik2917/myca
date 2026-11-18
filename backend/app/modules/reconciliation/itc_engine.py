@@ -12,26 +12,130 @@ def calculate_rule_37_interest(
     ecl_minimum_balance: Optional[Decimal] = None,
     utilisation_date: Optional[date] = None,
     reversal_date: Optional[date] = None,
-    interest_rate_pct: Decimal = Decimal("18.00")
+    interest_rate_pct: Decimal = Decimal("18.00"),
+    tax_head: str = "TOTAL",
+    ecl_head_balances: Optional[Dict[str, Decimal]] = None,
+    ecl_transactions: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
-    Computes statutory interest liability under Section 50(3) read with Rule 88B(3) of CGST Rules:
+    Computes statutory interest liability under Section 50(3) read with Rule 88B(3) of CGST Rules
+    and CBIC Circular No. 192/04/2023-GST:
+
     1. Interest is payable ONLY if and to the extent that the wrongly availed credit was actually utilised.
-    2. Under Rule 88B(3), credit is treated as utilised only when the balance in the Electronic Credit Ledger (ECL)
-       falls below the amount of wrongly availed credit.
-    3. If minimum ECL balance >= reversal_tax, the credit was NEVER utilised -> Utilised Amount = 0, Interest = Nil (₹0.00).
-    4. If minimum ECL balance < reversal_tax, Utilised Amount = reversal_tax - max(0, ecl_minimum_balance).
-    5. The interest period runs from the date of utilisation (the date the return was filed or debit occurred
-       causing the ECL balance to fall) to the date of reversal in Form GSTR-3B.
+    2. Under Rule 88B(3), credit is treated as utilised only when the balance in the Electronic Credit
+       Ledger (ECL) falls below the amount of wrongly availed credit.
+    3. Tax-Head Aggregation Rules (Circular 192/04/2023-GST & Section 49(5)):
+       - IGST Wrong Availment: Total balance across IGST + CGST + SGST heads taken together is evaluated
+         because IGST credit can be cross-utilized towards IGST, CGST, and SGST liabilities.
+         *Compensation Cess is strictly excluded* from this combined balance.
+       - CGST Wrong Availment: Total balance across CGST + IGST heads is evaluated under Section 49(5)(b).
+         (SGST and Cess are excluded).
+       - SGST Wrong Availment: Total balance across SGST + IGST heads is evaluated under Section 49(5)(c).
+         (CGST and Cess are excluded).
+       - Cess Wrong Availment: Only Compensation Cess ledger balance is evaluated (cross-utilization prohibited).
+    4. If relevant minimum ECL balance >= reversal_tax, the credit was NEVER utilised -> Utilised Amount = 0,
+       and Interest is Nil (₹0.00).
+    5. If relevant minimum ECL balance < reversal_tax, Utilised Amount = reversal_tax - max(0, relevant_ecl).
+       Interest runs at 18% p.a. on the utilised shortfall from the date of utilisation (debit) to the
+       date of reversal in Form GSTR-3B.
     """
     rev_tax = Decimal(str(reversal_tax or 0)).quantize(Decimal("0.01"))
     rate = Decimal(str(interest_rate_pct or "18.00"))
     rev_dt = reversal_date or date.today()
+    t_head = (tax_head or "TOTAL").upper()
 
-    if ecl_minimum_balance is not None and Decimal(str(ecl_minimum_balance)) >= rev_tax:
+    computed_u_date = utilisation_date
+    relevant_ecl: Optional[Decimal] = None
+    cess_excluded = True
+
+    # 1. Evaluate from chronological ECL transaction ledger if provided
+    if ecl_transactions:
+        min_txn_balance: Optional[Decimal] = None
+        first_dip_date: Optional[date] = None
+
+        for txn in ecl_transactions:
+            t_dt_raw = txn.get("date") or txn.get("transaction_date")
+            if isinstance(t_dt_raw, str):
+                t_dt = datetime.strptime(t_dt_raw[:10], "%Y-%m-%d").date()
+            elif isinstance(t_dt_raw, date):
+                t_dt = t_dt_raw
+            else:
+                t_dt = None
+
+            b_igst = Decimal(str(txn.get("balance_igst") or 0))
+            b_cgst = Decimal(str(txn.get("balance_cgst") or 0))
+            b_sgst = Decimal(str(txn.get("balance_sgst") or 0))
+            b_cess = Decimal(str(txn.get("balance_cess") or 0))
+
+            if t_head == "IGST":
+                txn_rel = b_igst + b_cgst + b_sgst  # Circular 192: Cess strictly excluded
+            elif t_head == "CGST":
+                txn_rel = b_cgst + b_igst
+            elif t_head == "SGST":
+                txn_rel = b_sgst + b_igst
+            elif t_head == "CESS":
+                txn_rel = b_cess
+            else:
+                txn_rel = b_igst + b_cgst + b_sgst
+
+            if min_txn_balance is None or txn_rel < min_txn_balance:
+                min_txn_balance = txn_rel
+
+            if txn_rel < rev_tax and first_dip_date is None:
+                first_dip_date = t_dt
+
+        relevant_ecl = min_txn_balance
+        if computed_u_date is None and first_dip_date is not None:
+            computed_u_date = first_dip_date
+
+    # 2. Evaluate from head balances snapshot if transactions not provided
+    elif ecl_head_balances:
+        b_igst = Decimal(str(ecl_head_balances.get("igst") or 0))
+        b_cgst = Decimal(str(ecl_head_balances.get("cgst") or 0))
+        b_sgst = Decimal(str(ecl_head_balances.get("sgst") or 0))
+        b_cess = Decimal(str(ecl_head_balances.get("cess") or 0))
+
+        if t_head == "IGST":
+            relevant_ecl = b_igst + b_cgst + b_sgst
+        elif t_head == "CGST":
+            relevant_ecl = b_cgst + b_igst
+        elif t_head == "SGST":
+            relevant_ecl = b_sgst + b_igst
+        elif t_head == "CESS":
+            relevant_ecl = b_cess
+        else:
+            relevant_ecl = b_igst + b_cgst + b_sgst
+
+    # 3. Direct minimum balance fallback
+    elif ecl_minimum_balance is not None:
+        relevant_ecl = Decimal(str(ecl_minimum_balance))
+
+    # Determine statutory basis string
+    if t_head == "IGST":
+        statutory_basis = "Section 50(3) read with Rule 88B(3) and CBIC Circular No. 192/04/2023-GST"
+    else:
+        statutory_basis = "Section 50(3) read with Rule 88B(3)"
+
+    # When relevant ECL balance >= reversal_tax: NEVER utilised -> Nil interest
+    if relevant_ecl is not None and relevant_ecl >= rev_tax:
+        if t_head == "IGST":
+            reason = (
+                f"Combined ECL minimum balance across IGST+CGST+SGST (₹{relevant_ecl:,.2f}, excluding Cess) "
+                f">= wrongly availed IGST (₹{rev_tax:,.2f}). Per CBIC Circular 192/04/2023-GST, credit was "
+                f"never utilised. Statutory interest under Section 50(3) is Nil (₹0.00)."
+            )
+        else:
+            reason = (
+                f"ECL relevant minimum balance (₹{relevant_ecl:,.2f}) >= reversal amount (₹{rev_tax:,.2f}). "
+                f"Wrongly availed ITC was never utilised. Statutory interest under Section 50(3) is Nil (₹0.00)."
+            )
+
         return {
             "reversal_tax": rev_tax,
-            "ecl_minimum_balance": Decimal(str(ecl_minimum_balance)),
+            "ecl_minimum_balance": ecl_minimum_balance if ecl_minimum_balance is not None else relevant_ecl,
+            "relevant_ecl_balance": relevant_ecl,
+            "tax_head": t_head,
+            "cess_excluded": cess_excluded,
             "utilised_amount": Decimal("0.00"),
             "utilisation_date": None,
             "reversal_date": rev_dt,
@@ -39,16 +143,17 @@ def calculate_rule_37_interest(
             "interest_rate_pct": rate,
             "interest_amount": Decimal("0.00"),
             "is_utilised": False,
-            "statutory_basis": "Section 50(3) read with Rule 88B(3)",
-            "explanation": f"ECL minimum balance (₹{Decimal(str(ecl_minimum_balance)):,.2f}) >= reversal amount (₹{rev_tax:,.2f}). Wrongly availed ITC was never utilised. Interest liability is Nil (₹0.00)."
+            "statutory_basis": statutory_basis,
+            "explanation": reason,
+            "source_ecl_transactions": ecl_transactions
         }
 
     # When utilised or ECL balance fell below reversal amount
-    min_bal = max(Decimal("0.00"), Decimal(str(ecl_minimum_balance))) if ecl_minimum_balance is not None else Decimal("0.00")
+    min_bal = max(Decimal("0.00"), relevant_ecl) if relevant_ecl is not None else Decimal("0.00")
     utilised = (rev_tax - min_bal).quantize(Decimal("0.01"))
 
-    if utilisation_date and rev_dt > utilisation_date:
-        days = (rev_dt - utilisation_date).days
+    if computed_u_date and rev_dt > computed_u_date:
+        days = (rev_dt - computed_u_date).days
     else:
         days = 0
 
@@ -57,18 +162,34 @@ def calculate_rule_37_interest(
     else:
         interest = Decimal("0.00")
 
+    if t_head == "IGST":
+        exp = (
+            f"Combined ECL balance (IGST+CGST+SGST, excluding Cess) fell to ₹{min_bal:,.2f}, resulting in "
+            f"statutory credit utilisation of ₹{utilised:,.2f} for {days} days ({computed_u_date} to {rev_dt}) "
+            f"at {rate}% p.a. per Rule 88B(3) and CBIC Circular 192/04/2023-GST."
+        )
+    else:
+        exp = (
+            f"Relevant ECL balance fell to ₹{min_bal:,.2f}, resulting in actual credit utilisation of ₹{utilised:,.2f} "
+            f"for {days} days ({computed_u_date} to {rev_dt}) at {rate}% p.a. under Section 50(3)."
+        )
+
     return {
         "reversal_tax": rev_tax,
-        "ecl_minimum_balance": ecl_minimum_balance,
+        "ecl_minimum_balance": ecl_minimum_balance if ecl_minimum_balance is not None else relevant_ecl,
+        "relevant_ecl_balance": relevant_ecl,
+        "tax_head": t_head,
+        "cess_excluded": cess_excluded,
         "utilised_amount": utilised,
-        "utilisation_date": utilisation_date,
+        "utilisation_date": computed_u_date,
         "reversal_date": rev_dt,
         "days_utilised": days,
         "interest_rate_pct": rate,
         "interest_amount": interest,
         "is_utilised": utilised > Decimal("0.00"),
-        "statutory_basis": "Section 50(3) read with Rule 88B(3)",
-        "explanation": f"ECL minimum balance fell to ₹{min_bal:,.2f}, resulting in actual credit utilisation of ₹{utilised:,.2f} for {days} days ({utilisation_date} to {rev_dt}) at {rate}% p.a. under Section 50(3)."
+        "statutory_basis": statutory_basis,
+        "explanation": exp,
+        "source_ecl_transactions": ecl_transactions
     }
 
 
