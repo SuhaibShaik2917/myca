@@ -7,6 +7,71 @@ from .schemas import ITCEligibilityEnum, ITCAssessmentOut, Rule37PaymentCheck, R
 logger = logging.getLogger("reconciliation.itc_engine")
 
 
+def calculate_rule_37_interest(
+    reversal_tax: Decimal,
+    ecl_minimum_balance: Optional[Decimal] = None,
+    utilisation_date: Optional[date] = None,
+    reversal_date: Optional[date] = None,
+    interest_rate_pct: Decimal = Decimal("18.00")
+) -> Dict[str, Any]:
+    """
+    Computes statutory interest liability under Section 50(3) read with Rule 88B(3) of CGST Rules:
+    1. Interest is payable ONLY if and to the extent that the wrongly availed credit was actually utilised.
+    2. Under Rule 88B(3), credit is treated as utilised only when the balance in the Electronic Credit Ledger (ECL)
+       falls below the amount of wrongly availed credit.
+    3. If minimum ECL balance >= reversal_tax, the credit was NEVER utilised -> Utilised Amount = 0, Interest = Nil (₹0.00).
+    4. If minimum ECL balance < reversal_tax, Utilised Amount = reversal_tax - max(0, ecl_minimum_balance).
+    5. The interest period runs from the date of utilisation (the date the return was filed or debit occurred
+       causing the ECL balance to fall) to the date of reversal in Form GSTR-3B.
+    """
+    rev_tax = Decimal(str(reversal_tax or 0)).quantize(Decimal("0.01"))
+    rate = Decimal(str(interest_rate_pct or "18.00"))
+    rev_dt = reversal_date or date.today()
+
+    if ecl_minimum_balance is not None and Decimal(str(ecl_minimum_balance)) >= rev_tax:
+        return {
+            "reversal_tax": rev_tax,
+            "ecl_minimum_balance": Decimal(str(ecl_minimum_balance)),
+            "utilised_amount": Decimal("0.00"),
+            "utilisation_date": None,
+            "reversal_date": rev_dt,
+            "days_utilised": 0,
+            "interest_rate_pct": rate,
+            "interest_amount": Decimal("0.00"),
+            "is_utilised": False,
+            "statutory_basis": "Section 50(3) read with Rule 88B(3)",
+            "explanation": f"ECL minimum balance (₹{Decimal(str(ecl_minimum_balance)):,.2f}) >= reversal amount (₹{rev_tax:,.2f}). Wrongly availed ITC was never utilised. Interest liability is Nil (₹0.00)."
+        }
+
+    # When utilised or ECL balance fell below reversal amount
+    min_bal = max(Decimal("0.00"), Decimal(str(ecl_minimum_balance))) if ecl_minimum_balance is not None else Decimal("0.00")
+    utilised = (rev_tax - min_bal).quantize(Decimal("0.01"))
+
+    if utilisation_date and rev_dt > utilisation_date:
+        days = (rev_dt - utilisation_date).days
+    else:
+        days = 0
+
+    if days > 0 and utilised > Decimal("0.00"):
+        interest = (utilised * (rate / Decimal("100.00")) * Decimal(days) / Decimal("365")).quantize(Decimal("0.01"))
+    else:
+        interest = Decimal("0.00")
+
+    return {
+        "reversal_tax": rev_tax,
+        "ecl_minimum_balance": ecl_minimum_balance,
+        "utilised_amount": utilised,
+        "utilisation_date": utilisation_date,
+        "reversal_date": rev_dt,
+        "days_utilised": days,
+        "interest_rate_pct": rate,
+        "interest_amount": interest,
+        "is_utilised": utilised > Decimal("0.00"),
+        "statutory_basis": "Section 50(3) read with Rule 88B(3)",
+        "explanation": f"ECL minimum balance fell to ₹{min_bal:,.2f}, resulting in actual credit utilisation of ₹{utilised:,.2f} for {days} days ({utilisation_date} to {rev_dt}) at {rate}% p.a. under Section 50(3)."
+    }
+
+
 class StatutoryITCRiskEngine:
     """
     Milestone 2 Versioned Statutory ITC Risk & Eligibility Engine.
@@ -21,7 +86,10 @@ class StatutoryITCRiskEngine:
         purchase_doc: Dict[str, Any],
         gstr2b_doc: Optional[Dict[str, Any]] = None,
         payments: Optional[List[Dict[str, Any]]] = None,
-        evaluation_date: Optional[date] = None
+        evaluation_date: Optional[date] = None,
+        ecl_minimum_balance: Optional[Decimal] = None,
+        utilisation_date: Optional[date] = None,
+        reversal_date: Optional[date] = None
     ) -> List[ITCAssessmentOut]:
         eval_dt = evaluation_date or date.today()
         assessments: List[ITCAssessmentOut] = []
@@ -129,9 +197,24 @@ class StatutoryITCRiskEngine:
             # Proportionate reversal
             prop_ratio = unpaid / total_inv_val if total_inv_val > 0 else Decimal("1.00")
             reversal_tax = (total_tax * prop_ratio).quantize(Decimal("0.01"))
-            # Estimated interest at 18% p.a.
             days_over = days_elapsed - 180
-            interest_estimate = (reversal_tax * Decimal("0.18") * Decimal(days_over) / Decimal("365")).quantize(Decimal("0.01"))
+
+            if ecl_minimum_balance is not None:
+                int_calc = calculate_rule_37_interest(
+                    reversal_tax=reversal_tax,
+                    ecl_minimum_balance=ecl_minimum_balance,
+                    utilisation_date=utilisation_date,
+                    reversal_date=reversal_date or eval_dt
+                )
+                interest_estimate = int_calc["interest_amount"]
+                explanation = (
+                    f"Vendor invoice unpaid after {days_elapsed} days ({days_over} days past 180-day limit). "
+                    f"Proportionate reversal required: ₹{reversal_tax}. Estimated interest under Section 50(1) at 18% p.a.: ₹{interest_estimate}. "
+                    f"ECL utilization basis: {int_calc['explanation']}"
+                )
+            else:
+                interest_estimate = (reversal_tax * Decimal("0.18") * Decimal(days_over) / Decimal("365")).quantize(Decimal("0.01"))
+                explanation = f"Vendor invoice unpaid after {days_elapsed} days ({days_over} days past 180-day limit). Proportionate reversal required: ₹{reversal_tax}. Estimated interest under Section 50(1) at 18% p.a.: ₹{interest_estimate}."
 
             assessments.append(ITCAssessmentOut(
                 purchase_doc_id=p_id,
@@ -141,7 +224,7 @@ class StatutoryITCRiskEngine:
                 eligibility_status=ITCEligibilityEnum.PAYMENT_180_DAY_RISK,
                 potential_itc=total_tax,
                 risk_reversal_amount=reversal_tax,
-                findings_explanation=f"Vendor invoice unpaid after {days_elapsed} days ({days_over} days past 180-day limit). Proportionate reversal required: ₹{reversal_tax}. Estimated interest under Section 50(1) at 18% p.a.: ₹{interest_estimate}.",
+                findings_explanation=explanation,
                 missing_evidence_required="Record payment voucher, bank settlement, or formal credit adjustment to re-avail credit.",
                 evaluation_date=str(eval_dt)
             ))

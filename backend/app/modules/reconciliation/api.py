@@ -17,7 +17,8 @@ from app.modules.reconciliation.schemas import (
     HumanResolutionRequest, HumanResolutionResponse, PurchasePaymentRequest,
     GSTR3BTable4WorkingOutput, ITCRiskEvaluateRequest,
     GSTRegistrationCreate, GSTRegistrationOut, GSTR2BRecomputeRequest, GSTR2BRecomputeResponse,
-    ITCLedgerEventCreate, ITCLedgerEntryOut, ITCLedgerSummaryOut, IMSActionHistoryOut, ComponentTaxAmount
+    ITCLedgerEventCreate, ITCLedgerEntryOut, ITCLedgerSummaryOut, IMSActionHistoryOut, ComponentTaxAmount,
+    Rule37InterestCalculationRequest, Rule37InterestCalculationResponse
 )
 from app.modules.reconciliation.gstr2b_parser import parse_gstr2b_json, parse_gstr2b_excel
 from app.modules.reconciliation.purchase_service import (
@@ -26,7 +27,7 @@ from app.modules.reconciliation.purchase_service import (
     DuplicatePurchaseDocumentError, PurchaseServiceError
 )
 from app.modules.reconciliation.matching_engine import DeterministicReconciliationEngine
-from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
+from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine, calculate_rule_37_interest
 from app.modules.reconciliation.gstr3b_itc import generate_gstr3b_table4_summary
 
 router = APIRouter(prefix="/reconciliation", tags=["GSTR-2B & Purchase Reconciliation"])
@@ -1072,7 +1073,7 @@ def evaluate_itc_risk(
     Evaluates statutory ITC risk for a purchase document (Section 16, 17, Rule 37 180 days, Rule 37A).
     """
     p_row = db.execute(
-        text("SELECT * FROM public.purchase_documents WHERE id = :id AND org_id = :org;"),
+        text("SELECT * FROM public.purchase_documents WHERE id = :id AND org_id = :org FOR UPDATE;"),
         {"id": payload.purchase_doc_id, "org": x_org_id}
     ).fetchone()
     if not p_row:
@@ -1339,6 +1340,52 @@ def avail_purchase_document_in_3b(
     return res
 
 
+@router.post("/rule37/calculate-interest", response_model=Rule37InterestCalculationResponse)
+def calculate_rule37_interest_endpoint(
+    payload: Rule37InterestCalculationRequest,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Computes statutory Rule 37 interest liability under Section 50(3) read with Rule 88B(3).
+    Evaluates actual Electronic Credit Ledger (ECL) minimum balance and date of credit utilisation.
+    """
+    p_row = db.execute(
+        text("SELECT * FROM public.purchase_documents WHERE id = :id AND org_id = :org;"),
+        {"id": payload.purchase_doc_id, "org": x_org_id}
+    ).fetchone()
+    if not p_row:
+        raise HTTPException(status_code=404, detail="Purchase document not found")
+
+    u_date = datetime.strptime(payload.utilisation_date[:10], "%Y-%m-%d").date() if payload.utilisation_date else None
+    r_date = datetime.strptime(payload.reversal_date[:10], "%Y-%m-%d").date() if payload.reversal_date else date.today()
+
+    calc = calculate_rule_37_interest(
+        reversal_tax=payload.reversal_amount,
+        ecl_minimum_balance=payload.ecl_minimum_balance,
+        utilisation_date=u_date,
+        reversal_date=r_date,
+        interest_rate_pct=payload.interest_rate_pct
+    )
+
+    return Rule37InterestCalculationResponse(
+        purchase_doc_id=payload.purchase_doc_id,
+        reversal_amount=payload.reversal_amount,
+        ecl_minimum_balance=payload.ecl_minimum_balance,
+        utilised_amount=calc["utilised_amount"],
+        utilisation_date=str(calc["utilisation_date"]) if calc["utilisation_date"] else None,
+        reversal_date=str(calc["reversal_date"]) if calc["reversal_date"] else None,
+        days_utilised=calc["days_utilised"],
+        interest_rate_pct=calc["interest_rate_pct"],
+        interest_amount=calc["interest_amount"],
+        is_utilised=calc["is_utilised"],
+        statutory_basis=calc["statutory_basis"],
+        explanation=calc["explanation"]
+    )
+
+
+
 # -----------------------------------------------------------------------------
 # 9. Traceable Event-Based ITC Ledger (Availment, Reversals & Reclaims)
 # -----------------------------------------------------------------------------
@@ -1361,7 +1408,7 @@ def record_itc_ledger_event(
     - Reclaim must reference an existing reversal event.
     """
     p_row = db.execute(
-        text("SELECT * FROM public.purchase_documents WHERE id = :id AND org_id = :org;"),
+        text("SELECT * FROM public.purchase_documents WHERE id = :id AND org_id = :org FOR UPDATE;"),
         {"id": payload.purchase_doc_id, "org": x_org_id}
     ).fetchone()
     if not p_row:
@@ -1460,7 +1507,7 @@ def record_itc_ledger_event(
             )
 
         orig_rev = db.execute(
-            text("SELECT * FROM public.itc_reversal_events WHERE id = :id AND org_id = :org;"),
+            text("SELECT * FROM public.itc_reversal_events WHERE id = :id AND org_id = :org FOR UPDATE;"),
             {"id": payload.reversal_event_id, "org": x_org_id}
         ).fetchone()
         if not orig_rev:

@@ -286,6 +286,8 @@ class GSTR3BTable4WorkingOutput(BaseModel):
     # Distinct Subtotals (Statutory Provenance Non-Confused Totals)
     subtotal_gstr2b_portal_available: Decimal = Decimal("0.00")
     subtotal_books_matched: Decimal = Decimal("0.00")
+    current_b2b_inward_available: Decimal = Decimal("0.00")
+    reclaims_total: Decimal = Decimal("0.00")
     subtotal_legally_eligible: Decimal = Decimal("0.00")
     subtotal_human_approved: Decimal = Decimal("0.00")
     # Component Breakdown for Tax Columns (CGST, SGST, IGST, Cess)
@@ -437,4 +439,29 @@ class ITCRiskEvaluateRequest(BaseModel):
     purchase_doc_id: str
     gstr2b_doc_id: Optional[str] = None
     evaluation_date: Optional[str] = None
+
+
+class Rule37InterestCalculationRequest(BaseModel):
+    purchase_doc_id: str
+    reversal_amount: Decimal
+    ecl_minimum_balance: Optional[Decimal] = None
+    utilisation_date: Optional[str] = None  # YYYY-MM-DD
+    reversal_date: Optional[str] = None     # YYYY-MM-DD
+    interest_rate_pct: Decimal = Decimal("18.00")
+
+
+class Rule37InterestCalculationResponse(BaseModel):
+    purchase_doc_id: str
+    reversal_amount: Decimal
+    ecl_minimum_balance: Optional[Decimal] = None
+    utilised_amount: Decimal = Decimal("0.00")
+    utilisation_date: Optional[str] = None
+    reversal_date: Optional[str] = None
+    days_utilised: int = 0
+    interest_rate_pct: Decimal = Decimal("18.00")
+    interest_amount: Decimal = Decimal("0.00")
+    is_utilised: bool = False
+    statutory_basis: str
+    explanation: str
+
 

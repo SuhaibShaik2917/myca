@@ -149,6 +149,7 @@ def generate_gstr3b_table4_summary(
 
     # Statutory Reconciled Link: Reclaims in 4(D)(1) must also be added to 4(A)(5) in current return
     # so that 4(C) net credit incorporates re-availed ITC
+    current_b2b_inward = comp_4a5.total
     comp_4a5 = _add_component(comp_4a5, comp_4d1.cgst, comp_4d1.sgst, comp_4d1.igst, comp_4d1.cess)
 
     # Total 4(A) across components
@@ -295,9 +296,10 @@ def generate_gstr3b_table4_summary(
     # 7. Variance Explanation between GSTR-2B Statement Total and Books Matched
     unbooked_var = max(Decimal("0.00"), subtotal_portal_avail - subtotal_books_matched)
     var_exp = (
-        f"GSTR-2B available total ₹{subtotal_portal_avail:,.2f} exceeds book matched total ₹{subtotal_books_matched:,.2f} "
-        f"by ₹{unbooked_var:,.2f}. This difference is accounted for by {len(unbooked_docs)} inward document(s) "
-        f"present in GSTR-2B but unrecorded/unmatched in purchase register. Separately, Table 4(B)(2) reversals of "
+        f"GSTR-2B Statement Available Total ₹{subtotal_portal_avail:,.2f} = Book-matched inward supplies ₹{subtotal_books_matched:,.2f} "
+        f"+ Unbooked GSTR-2B documents ₹{unbooked_var:,.2f} ({len(unbooked_docs)} document(s) missing in purchase register). "
+        f"Form GSTR-3B Table 4(A) Total ₹{comp_4a_total.total:,.2f} includes current GSTR-2B supplies ₹{subtotal_portal_avail:,.2f} "
+        f"plus prior-period reclaims ₹{comp_4d1.total:,.2f} reported under Table 4(D)(1). Separately, Table 4(B)(2) reversals of "
         f"₹{comp_4b2_total.total:,.2f} pertain to previously availed historical purchase documents under Rule 37 / Rule 37A."
     )
 
@@ -328,6 +330,8 @@ def generate_gstr3b_table4_summary(
         # Calculation Provenance Subtotals
         subtotal_gstr2b_portal_available=subtotal_portal_avail,
         subtotal_books_matched=subtotal_books_matched,
+        current_b2b_inward_available=current_b2b_inward,
+        reclaims_total=comp_4d1.total,
         subtotal_legally_eligible=subtotal_legally_eligible,
         subtotal_human_approved=subtotal_human_approved,
         # Detailed Component Breakdown
