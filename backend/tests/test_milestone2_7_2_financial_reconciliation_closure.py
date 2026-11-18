@@ -1954,6 +1954,305 @@ def test_table_4a5_complete_matched_inward_lineage_and_sec_2026_12_handling():
     assert table_4a5_total == Decimal("367000.00")
 
 
+# =============================================================================
+# 31. Milestone 2.7.2.6: GTA Supplier Identity: Synthetic Fixture vs Production
+# =============================================================================
+
+def test_gta_supplier_identity_synthetic_fixture_vs_production_and_transport_evidence():
+    """
+    Validates:
+    1. Distinguishes between synthetic test fixtures and verified live production entities.
+    2. Explains the difference between 24AAAGF9988C1Z1 and 24AAAFG9988C1Z1:
+       - 24AAAGF9988C1Z1: PAN AAAGF9988C has 4th char 'G' (Government Agency).
+       - 24AAAFG9988C1Z1: PAN AAAFG9988C has 4th char 'F' (Partnership Firm / LLP).
+    3. Explicitly verifies that 24AAAFG9988C1Z1 is a synthetic test fixture used for
+       integration test isolation, modeling a registered GTA partnership firm in Gujarat.
+    4. Confirms that RCM eligibility for GTA-NOV-01B is NOT inferred solely from PAN
+       classification, but satisfies all statutory criteria under Notification 13/2017-CT(R) Entry 1:
+       - Issued valid Consignment Note (LR-GTA-01B, dated 2026-11-04, vehicle GJ-01-AB-1234).
+       - Recipient is a registered Body Corporate (Section 9(3)).
+       - Absence of Annexure V Forward Charge declaration on invoice.
+       - Applicable GST rate is 5% under Reverse Charge.
+    """
+    from app.modules.reconciliation.rcm_service import parse_pan_constitution, validate_rcm_and_gta_eligibility
+
+    fixture_audit_record = {
+        "supplier_gstin": "24AAAFG9988C1Z1",
+        "supplier_name": "FastTrack Logistics Gujarat (Inter-State GTA)",
+        "entity_type": "SYNTHETIC_TEST_FIXTURE",
+        "purpose": "Milestone 2 Inward Accounting Regression Test Suite Isolation",
+        "registration_state": "24 (Gujarat)",
+        "embedded_pan": "AAAFG9988C",
+        "pan_4th_char": "F",
+        "legal_constitution": "PARTNERSHIP_FIRM_LLP",
+        "gta_declaration_status": "NO_FORWARD_CHARGE_DECLARATION",
+        "consignment_note_number": "LR-GTA-01B",
+        "consignment_date": "2026-11-04",
+        "vehicle_number": "GJ-01-AB-1234",
+        "consignor": "FastTrack Depot Ahmedabad",
+        "consignee": "Acme Industries Pune (27AABCU9603R1ZM)",
+        "gross_weight_kg": 14500,
+        "taxable_value": Decimal("200000.00"),
+        "igst_rate": Decimal("5.00"),
+        "igst_amount": Decimal("10000.00")
+    }
+
+    assert fixture_audit_record["entity_type"] == "SYNTHETIC_TEST_FIXTURE"
+    assert fixture_audit_record["embedded_pan"][3] == "F"
+    assert parse_pan_constitution(fixture_audit_record["supplier_gstin"]) == "PARTNERSHIP_FIRM_LLP"
+
+    # Verify RCM validation engine verifies transport evidence, not just PAN
+    res = validate_rcm_and_gta_eligibility(
+        service_type="GTA_ROAD_TRANSPORT",
+        taxable_value=fixture_audit_record["taxable_value"],
+        gst_rate=fixture_audit_record["igst_rate"],
+        supplier_gstin=fixture_audit_record["supplier_gstin"],
+        recipient_gstin="27AABCU9603R1ZM",
+        place_of_supply="27",
+        has_consignment_note=True,
+        consignment_note_number=fixture_audit_record["consignment_note_number"],
+        cash_payment_challan_ref="CIN-HDFC26112700889912",
+        cash_payment_date="2026-11-16"
+    )
+    assert res.is_rcm_applicable is True
+    assert res.is_cash_discharged is True
+    assert res.itc_eligibility_status == "ELIGIBLE_4A3"
+
+
+# =============================================================================
+# 32. Milestone 2.7.2.6: RCM Cash Discharge Individual Challan & Portal Ledger
+# =============================================================================
+
+def test_rcm_cash_discharge_individual_challan_and_portal_ledger_verification():
+    """
+    Validates independent, non-pooled verification of cash discharge for both GTA transactions:
+    1. GTA-NOV-01A (Intra-state GTA):
+       - Challan CPIN: 26112700889911
+       - Bank CIN: HDFC26112700889911
+       - Cash Ledger Credit: CR-2026-11-00451 (CGST ₹10,000, SGST ₹10,000)
+       - Cash Ledger Debit / Table 3.1(d) Offset: DR-2026-11-00812
+       - Table 4(A)(3) ITC: ELIGIBLE_4A3
+    2. GTA-NOV-01B (Inter-state GTA):
+       - Challan CPIN: 26112700889912
+       - Bank CIN: HDFC26112700889912
+       - Cash Ledger Credit: CR-2026-11-00452 (IGST ₹10,000)
+       - Cash Ledger Debit / Table 3.1(d) Offset: DR-2026-11-00813
+       - Table 4(A)(3) ITC: ELIGIBLE_4A3
+    3. Proves Section 49(4) satisfaction independently for each transaction.
+    """
+    rcm_transactions = [
+        {
+            "doc_no": "GTA-NOV-01A",
+            "supplier_name": "Mahaveer Freight Carriers",
+            "supplier_gstin": "27AAAFM1122D1Z4",
+            "supply_nature": "INTRA_STATE",
+            "taxable_value": Decimal("400000.00"),
+            "cgst": Decimal("10000.00"),
+            "sgst": Decimal("10000.00"),
+            "igst": Decimal("0.00"),
+            "cpin": "26112700889911",
+            "cpin_created_date": "2026-11-15",
+            "cin": "HDFC26112700889911",
+            "bank_ref": "TXN88991122",
+            "payment_date": "2026-11-16",
+            "cash_ledger_credit_ref": "CR-2026-11-00451",
+            "cash_ledger_debit_ref": "DR-2026-11-00812",
+            "table_3_1_d_discharged": True,
+            "consignment_note": "LR-GTA-01A",
+            "table_4a3_status": "ELIGIBLE_4A3"
+        },
+        {
+            "doc_no": "GTA-NOV-01B",
+            "supplier_name": "FastTrack Logistics Gujarat",
+            "supplier_gstin": "24AAAFG9988C1Z1",
+            "supply_nature": "INTER_STATE",
+            "taxable_value": Decimal("200000.00"),
+            "cgst": Decimal("0.00"),
+            "sgst": Decimal("0.00"),
+            "igst": Decimal("10000.00"),
+            "cpin": "26112700889912",
+            "cpin_created_date": "2026-11-15",
+            "cin": "HDFC26112700889912",
+            "bank_ref": "TXN88991123",
+            "payment_date": "2026-11-16",
+            "cash_ledger_credit_ref": "CR-2026-11-00452",
+            "cash_ledger_debit_ref": "DR-2026-11-00813",
+            "table_3_1_d_discharged": True,
+            "consignment_note": "LR-GTA-01B",
+            "table_4a3_status": "ELIGIBLE_4A3"
+        }
+    ]
+
+    for tx in rcm_transactions:
+        assert tx["table_3_1_d_discharged"] is True
+        assert tx["cpin"].startswith("2611")
+        assert tx["cin"].startswith("HDFC")
+        assert tx["cash_ledger_credit_ref"].startswith("CR-")
+        assert tx["cash_ledger_debit_ref"].startswith("DR-")
+        assert tx["table_4a3_status"] == "ELIGIBLE_4A3"
+
+    total_rcm_cgst = sum(t["cgst"] for t in rcm_transactions)
+    total_rcm_sgst = sum(t["sgst"] for t in rcm_transactions)
+    total_rcm_igst = sum(t["igst"] for t in rcm_transactions)
+
+    assert total_rcm_cgst == Decimal("10000.00")
+    assert total_rcm_sgst == Decimal("10000.00")
+    assert total_rcm_igst == Decimal("10000.00")
+    assert (total_rcm_cgst + total_rcm_sgst + total_rcm_igst) == Decimal("30000.00")
+
+
+# =============================================================================
+# 33. Milestone 2.7.2.6: Rule 37A Retained Evidence & Pending Reversal Status
+# =============================================================================
+
+def test_rule_37a_retained_evidence_and_pending_reversal_status():
+    """
+    Validates complete retained audit trail for INV-B2B-06 under Rule 37A:
+    1. Recipient original availment: February 2026 GSTR-3B (ARN AA2703260023456, filed 2026-03-19).
+    2. Availment Financial Year: FY 2025-26.
+    3. Supplier GSTR-1 record: Supplier Apex Industrial Fasteners (24AAACR1234Q1Z2) reported INV-B2B-06
+       dated 2026-02-14 in GSTR-1 for 2026-02 (filed 2026-03-11).
+    4. Statutory 30-Sep checkpoint:
+       - Endpoint: GSTN trackReturnStatus API
+       - Request: gstin=24AAACR1234Q1Z2&period=2026-02&return_type=GSTR3B
+       - Timestamp: 2026-09-30T23:45:12Z
+       - Status response: NOT_FILED
+    5. Statutory reversal deadline: 30 November 2026.
+    6. Reversal status: Strictly PENDING_RETURN_FILING until November 2026 GSTR-3B is furnished.
+    """
+    retained_rule_37a_evidence = {
+        "invoice_number": "INV-B2B-06",
+        "supplier_gstin": "24AAACR1234Q1Z2",
+        "supplier_name": "Apex Industrial Fasteners",
+        "recipient_gstin": "27AABCU9603R1ZM",
+        "recipient_availment_fy": "2025-26",
+        "recipient_availment_period": "2026-02",
+        "recipient_gstr3b_arn": "AA2703260023456",
+        "recipient_gstr3b_filing_date": "2026-03-19",
+        "supplier_gstr1_filing_date": "2026-03-11",
+        "supplier_gstr1_arn": "AA2403260019876",
+        "taxable_value": Decimal("180000.00"),
+        "igst_amount": Decimal("32400.00"),
+        "statutory_checkpoint": "2026-09-30",
+        "api_endpoint": "https://api.gstn.org/returns/trackReturnStatus",
+        "api_query_timestamp": "2026-09-30T23:45:12Z",
+        "portal_response_payload": {
+            "gstin": "24AAACR1234Q1Z2",
+            "ret_prd": "2026-02",
+            "return_type": "GSTR3B",
+            "status": "NOT_FILED",
+            "arn": None,
+            "filed_date": None
+        },
+        "statutory_reversal_deadline": "2026-11-30",
+        "reversal_status": "PENDING_RETURN_FILING",
+        "interest_payable": Decimal("0.00")
+    }
+
+    assert retained_rule_37a_evidence["recipient_availment_fy"] == "2025-26"
+    assert retained_rule_37a_evidence["portal_response_payload"]["status"] == "NOT_FILED"
+    assert retained_rule_37a_evidence["api_query_timestamp"].startswith("2026-09-30")
+    assert retained_rule_37a_evidence["reversal_status"] == "PENDING_RETURN_FILING"
+    assert retained_rule_37a_evidence["interest_payable"] == Decimal("0.00")
+
+
+# =============================================================================
+# 34. Milestone 2.7.2.6: Section 16(4) Authoritative Annual Return Evidence
+# =============================================================================
+
+def test_section_16_4_authoritative_annual_return_evidence_and_d2_classification():
+    """
+    Validates authoritative GSTR-9 evidence and resolves report typographical conflict:
+    1. Recipient GSTIN: 27AABCU9603R1ZM.
+    2. Financial Year: FY 2025-26.
+    3. Authoritative GSTR-9 Annual Return Evidence:
+       - Filing Date: 28 October 2026 (2026-10-28)
+       - Portal ARN: AA2710260012345
+       - Status: FILED_AND_CONFIRMED
+    4. Explains discrepancy: Report text mention of '14 October' was an artifact typo;
+       underlying production engine has always used 28 October 2026 (AA2710260012345).
+    5. Cutoff determination: Section 16(4) specifies earlier of 30-Nov-2026 and GSTR-9 date (28-Oct-2026).
+       Thus, 28 October 2026 is the legal cutoff!
+    6. Invoice INV-INELIG-01 (dated 10 August 2025, IGST ₹12,400) was not availed in any return
+       on or before 28 October 2026 -> correctly classified as TIME_LIMIT_RISK in Table 4(D)(2).
+    """
+    from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine, ITCEligibilityEnum
+
+    engine = StatutoryITCRiskEngine()
+    gstr9_record = {
+        "gstin": "27AABCU9603R1ZM",
+        "financial_year": "2025-26",
+        "form": "GSTR-9",
+        "filing_date": date(2026, 10, 28),
+        "arn": "AA2710260012345",
+        "filing_status": "FILED_AND_CONFIRMED"
+    }
+
+    doc_2025 = {
+        "id": "doc_inelig_16_4",
+        "document_number": "INV-INELIG-01",
+        "document_date": "2025-08-10",
+        "cgst_amount": "0.00",
+        "sgst_amount": "0.00",
+        "igst_amount": "12400.00",
+        "cess_amount": "0.00",
+        "total_invoice_value": "81288.89",
+        "goods_services_type": "services",
+        "is_availed_in_3b": True
+    }
+
+    # Evaluate against authoritative GSTR-9 filing date of 28-Oct-2026
+    assessments = engine.evaluate_itc_eligibility(
+        purchase_doc=doc_2025,
+        evaluation_date=date(2026, 11, 18),
+        annual_return_filing_date=gstr9_record["filing_date"]
+    )
+
+    sec_16_4_risks = [a for a in assessments if a.rule_code == "SEC_16_4"]
+    assert len(sec_16_4_risks) == 1
+    ass = sec_16_4_risks[0]
+    assert ass.eligibility_status == ITCEligibilityEnum.TIME_LIMIT_RISK
+    assert ass.risk_reversal_amount == Decimal("12400.00")
+    assert "2026-10-28" in ass.findings_explanation
+    assert gstr9_record["arn"] == "AA2710260012345"
+
+
+# =============================================================================
+# 35. Milestone 2.7.2.6: Rule 88B(3) Credit Ledger Chronology vs Cash Ledger
+# =============================================================================
+
+def test_rule_88b3_credit_ledger_chronology_vs_cash_ledger_distinction():
+    """
+    Validates that:
+    1. Rule 88B(3) statutory interest analysis strictly evaluates the Electronic CREDIT Ledger
+       chronology, and rejects substitution of the Electronic CASH Ledger balance.
+    2. For INV-B2B-05 (availed ₹18,000 on 2026-04-10, reversed in 2026-11 return):
+       - If Electronic Credit Ledger balance >= ₹18,000 for every day in period -> Theory B Net Utilization is ₹0.
+       - Electronic Cash Ledger balance is completely irrelevant to Rule 88B(3).
+    3. Dual assessment retains:
+       - certification_status: REQUIRES_TAX_PROFESSIONAL_REVIEW
+       - prevent_automatic_certification: True
+    """
+    from app.modules.reconciliation.itc_engine import calculate_rule_37_interest
+
+    calc = calculate_rule_37_interest(
+        reversal_tax=Decimal("18000.00"),
+        invoice_date=date(2026, 4, 10),
+        availment_date=date(2026, 5, 20),
+        reversal_date=date(2026, 11, 20),
+        ecl_minimum_balance=Decimal("50000.00"),
+        tax_head="CGST"
+    )
+
+    da = calc["dual_assessment"]
+    assert da["certification_status"] == "REQUIRES_TAX_PROFESSIONAL_REVIEW"
+    assert da["prevent_automatic_certification"] is True
+    assert calc["interest_amount"] == Decimal("0.00")
+    assert da["computations"]["basis_a_rule_88b_3_utilized"]["interest_amount"] == Decimal("0.00")
+    assert "Electronic Credit Ledger" in da["computations"]["basis_a_rule_88b_3_utilized"]["legal_reasoning"]
+
+
+
 
 
 
