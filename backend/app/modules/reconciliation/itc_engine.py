@@ -297,10 +297,10 @@ def calculate_rule_37_interest(
 
     # 3. Evaluate from head balances snapshot if transactions not provided
     elif ecl_head_balances:
-        b_igst = Decimal(str(ecl_head_balances.get("igst") or 0))
-        b_cgst = Decimal(str(ecl_head_balances.get("cgst") or 0))
-        b_sgst = Decimal(str(ecl_head_balances.get("sgst") or 0))
-        b_cess = Decimal(str(ecl_head_balances.get("cess") or 0))
+        b_igst = Decimal(str(ecl_head_balances.get("igst") or ecl_head_balances.get("IGST") or 0))
+        b_cgst = Decimal(str(ecl_head_balances.get("cgst") or ecl_head_balances.get("CGST") or 0))
+        b_sgst = Decimal(str(ecl_head_balances.get("sgst") or ecl_head_balances.get("SGST") or 0))
+        b_cess = Decimal(str(ecl_head_balances.get("cess") or ecl_head_balances.get("CESS") or 0))
 
         if t_head == "IGST":
             relevant_ecl = b_igst + b_cgst + b_sgst
@@ -343,6 +343,7 @@ def calculate_rule_37_interest(
             "tax_head": t_head,
             "cess_excluded": cess_excluded,
             "utilised_amount": Decimal("0.00"),
+            "utilized_amount": Decimal("0.00"),
             "utilisation_date": None,
             "reversal_date": rev_dt,
             "days_utilised": 0,
@@ -393,6 +394,7 @@ def calculate_rule_37_interest(
         "tax_head": t_head,
         "cess_excluded": cess_excluded,
         "utilised_amount": utilised,
+        "utilized_amount": utilised,
         "utilisation_date": computed_u_date,
         "reversal_date": rev_dt,
         "days_utilised": days,
@@ -447,10 +449,10 @@ def calculate_rule_37_interest(
 
     # 3. Evaluate from head balances snapshot if transactions not provided
     elif ecl_head_balances:
-        b_igst = Decimal(str(ecl_head_balances.get("igst") or 0))
-        b_cgst = Decimal(str(ecl_head_balances.get("cgst") or 0))
-        b_sgst = Decimal(str(ecl_head_balances.get("sgst") or 0))
-        b_cess = Decimal(str(ecl_head_balances.get("cess") or 0))
+        b_igst = Decimal(str(ecl_head_balances.get("igst") or ecl_head_balances.get("IGST") or 0))
+        b_cgst = Decimal(str(ecl_head_balances.get("cgst") or ecl_head_balances.get("CGST") or 0))
+        b_sgst = Decimal(str(ecl_head_balances.get("sgst") or ecl_head_balances.get("SGST") or 0))
+        b_cess = Decimal(str(ecl_head_balances.get("cess") or ecl_head_balances.get("CESS") or 0))
 
         if t_head == "IGST":
             relevant_ecl = b_igst + b_cgst + b_sgst
@@ -495,6 +497,7 @@ def calculate_rule_37_interest(
             "tax_head": t_head,
             "cess_excluded": cess_excluded,
             "utilised_amount": Decimal("0.00"),
+            "utilized_amount": Decimal("0.00"),
             "utilisation_date": None,
             "reversal_date": rev_dt,
             "days_utilised": 0,
@@ -503,7 +506,8 @@ def calculate_rule_37_interest(
             "is_utilised": False,
             "statutory_basis": statutory_basis,
             "explanation": reason,
-            "source_ecl_transactions": ecl_transactions
+            "source_ecl_transactions": ecl_transactions,
+            "dual_assessment": dual_assessment
         }
 
     # When utilised or ECL balance fell below reversal amount
@@ -532,6 +536,11 @@ def calculate_rule_37_interest(
             f"for {days} days ({computed_u_date} to {rev_dt}) at {rate}% p.a. under Section 50(3)."
         )
 
+    if dual_assessment:
+        dual_assessment["computations"]["basis_a_rule_88b_3_utilized"]["interest_amount"] = interest
+        dual_assessment["computations"]["basis_a_rule_88b_3_utilized"]["days_utilized"] = days
+        dual_assessment["computations"]["basis_a_rule_88b_3_utilized"]["utilized_shortfall"] = utilised
+
     return {
         "reversal_tax": rev_tax,
         "ecl_minimum_balance": ecl_minimum_balance if ecl_minimum_balance is not None else relevant_ecl,
@@ -539,6 +548,7 @@ def calculate_rule_37_interest(
         "tax_head": t_head,
         "cess_excluded": cess_excluded,
         "utilised_amount": utilised,
+        "utilized_amount": utilised,
         "utilisation_date": computed_u_date,
         "reversal_date": rev_dt,
         "days_utilised": days,
@@ -547,14 +557,18 @@ def calculate_rule_37_interest(
         "is_utilised": utilised > Decimal("0.00"),
         "statutory_basis": statutory_basis,
         "explanation": exp,
-        "source_ecl_transactions": ecl_transactions
+        "source_ecl_transactions": ecl_transactions,
+        "dual_assessment": dual_assessment
     }
 
 
 def simulate_sequential_ecl_cross_utilization(
-    opening_balances: Dict[str, Any],
-    output_liabilities: Dict[str, Any],
-    igst_offset_order: Any = "CGST_THEN_SGST"
+    opening_balances: Optional[Dict[str, Any]] = None,
+    output_liabilities: Optional[Dict[str, Any]] = None,
+    igst_offset_order: Any = "CGST_THEN_SGST",
+    itc_balances: Optional[Dict[str, Any]] = None,
+    tax_liabilities: Optional[Dict[str, Any]] = None,
+    igst_cross_utilization_order: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Simulates sequential tax liability offset and Electronic Credit Ledger (ECL) cross-utilization
@@ -581,15 +595,26 @@ def simulate_sequential_ecl_cross_utilization(
     4. Compensation Cess:
        - Can only be utilized towards payment of Cess liability. No cross-utilization permitted.
     """
-    b_igst = Decimal(str(opening_balances.get("igst") or 0))
-    b_cgst = Decimal(str(opening_balances.get("cgst") or 0))
-    b_sgst = Decimal(str(opening_balances.get("sgst") or 0))
-    b_cess = Decimal(str(opening_balances.get("cess") or 0))
+    # Normalize inputs
+    raw_balances = opening_balances or itc_balances or {}
+    raw_liabilities = output_liabilities or tax_liabilities or {}
+    offset_order = igst_cross_utilization_order or igst_offset_order or "CGST_THEN_SGST"
 
-    l_igst = Decimal(str(output_liabilities.get("igst") or 0))
-    l_cgst = Decimal(str(output_liabilities.get("cgst") or 0))
-    l_sgst = Decimal(str(output_liabilities.get("sgst") or 0))
-    l_cess = Decimal(str(output_liabilities.get("cess") or 0))
+    def get_val(d: Dict[str, Any], key: str) -> Decimal:
+        v = d.get(key.lower())
+        if v is None:
+            v = d.get(key.upper())
+        return Decimal(str(v or 0))
+
+    b_igst = get_val(raw_balances, "igst")
+    b_cgst = get_val(raw_balances, "cgst")
+    b_sgst = get_val(raw_balances, "sgst")
+    b_cess = get_val(raw_balances, "cess")
+
+    l_igst = get_val(raw_liabilities, "igst")
+    l_cgst = get_val(raw_liabilities, "cgst")
+    l_sgst = get_val(raw_liabilities, "sgst")
+    l_cess = get_val(raw_liabilities, "cess")
 
     rem_igst_bal = b_igst
     rem_cgst_bal = b_cgst
@@ -624,7 +649,7 @@ def simulate_sequential_ecl_cross_utilization(
     igst_used_for_sgst = Decimal("0.00")
 
     if rem_igst_bal > Decimal("0.00"):
-        if igst_offset_order == "EQUAL":
+        if offset_order == "EQUAL":
             half = (rem_igst_bal / Decimal("2.00")).quantize(Decimal("0.01"))
             igst_used_for_cgst = min(half, rem_cgst_liab)
             rem_igst_bal -= igst_used_for_cgst
@@ -633,7 +658,7 @@ def simulate_sequential_ecl_cross_utilization(
             igst_used_for_sgst = min(rem_igst_bal, rem_sgst_liab)
             rem_igst_bal -= igst_used_for_sgst
             rem_sgst_liab -= igst_used_for_sgst
-        elif igst_offset_order == "SGST_THEN_CGST":
+        elif offset_order == "SGST_THEN_CGST":
             igst_used_for_sgst = min(rem_igst_bal, rem_sgst_liab)
             rem_igst_bal -= igst_used_for_sgst
             rem_sgst_liab -= igst_used_for_sgst
@@ -641,7 +666,7 @@ def simulate_sequential_ecl_cross_utilization(
             igst_used_for_cgst = min(rem_igst_bal, rem_cgst_liab)
             rem_igst_bal -= igst_used_for_cgst
             rem_cgst_liab -= igst_used_for_cgst
-        elif isinstance(igst_offset_order, dict):
+        elif isinstance(offset_order, dict):
             cgst_req = Decimal(str(igst_offset_order.get("cgst") or 0))
             sgst_req = Decimal(str(igst_offset_order.get("sgst") or 0))
             igst_used_for_cgst = min(min(rem_igst_bal, cgst_req), rem_cgst_liab)
@@ -758,6 +783,18 @@ def simulate_sequential_ecl_cross_utilization(
             "remaining_cess_liability": rem_cess_liab
         })
 
+    tot_cash = rem_igst_liab + rem_cgst_liab + rem_sgst_liab + rem_cess_liab
+    tot_utilized = (
+        igst_used_for_igst + igst_used_for_cgst + igst_used_for_sgst +
+        cgst_used_for_cgst + cgst_used_for_igst + sgst_used_for_sgst +
+        sgst_used_for_igst + cess_used_for_cess
+    )
+
+    # Standardize debit history keys
+    for entry in debit_history:
+        entry["credit_head"] = entry.get("credit_head_used")
+        entry["liability_head"] = entry.get("liability_head_offset")
+
     return {
         "opening_balances": {"igst": b_igst, "cgst": b_cgst, "sgst": b_sgst, "cess": b_cess},
         "output_liabilities": {"igst": l_igst, "cgst": l_cgst, "sgst": l_sgst, "cess": l_cess},
@@ -770,11 +807,7 @@ def simulate_sequential_ecl_cross_utilization(
             "sgst_used_for_sgst": sgst_used_for_sgst,
             "sgst_used_for_igst": sgst_used_for_igst,
             "cess_used_for_cess": cess_used_for_cess,
-            "total_itc_utilized": (
-                igst_used_for_igst + igst_used_for_cgst + igst_used_for_sgst +
-                cgst_used_for_cgst + cgst_used_for_igst + sgst_used_for_sgst +
-                sgst_used_for_igst + cess_used_for_cess
-            )
+            "total_itc_utilized": tot_utilized
         },
         "closing_balances": {
             "igst": rem_igst_bal,
@@ -783,13 +816,27 @@ def simulate_sequential_ecl_cross_utilization(
             "cess": rem_cess_bal,
             "total": rem_igst_bal + rem_cgst_bal + rem_sgst_bal + rem_cess_bal
         },
+        "remaining_itc": {
+            "IGST": rem_igst_bal,
+            "CGST": rem_cgst_bal,
+            "SGST": rem_sgst_bal,
+            "CESS": rem_cess_bal
+        },
         "remaining_liabilities_payable_in_cash": {
             "igst": rem_igst_liab,
             "cgst": rem_cgst_liab,
             "sgst": rem_sgst_liab,
             "cess": rem_cess_liab,
-            "total": rem_igst_liab + rem_cgst_liab + rem_sgst_liab + rem_cess_liab
+            "total": tot_cash
         },
+        "net_cash_payable": {
+            "IGST": rem_igst_liab,
+            "CGST": rem_cgst_liab,
+            "SGST": rem_sgst_liab,
+            "CESS": rem_cess_liab
+        },
+        "total_cash_payable": tot_cash,
+        "total_itc_utilized": tot_utilized,
         "debit_history": debit_history,
         "rule_88a_exhaustion_satisfied": rule_88a_exhaustion_satisfied,
         "cross_head_double_counting_prevented": True,
