@@ -249,6 +249,25 @@ def generate_unified_financial_report(
         }
     }
 
+    # 6. Statutory ITC Accounting States Breakdown
+    state_rows = session.execute(
+        text("""
+        SELECT itc_accounting_state, COUNT(*) as cnt,
+               SUM(COALESCE(cgst_amount, 0) + COALESCE(sgst_amount, 0) + COALESCE(igst_amount, 0) + COALESCE(cess_amount, 0)) as total_tax
+        FROM public.purchase_documents
+        WHERE org_id = :org AND registration_id = :reg AND financial_period = :period
+        GROUP BY itc_accounting_state;
+        """),
+        {"org": org_id, "reg": registration_id, "period": return_period}
+    ).fetchall()
+    itc_accounting_states = {
+        r.itc_accounting_state: {
+            "count": r.cnt,
+            "total_tax": Decimal(str(r.total_tax))
+        }
+        for r in state_rows
+    }
+
     return {
         "registration_id": registration_id,
         "return_period": return_period,
@@ -262,9 +281,11 @@ def generate_unified_financial_report(
         "table_4b2_reclaimable_reversals": t4.total_itc_reversed_reclaimable_4b2,
         "table_4b2_receipt_reversals": t4.itc_reversed_sec_16_2_b_receipt,
         "table_4c_net_eligible_itc": t4.net_itc_available,
+        "calculated_net_itc_label": "calculated net ITC in this scenario, subject to all applicable statutory conditions and human review",
         "table_4d1_reclaimed_disclosure": t4.itc_reclaimed_earlier_reversal_4d1,
         "table_4d2_ineligible_disclosure": t4.ineligible_sec_16_4_and_pos_restrictions_4d2,
         "human_approved_itc": human_approved_itc,
+        "itc_accounting_states": itc_accounting_states,
         "outstanding_exceptions_count": len(exceptions),
         "exceptions_by_category": exceptions_by_cat,
         "tax_head_summary": tax_head_summary,

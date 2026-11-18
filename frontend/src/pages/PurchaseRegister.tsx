@@ -676,7 +676,7 @@ export const PurchaseRegister: React.FC = () => {
                 <span className="font-bold text-purple-900">First Proviso to Section 16(2)(b)</span>
               </div>
               <p className="text-purple-800 text-[11px] leading-relaxed">
-                Where goods against an invoice are received in lots or instalments, ITC is statutorily available <strong>only upon receipt of the final lot</strong>. Client override flags are strictly ignored; final status is computed exclusively from the immutable lot ledger.
+                Where goods against an invoice are received in lots or instalments, ITC is statutorily available <strong>only upon physical receipt of the final required lot and 100% of contracted quantity</strong>. Percentage approximations (e.g. 95%) and over-receipt tolerances are prohibited; final status is computed exclusively from the immutable lot ledger.
               </p>
               <div className="grid grid-cols-3 gap-2 pt-1 font-mono text-[11px]">
                 <div className="bg-white p-2 rounded border border-purple-100">

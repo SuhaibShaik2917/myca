@@ -503,7 +503,7 @@ export const ItcRiskDashboard: React.FC = () => {
         },
         {
           docNo: "SUP-2B-998",
-          docDate: "2026-11-20",
+          docDate: "2026-11-08",
           supplierGstin: "24AAACR1234K1ZA",
           supplierName: "Reliance Polymers Dist",
           taxable: "1,00,000.00",
@@ -1219,7 +1219,7 @@ export const ItcRiskDashboard: React.FC = () => {
           <div className="bg-emerald-50/70 p-3.5 rounded-lg border border-emerald-200 font-mono">
             <div className="text-[10px] uppercase font-sans text-emerald-800 font-semibold">Net Eligible ITC 4(C)</div>
             <div className="text-lg font-bold text-emerald-700 mt-1">₹3,36,600.00</div>
-            <div className="text-[10px] font-sans text-emerald-700 mt-0.5">Gross (₹4,82.5k) - Rev (₹1,45.9k)</div>
+            <div className="text-[10px] font-sans text-emerald-700 mt-0.5">Calculated net ITC in this scenario (₹3,36,600.00), subject to all applicable statutory conditions and human review</div>
           </div>
         </div>
 

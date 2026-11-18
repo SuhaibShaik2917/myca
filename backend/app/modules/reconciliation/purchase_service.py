@@ -19,6 +19,17 @@ class PurchaseStatusError(PurchaseServiceError):
     pass
 
 
+def _to_date(val: Any) -> Optional[date]:
+    if not val:
+        return None
+    if isinstance(val, date):
+        return val
+    try:
+        return datetime.strptime(str(val)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
 def create_purchase_document(
     session: Session,
     org_id: str,
@@ -72,6 +83,31 @@ def create_purchase_document(
     calc_igst = payload.igst_amount
     calc_cess = payload.cess_amount or Decimal("0.00")
     calc_total = payload.total_invoice_value
+
+    # Statutory Document & Receipt Date Validation (Reject impossible future dates)
+    doc_d = _to_date(payload.document_date)
+    if doc_d and doc_d > date.today():
+        raise PurchaseServiceError(f"Invoice/document date {payload.document_date} cannot be later than current date ({date.today()}).")
+
+    if payload.goods_receipt_date:
+        grn_d = _to_date(payload.goods_receipt_date)
+        if grn_d:
+            if grn_d > date.today():
+                raise PurchaseServiceError(f"Goods receipt date {payload.goods_receipt_date} cannot be later than current date ({date.today()}).")
+            if doc_d and grn_d < doc_d:
+                raise PurchaseServiceError(f"Goods receipt date {payload.goods_receipt_date} cannot precede invoice/document date ({payload.document_date}).")
+
+    if payload.service_completion_date:
+        sc_d = _to_date(payload.service_completion_date)
+        if sc_d:
+            if sc_d > date.today():
+                raise PurchaseServiceError(f"Service completion date {payload.service_completion_date} cannot be later than current date ({date.today()}).")
+            if doc_d and sc_d < doc_d:
+                raise PurchaseServiceError(f"Service completion date {payload.service_completion_date} cannot precede invoice/document date ({payload.document_date}).")
+
+    if payload.quantity_expected and payload.quantity_received:
+        if payload.quantity_received > payload.quantity_expected:
+            raise PurchaseServiceError(f"Over-receipt rejected: received quantity ({payload.quantity_received}) exceeds contracted order quantity ({payload.quantity_expected}).")
 
     if calc_taxable is None and payload.line_items:
         calc_taxable = sum((item.taxable_amount or Decimal("0.00")) for item in payload.line_items)
@@ -128,7 +164,7 @@ def create_purchase_document(
             delivery_challan_ref, service_completion_date, deemed_receipt_reason,
             total_lots_expected, lots_received_count, is_last_lot_received,
             quantity_expected, quantity_received, remaining_quantity,
-            service_acceptance_cert_ref
+            service_acceptance_cert_ref, itc_accounting_state
         ) VALUES (
             :id, :org_id, :registration_id, :document_type, :document_number,
             :document_date, :financial_period, :supplier_gstin, :supplier_legal_name,
@@ -140,7 +176,7 @@ def create_purchase_document(
             :delivery_challan_ref, :service_completion_date, :deemed_receipt_reason,
             :total_lots_expected, :lots_received_count, :is_last_lot_received,
             :quantity_expected, :quantity_received, :remaining_quantity,
-            :service_acceptance_cert_ref
+            :service_acceptance_cert_ref, 'NOT_YET_ELIGIBLE'
         ) RETURNING id, status, created_at;
         """),
         {
@@ -236,9 +272,11 @@ def approve_purchase_document(
 ) -> Dict[str, Any]:
     """
     Transitions purchase document to approved state after human review.
+    Updates itc_accounting_state to ELIGIBLE_NOT_AVAILED (or AVAILED if already availed)
+    if receipt conditions are met, otherwise keeps NOT_YET_ELIGIBLE.
     """
     row = session.execute(
-        text("SELECT id, status FROM public.purchase_documents WHERE id = :id AND org_id = :org_id;"),
+        text("SELECT id, status, receipt_status, is_availed_in_3b FROM public.purchase_documents WHERE id = :id AND org_id = :org_id;"),
         {"id": purchase_doc_id, "org_id": org_id}
     ).fetchone()
     if not row:
@@ -247,18 +285,25 @@ def approve_purchase_document(
     if row.status == "approved":
         return {"id": purchase_doc_id, "status": "approved", "message": "Already approved"}
 
+    # Determine itc_accounting_state upon human approval
+    if row.receipt_status in ("RECEIVED", "DEEMED_RECEIVED"):
+        new_itc_state = "AVAILED" if row.is_availed_in_3b else "ELIGIBLE_NOT_AVAILED"
+    else:
+        new_itc_state = "NOT_YET_ELIGIBLE"
+
     session.execute(
         text("""
         UPDATE public.purchase_documents
         SET status = 'approved',
             approved_by = :user_id,
             approved_at = clock_timestamp(),
+            itc_accounting_state = :itc_state,
             updated_at = clock_timestamp()
         WHERE id = :id AND org_id = :org_id;
         """),
-        {"id": purchase_doc_id, "org_id": org_id, "user_id": user_id}
+        {"id": purchase_doc_id, "org_id": org_id, "user_id": user_id, "itc_state": new_itc_state}
     )
-    return {"id": purchase_doc_id, "status": "approved", "approved_by": user_id}
+    return {"id": purchase_doc_id, "status": "approved", "approved_by": user_id, "itc_accounting_state": new_itc_state}
 
 
 def record_purchase_payment(

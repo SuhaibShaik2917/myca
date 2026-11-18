@@ -898,7 +898,8 @@ def update_receipt_evidence(
     doc = db.execute(
         text("""
         SELECT id, goods_services_type, receipt_status, total_lots_expected,
-               lots_received_count, is_last_lot_received, quantity_expected, quantity_received, remaining_quantity
+               lots_received_count, is_last_lot_received, quantity_expected, quantity_received, remaining_quantity,
+               document_date, status, is_availed_in_3b
         FROM public.purchase_documents
         WHERE id = :id AND org_id = :org;
         """),
@@ -917,7 +918,7 @@ def update_receipt_evidence(
 
     srv_type = (doc.goods_services_type or "goods").lower()
 
-    # 3. Evidence Validation Rules:
+    # 3. Evidence Validation Rules & Statutory Date Validations:
     if status_val == "RECEIVED":
         if srv_type == "services":
             sc_dt = payload.get("service_completion_date")
@@ -926,6 +927,17 @@ def update_receipt_evidence(
                 raise HTTPException(
                     status_code=400,
                     detail="Statutory Violation: Service receipt verification requires both service_completion_date and service_acceptance_cert_ref under Section 16(2)(b)."
+                )
+            sc_d = datetime.strptime(str(sc_dt)[:10], "%Y-%m-%d").date()
+            if sc_d > date.today():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Future service completion date rejected: service_completion_date {sc_dt} cannot be later than current date ({date.today()})."
+                )
+            if doc.document_date and sc_d < doc.document_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Service completion date {sc_dt} cannot precede invoice/document date ({doc.document_date})."
                 )
         else:
             # Goods, Capital Goods, Both
@@ -936,16 +948,34 @@ def update_receipt_evidence(
                     status_code=400,
                     detail="Statutory Violation: Goods receipt verification requires goods_receipt_date and either goods_receipt_note_ref or delivery_challan_ref under Section 16(2)(b)."
                 )
-
-            # Section 16(2)(b) First Proviso: Last-Lot Rule
-            total_lots = doc.total_lots_expected or 1
-            is_last = payload.get("is_last_lot", False) or payload.get("is_last_lot_received", False)
-            rem_qty = payload.get("remaining_quantity")
-            if total_lots > 1 and not is_last and (rem_qty is not None and Decimal(str(rem_qty)) > Decimal("0.00")):
+            grn_d = datetime.strptime(str(grn_dt)[:10], "%Y-%m-%d").date()
+            if grn_d > date.today():
                 raise HTTPException(
                     status_code=400,
-                    detail="Section 16(2)(b) First Proviso: Where goods against an invoice are received in lots or instalments, ITC can only be availed upon receipt of the last lot. Status must remain PARTIALLY_RECEIVED until the final lot is received."
+                    detail=f"Future receipt date rejected: goods_receipt_date {grn_dt} cannot be later than current date ({date.today()})."
                 )
+            if doc.document_date and grn_d < doc.document_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Goods receipt date {grn_dt} cannot precede invoice/document date ({doc.document_date})."
+                )
+
+            # Section 16(2)(b) First Proviso: Inward goods in lots cannot be marked RECEIVED directly
+            total_lots = doc.total_lots_expected or 1
+            if total_lots > 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Section 16(2)(b) First Proviso: Where goods against an invoice are received in lots or instalments, ITC can only be availed upon receipt of the last lot. Status must remain PARTIALLY_RECEIVED until the final lot is received and recorded through the lot ledger."
+                )
+
+            # Strict over-receipt validation
+            if doc.quantity_expected and payload.get("quantity_received"):
+                rec_q = Decimal(str(payload["quantity_received"]))
+                if rec_q > doc.quantity_expected:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Over-receipt rejected: received quantity ({rec_q}) exceeds expected contracted quantity ({doc.quantity_expected}). Excess receipts must be quarantined with an authorized PO amendment."
+                    )
 
     elif status_val == "DEEMED_RECEIVED":
         d_reason = payload.get("deemed_receipt_reason") or payload.get("deemed_receipt_legal_basis")
@@ -957,6 +987,14 @@ def update_receipt_evidence(
 
     now_ts = datetime.utcnow()
     is_last_flag = bool(payload.get("is_last_lot") or payload.get("is_last_lot_received") or (status_val == "RECEIVED"))
+
+    # Derive statutory ITC accounting state
+    is_doc_approved = (getattr(doc, "status", None) == "approved")
+    is_doc_availed = bool(getattr(doc, "is_availed_in_3b", False))
+    if status_val in ("RECEIVED", "DEEMED_RECEIVED"):
+        new_itc_state = "AVAILED" if (is_doc_approved and is_doc_availed) else ("ELIGIBLE_NOT_AVAILED" if is_doc_approved else "NOT_YET_ELIGIBLE")
+    else:
+        new_itc_state = "NOT_YET_ELIGIBLE"
 
     row = db.execute(
         text("""
@@ -973,11 +1011,12 @@ def update_receipt_evidence(
             is_last_lot_received = :is_last,
             receipt_verified_by = :uid,
             receipt_verified_at = :ts,
+            itc_accounting_state = :new_st,
             updated_at = :ts
         WHERE id = :id AND org_id = :org
         RETURNING id, receipt_status, goods_receipt_date, goods_receipt_note_ref,
                   delivery_challan_ref, service_completion_date, service_acceptance_cert_ref,
-                  is_last_lot_received, remaining_quantity;
+                  is_last_lot_received, remaining_quantity, itc_accounting_state;
         """),
         {
             "st": status_val,
@@ -992,6 +1031,7 @@ def update_receipt_evidence(
             "is_last": is_last_flag,
             "uid": x_user_id,
             "ts": now_ts,
+            "new_st": new_itc_state,
             "id": id,
             "org": x_org_id
         }
@@ -1619,13 +1659,16 @@ def record_itc_ledger_event(
     total_event_tax = payload.cgst_amount + payload.sgst_amount + payload.igst_amount + payload.cess_amount
     now_ts = datetime.utcnow()
     rev_event_id = payload.reversal_event_id
+    itc_state = p_doc.get("itc_accounting_state") or "NOT_YET_ELIGIBLE"
 
     if payload.event_type == "AVAIL":
+        itc_state = "AVAILED"
         db.execute(
             text("""
             UPDATE public.purchase_documents
             SET is_availed_in_3b = true,
                 availed_period = :rp,
+                itc_accounting_state = 'AVAILED',
                 updated_at = :ts
             WHERE id = :id AND org_id = :org;
             """),
@@ -1633,10 +1676,10 @@ def record_itc_ledger_event(
         )
 
     elif payload.event_type.startswith("REVERSAL_"):
-        if payload.event_type != "REVERSAL_SECTION_16_2_B" and not p_doc.get("is_availed_in_3b"):
+        if not p_doc.get("is_availed_in_3b"):
             raise HTTPException(
                 status_code=400,
-                detail="Statutory Violation: Cannot record reversal for an invoice that has not been availed in GSTR-3B."
+                detail="Statutory Accounting Violation: Cannot record reversal for an invoice that has not been availed in GSTR-3B. An unreceived or partially received inward supply must remain in NOT_YET_ELIGIBLE status without generating an accounting reversal event."
             )
 
         if payload.event_type == "REVERSAL_RULE_37" and p_doc.get("is_reverse_charge"):
@@ -1700,6 +1743,16 @@ def record_itc_ledger_event(
             }
         )
         rev_event_id = rev_id
+        itc_state = "REVERSED" if payload.event_type in ("REVERSAL_PERMANENT_17_5", "REVERSAL_RULE_38", "REVERSAL_RULE_42_43") else "RECLAIMABLE"
+        db.execute(
+            text("""
+            UPDATE public.purchase_documents
+            SET itc_accounting_state = :st,
+                updated_at = :ts
+            WHERE id = :id AND org_id = :org;
+            """),
+            {"id": p_doc["id"], "org": x_org_id, "st": itc_state, "ts": now_ts}
+        )
 
     elif payload.event_type == "RECLAIM":
         if not payload.reversal_event_id:
@@ -1768,6 +1821,16 @@ def record_itc_ledger_event(
                 "ts": now_ts
             }
         )
+        itc_state = "RECLAIMED"
+        db.execute(
+            text("""
+            UPDATE public.purchase_documents
+            SET itc_accounting_state = 'RECLAIMED',
+                updated_at = :ts
+            WHERE id = :id AND org_id = :org;
+            """),
+            {"id": p_doc["id"], "org": x_org_id, "ts": now_ts}
+        )
 
     entry_id = str(uuid.uuid4())
     prov = payload.provenance or {
@@ -1783,12 +1846,12 @@ def record_itc_ledger_event(
             id, org_id, purchase_doc_id, gstr2b_doc_id, event_type,
             tax_period, cgst_amount, sgst_amount, igst_amount, cess_amount,
             total_tax, reversal_event_id, interest_amount, interest_basis,
-            provenance, created_at
+            provenance, itc_accounting_state, created_at
         ) VALUES (
             :id, :org, :pid, :gid, :etype,
             :rp, :cgst, :sgst, :igst, :cess,
             :tot, :rev_id, :interest, :int_basis,
-            :prov, :ts
+            :prov, :itc_st, :ts
         );
         """),
         {
@@ -1807,6 +1870,7 @@ def record_itc_ledger_event(
             "interest": payload.interest_amount,
             "int_basis": payload.interest_basis,
             "prov": json.dumps(prov),
+            "itc_st": itc_state,
             "ts": now_ts
         }
     )
@@ -2139,6 +2203,13 @@ def verify_unbooked_candidate_receipt(
     """
     Attaches GRN / delivery proof or service completion evidence to an unbooked candidate.
     """
+    cand = db.execute(
+        text("SELECT id, document_date FROM public.gstr2b_unbooked_candidates WHERE id = :id AND org_id = :org;"),
+        {"id": id, "org": x_org_id}
+    ).fetchone()
+    if not cand:
+        raise HTTPException(status_code=404, detail="Unbooked candidate not found")
+
     status_val = (payload.get("receipt_status") or "RECEIVED").upper()
     valid_statuses = ("RECEIVED", "PARTIALLY_RECEIVED", "NOT_RECEIVED", "DEEMED_RECEIVED", "UNKNOWN")
     if status_val not in valid_statuses:
@@ -2146,6 +2217,21 @@ def verify_unbooked_candidate_receipt(
             status_code=400,
             detail=f"Invalid receipt_status '{status_val}'. Must be one of {valid_statuses}."
         )
+
+    # Date validations
+    grn_dt_val = payload.get("goods_receipt_date") or payload.get("service_completion_date")
+    if grn_dt_val:
+        rec_d = datetime.strptime(str(grn_dt_val)[:10], "%Y-%m-%d").date()
+        if rec_d > date.today():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Future receipt date rejected: receipt date {grn_dt_val} cannot be later than current date ({date.today()})."
+            )
+        if cand.document_date and rec_d < cand.document_date:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Receipt date {grn_dt_val} cannot precede candidate document date ({cand.document_date})."
+            )
 
     # Require evidence for RECEIVED
     if status_val == "RECEIVED":
@@ -2241,7 +2327,7 @@ def book_unbooked_candidate_entry(
             total_invoice_value, goods_services_type, goods_receipt_date,
             goods_receipt_note_ref, delivery_challan_ref, service_completion_date,
             service_acceptance_cert_ref, deemed_receipt_reason, receipt_status,
-            purchase_ledger_code, status, created_at, updated_at
+            purchase_ledger_code, status, itc_accounting_state, created_at, updated_at
         ) VALUES (
             :id, :org, :reg_id, 'tax_invoice', :doc_num,
             :doc_dt, :period, :supp_gstin, :supp_name,
@@ -2250,7 +2336,7 @@ def book_unbooked_candidate_entry(
             :total_val, 'goods', :grn_dt,
             :grn_ref, :dc_ref, :sc_dt,
             :sc_cert, :d_reason, :r_st,
-            :ledger_code, 'draft', :ts, :ts
+            :ledger_code, 'draft', 'NOT_YET_ELIGIBLE', :ts, :ts
         );
         """),
         {

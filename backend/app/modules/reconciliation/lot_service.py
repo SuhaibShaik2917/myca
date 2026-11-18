@@ -9,13 +9,24 @@ Enforces Section 16(2)(b) First Proviso statutory last-lot condition:
 import uuid
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, date
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from fastapi import HTTPException
 
 from app.modules.reconciliation.schemas import LotLedgerEntryCreate, LotLedgerEntryOut
+
+
+def _to_date(val: Any) -> Optional[date]:
+    if not val:
+        return None
+    if isinstance(val, date):
+        return val
+    try:
+        return datetime.strptime(str(val)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
 
 
 def record_lot_to_ledger(
@@ -36,7 +47,7 @@ def record_lot_to_ledger(
         text("""
         SELECT id, goods_services_type, total_lots_expected, lots_received_count,
                quantity_expected, quantity_received, remaining_quantity,
-               receipt_status, is_last_lot_received
+               receipt_status, is_last_lot_received, document_date, status, is_availed_in_3b
         FROM public.purchase_documents
         WHERE id = :id AND org_id = :org
         FOR UPDATE;
@@ -52,6 +63,20 @@ def record_lot_to_ledger(
         raise HTTPException(
             status_code=400,
             detail="Lot delivery tracking applies exclusively to goods. Inward services require completion date and acceptance certificate."
+        )
+
+    # Date validation: receipt date cannot be in the future or precede document date
+    rcpt_d = _to_date(payload.receipt_date)
+    if rcpt_d and rcpt_d > date.today():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Future receipt date rejected: receipt date {payload.receipt_date} cannot be later than current date ({date.today()})."
+        )
+    doc_d = _to_date(doc.document_date)
+    if doc_d and rcpt_d and rcpt_d < doc_d:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Receipt date {payload.receipt_date} cannot precede invoice/document date ({doc.document_date})."
         )
 
     expected_lots = payload.expected_lots_count or doc.total_lots_expected or 1
@@ -96,29 +121,37 @@ def record_lot_to_ledger(
             detail=f"Lot number {payload.lot_number} exceeds total expected lots ({expected_lots})."
         )
 
-    # 5. Quantity calculations & Over-receipt validation
+    # 5. Quantity calculations & Strict Over-receipt validation (No unsafe tolerances)
     cumulative_qty = sum(Decimal(str(l.received_quantity)) for l in existing_lots) + payload.received_quantity
 
-    if expected_qty > Decimal("0.00"):
-        max_tolerable = expected_qty * Decimal("1.10")  # 10% maximum allowable commercial over-receipt
-        if cumulative_qty > max_tolerable:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Over-receipt rejected: cumulative received quantity {cumulative_qty} exceeds expected order quantity {expected_qty} beyond allowable tolerance."
-            )
+    if expected_qty > Decimal("0.00") and cumulative_qty > expected_qty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Over-receipt rejected: cumulative received quantity ({cumulative_qty}) exceeds contracted order/invoice quantity ({expected_qty}). Excess unamended receipts are rejected and must be quarantined with an authorized PO amendment."
+        )
 
     remaining_qty = max(Decimal("0.00"), expected_qty - cumulative_qty) if expected_qty > Decimal("0.00") else Decimal("0.00")
 
     # 6. Database-derived Last-Lot Determination (Section 16(2)(b) First Proviso)
-    # The document achieves FULL receipt IF AND ONLY IF:
-    # - Lot number equals expected total lots, AND
-    # - Cumulative received quantity meets at least 95% of expected quantity (if expected quantity is set)
+    # Full receipt is achieved IF AND ONLY IF:
+    # - Lot number equals expected total lots (physical receipt of the actual final lot), AND
+    # - 100% of contracted quantity has been delivered (cumulative_qty >= expected_qty).
+    # Releasing ITC at 94%, 95%, or 99% is statutorily prohibited.
     is_final_lot = (payload.lot_number == expected_lots)
-    if expected_qty > Decimal("0.00") and cumulative_qty < (expected_qty * Decimal("0.95")):
-        # If order quantity is still significantly incomplete, do not finalize even if lot count matches
+    if expected_qty > Decimal("0.00") and cumulative_qty < expected_qty:
         is_final_lot = False
 
     derived_receipt_status = "RECEIVED" if is_final_lot else "PARTIALLY_RECEIVED"
+
+    # Derive statutory ITC accounting state
+    is_doc_approved = (getattr(doc, "status", None) == "approved")
+    is_doc_availed = bool(getattr(doc, "is_availed_in_3b", False))
+    if is_final_lot and is_doc_approved and is_doc_availed:
+        new_itc_state = "AVAILED"
+    elif is_final_lot and is_doc_approved:
+        new_itc_state = "ELIGIBLE_NOT_AVAILED"
+    else:
+        new_itc_state = "NOT_YET_ELIGIBLE"
 
     # 7. Insert immutable entry into public.goods_receipt_lot_ledger
     lot_id = str(uuid.uuid4())
@@ -164,7 +197,7 @@ def record_lot_to_ledger(
         }
     )
 
-    # 8. Update parent purchase_documents with derived state
+    # 8. Update parent purchase_documents with derived state and statutory accounting state
     session.execute(
         text("""
         UPDATE public.purchase_documents
@@ -179,6 +212,7 @@ def record_lot_to_ledger(
             goods_receipt_date = :rcpt_dt,
             receipt_verified_by = :uid,
             receipt_verified_at = :ts,
+            itc_accounting_state = :new_st,
             updated_at = :ts
         WHERE id = :pid AND org_id = :org;
         """),
@@ -194,6 +228,7 @@ def record_lot_to_ledger(
             "rcpt_dt": payload.receipt_date,
             "uid": user_id,
             "ts": now_ts,
+            "new_st": new_itc_state,
             "pid": purchase_doc_id,
             "org": org_id
         }
@@ -211,6 +246,7 @@ def record_lot_to_ledger(
         "is_last_lot_received": is_final_lot,
         "lots_received_count": payload.lot_number,
         "receipt_status": derived_receipt_status,
+        "itc_accounting_state": new_itc_state,
         "section_16_2_b_proviso_condition_met": is_final_lot,
         "verified_at": now_ts.isoformat()
     }

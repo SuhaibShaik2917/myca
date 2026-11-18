@@ -518,7 +518,7 @@ def test_goods_received_in_multiple_lots_last_lot_rule(setup_m2_6_tenant):
         json={
             "lot_number": 3,
             "delivery_challan_ref": "DC-LOT-03-FINAL",
-            "receipt_date": "2026-11-20",
+            "receipt_date": "2026-11-15",
             "quantity_received": "300.00",
             "remaining_quantity": "0.00",
             "is_last_lot": True
@@ -737,7 +737,7 @@ def test_unbooked_candidate_review_and_booking_workflow(setup_m2_6_tenant):
                     document_date, taxable_value, integrated_tax, place_of_supply
                 ) VALUES (%s, %s, %s, 'B2B', 'available', 'GSTR-1',
                           '24AAACR1234K1ZA', 'Reliance Polymers Dist', 'invoice', 'SUP-2B-998',
-                          '2026-11-20', 100000.00, 18000.00, '27');
+                          '2026-11-08', 100000.00, 18000.00, '27');
             """, (g_doc_id, ctx["org_id"], snap_id))
 
     # 1. Fetch unbooked candidates endpoint
@@ -757,7 +757,7 @@ def test_unbooked_candidate_review_and_booking_workflow(setup_m2_6_tenant):
         json={
             "receipt_status": "RECEIVED",
             "goods_receipt_note_ref": "GRN-REL-998",
-            "goods_receipt_date": "2026-11-25"
+            "goods_receipt_date": "2026-11-12"
         }
     )
     assert resp_ver.status_code == 200
