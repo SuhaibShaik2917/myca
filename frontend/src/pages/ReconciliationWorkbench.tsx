@@ -210,22 +210,6 @@ export const ReconciliationWorkbench: React.FC = () => {
             />
             <span className="text-slate-400">₹</span>
           </div>
-        </div>
-              onChange={e => setToleranceTax(e.target.value)}
-              className="w-16 px-2 py-1 border border-slate-300 rounded font-mono text-center"
-            />
-            <span className="text-slate-400">₹</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <label className="text-slate-600">Total Invoice Value:</label>
-            <input
-              type="text"
-              value={toleranceTotal}
-              onChange={e => setToleranceTotal(e.target.value)}
-              className="w-16 px-2 py-1 border border-slate-300 rounded font-mono text-center"
-            />
-            <span className="text-slate-400">₹</span>
-          </div>
           <span className="text-[11px] text-slate-500 italic ml-auto">
             Pass 1 (Exact) → Pass 2 (Amendments) → Pass 3 (Tolerances) → Pass 4 (Controlled Near-Match)
           </span>
@@ -353,6 +337,77 @@ export const ReconciliationWorkbench: React.FC = () => {
               ))}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      {/* Audit Trail & Reviewer Comments */}
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-4">
+        <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+              <ShieldAlert className="w-4 h-4 text-emerald-600" />
+              Statutory Resolution Audit Trail & Reviewer Governance
+            </h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Immutable log of auditor decisions, justification comments, and manual reconciliation overrides.
+            </p>
+          </div>
+          <span className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full font-medium">
+            3 Audited Actions
+          </span>
+        </div>
+
+        <div className="divide-y divide-slate-100 text-xs">
+          <div className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-slate-900 font-mono">INV-2026-101</span>
+                <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded text-[10px] font-semibold">
+                  FORCE_MATCH
+                </span>
+                <span className="text-slate-400">•</span>
+                <span className="text-slate-600 font-medium">CA Rahul Sharma</span>
+              </div>
+              <p className="text-slate-600 text-[11px] mt-1 font-sans">
+                "Prefix format variance verified with supplier confirmation email dated 2026-11-05. Physical delivery challan matched."
+              </p>
+            </div>
+            <span className="text-slate-400 font-mono text-[10px] shrink-0">2026-11-15 14:22 UTC</span>
+          </div>
+
+          <div className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-slate-900 font-mono">AMD/9912</span>
+                <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded text-[10px] font-semibold">
+                  ACCEPT_PORTAL_FIGURE
+                </span>
+                <span className="text-slate-400">•</span>
+                <span className="text-slate-600 font-medium">Priya Patel (Tax Lead)</span>
+              </div>
+              <p className="text-slate-600 text-[11px] mt-1 font-sans">
+                "Supplier filed GSTR-1 amendment in Nov 2026 matching updated PO #4412. Inward register updated accordingly."
+              </p>
+            </div>
+            <span className="text-slate-400 font-mono text-[10px] shrink-0">2026-11-15 15:40 UTC</span>
+          </div>
+
+          <div className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-slate-900 font-mono">DEL-881</span>
+                <span className="px-2 py-0.5 bg-cyan-50 text-cyan-700 border border-cyan-200 rounded text-[10px] font-semibold">
+                  ACCEPT_BOOK_FIGURE
+                </span>
+                <span className="text-slate-400">•</span>
+                <span className="text-slate-600 font-medium">Priya Patel (Tax Lead)</span>
+              </div>
+              <p className="text-slate-600 text-[11px] mt-1 font-sans">
+                "Rounding variance of ₹0.11 within statutory tolerance threshold of ₹1.00. Approved under Pass 3."
+              </p>
+            </div>
+            <span className="text-slate-400 font-mono text-[10px] shrink-0">2026-11-16 09:12 UTC</span>
+          </div>
         </div>
       </div>
 

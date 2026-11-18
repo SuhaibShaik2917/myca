@@ -38,8 +38,9 @@ def upgrade() -> None:
         SELECT pan INTO v_pan FROM public.organizations WHERE id = NEW.org_id;
         IF v_pan IS NOT NULL AND v_pan <> '' THEN
             IF substring(NEW.gstin FROM 3 FOR 10) <> v_pan THEN
-                RAISE EXCEPTION 'GSTIN % PAN % does not match Organization PAN % (42501)',
-                    NEW.gstin, substring(NEW.gstin FROM 3 FOR 10), v_pan;
+                RAISE EXCEPTION 'GSTIN % PAN % does not match Organization PAN %',
+                    NEW.gstin, substring(NEW.gstin FROM 3 FOR 10), v_pan
+                    USING ERRCODE = '23514';
             END IF;
         END IF;
         RETURN NEW;

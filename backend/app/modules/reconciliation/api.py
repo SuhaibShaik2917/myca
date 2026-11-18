@@ -16,7 +16,8 @@ from app.modules.reconciliation.schemas import (
     MatchDetailOut, VarianceDetailOut, MatchCategoryEnum, ITCAssessmentOut,
     HumanResolutionRequest, HumanResolutionResponse, PurchasePaymentRequest,
     GSTR3BTable4WorkingOutput, ITCRiskEvaluateRequest,
-    GSTRegistrationCreate, GSTRegistrationOut, GSTR2BRecomputeRequest, GSTR2BRecomputeResponse
+    GSTRegistrationCreate, GSTRegistrationOut, GSTR2BRecomputeRequest, GSTR2BRecomputeResponse,
+    ITCLedgerEventCreate, ITCLedgerEntryOut, ITCLedgerSummaryOut, IMSActionHistoryOut, ComponentTaxAmount
 )
 from app.modules.reconciliation.gstr2b_parser import parse_gstr2b_json, parse_gstr2b_excel
 from app.modules.reconciliation.purchase_service import (
@@ -539,6 +540,28 @@ def set_ims_action(
             "user_id": x_user_id
         }
     )
+
+    # Immutable Audit Log in IMS Action History
+    db.execute(
+        text("""
+        INSERT INTO public.ims_action_history (
+            id, org_id, ims_action_id, previous_action, new_action,
+            action_reason, actor_id, created_at
+        ) VALUES (
+            :id, :org, :ims_id, :prev, :new, :reason, :actor, :ts
+        );
+        """),
+        {
+            "id": str(uuid.uuid4()),
+            "org": x_org_id,
+            "ims_id": ims_row.id,
+            "prev": prev_action,
+            "new": payload.action.value,
+            "reason": payload.reason or "Taxpayer action change in IMS",
+            "actor": x_user_id,
+            "ts": now_ts
+        }
+    )
     db.commit()
 
     return IMSActionResponse(
@@ -700,14 +723,23 @@ def recompute_gstr2b(
 def freeze_ims_on_gstr3b_filing(
     registration_id: str = Query(...),
     return_period: str = Query(...),
+    filing_status: str = Query("FILED", description="Must be confirmed FILED; drafts or submitted attempts do not freeze IMS"),
+    filing_arn: Optional[str] = Query(None, description="GSTN Application Reference Number / Acknowledgement"),
     x_user_id: str = Header(..., alias="X-User-Id"),
     x_org_id: str = Header(..., alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
-    Freezes all IMS actions for a specific registration and return period upon GSTR-3B filing.
+    Freezes all IMS actions and GSTR-2B snapshots for a specific registration and return period upon confirmed GSTR-3B filing.
     Prevents any further action modification or GSTR-2B recomputation.
+    Rejects freeze if filing_status is not 'FILED'.
     """
+    if filing_status.upper() != "FILED":
+        raise HTTPException(
+            status_code=400,
+            detail="Freeze rejected: IMS actions can only be frozen upon confirmed filing (filing_status 'FILED'). Draft or pending submission status does not freeze IMS actions."
+        )
+
     now_ts = datetime.utcnow()
     res = db.execute(
         text("""
@@ -719,10 +751,23 @@ def freeze_ims_on_gstr3b_filing(
         """),
         {"org": x_org_id, "rp": return_period, "ts": now_ts}
     )
+
+    db.execute(
+        text("""
+        UPDATE public.gstr2b_snapshots
+        SET is_frozen = true,
+            filing_confirmation_arn = :arn,
+            filed_at = :ts
+        WHERE org_id = :org AND return_period = :rp AND is_active = true;
+        """),
+        {"org": x_org_id, "rp": return_period, "arn": filing_arn, "ts": now_ts}
+    )
     db.commit()
     return {
         "status": "frozen",
         "return_period": return_period,
+        "filing_status": "FILED",
+        "filing_arn": filing_arn,
         "frozen_timestamp": now_ts.isoformat(),
         "rows_affected": res.rowcount
     }
@@ -1243,6 +1288,18 @@ def get_gstr3b_table4_summary(
     ).fetchall()
     reclaims = [dict(r._mapping) for r in rec_rows]
 
+    # 8. Reversals Ledger Events
+    rev_rows = db.execute(
+        text("""
+        SELECT r.*
+        FROM public.itc_reversal_events r
+        JOIN public.purchase_documents p ON r.purchase_doc_id = p.id AND r.org_id = p.org_id
+        WHERE p.registration_id = :reg_id AND r.reversal_period = :rp AND r.org_id = :org;
+        """),
+        {"reg_id": registration_id, "rp": return_period, "org": x_org_id}
+    ).fetchall()
+    reversals_ledger = [dict(r._mapping) for r in rev_rows]
+
     return generate_gstr3b_table4_summary(
         return_period=return_period,
         recipient_gstin=reg_row.gstin,
@@ -1251,7 +1308,8 @@ def get_gstr3b_table4_summary(
         matches=matches,
         assessments=assessments,
         human_approved_ids=approved_set,
-        reclaims=reclaims
+        reclaims=reclaims,
+        reversals_ledger=reversals_ledger
     )
 
 
@@ -1279,3 +1337,448 @@ def avail_purchase_document_in_3b(
     )
     db.commit()
     return res
+
+
+# -----------------------------------------------------------------------------
+# 9. Traceable Event-Based ITC Ledger (Availment, Reversals & Reclaims)
+# -----------------------------------------------------------------------------
+
+@router.post("/itc-ledger/record-event", response_model=ITCLedgerEntryOut)
+def record_itc_ledger_event(
+    payload: ITCLedgerEventCreate,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Records an immutable, event-based ITC lifecycle event (AVAIL, REVERSAL_*, RECLAIM).
+    Enforces statutory accounting rules:
+    - Reversals require that the document was actually availed in GSTR-3B (Section 16(2) / Rule 37A).
+    - Reverse charge supplies cannot be reversed under Rule 37 (Section 16(2) 2nd proviso).
+    - No duplicate reversal for the same rule/document in the same period.
+    - Reclaims cannot exceed previously reversed amounts.
+    - Permanent Section 17(5) and Rule 38 credit cannot be reavailed.
+    - Reclaim must reference an existing reversal event.
+    """
+    p_row = db.execute(
+        text("SELECT * FROM public.purchase_documents WHERE id = :id AND org_id = :org;"),
+        {"id": payload.purchase_doc_id, "org": x_org_id}
+    ).fetchone()
+    if not p_row:
+        raise HTTPException(status_code=404, detail="Purchase document not found")
+    p_doc = dict(p_row._mapping)
+
+    total_event_tax = payload.cgst_amount + payload.sgst_amount + payload.igst_amount + payload.cess_amount
+    now_ts = datetime.utcnow()
+    rev_event_id = payload.reversal_event_id
+
+    if payload.event_type == "AVAIL":
+        db.execute(
+            text("""
+            UPDATE public.purchase_documents
+            SET is_availed_in_3b = true,
+                availed_period = :rp,
+                updated_at = :ts
+            WHERE id = :id AND org_id = :org;
+            """),
+            {"id": p_doc["id"], "org": x_org_id, "rp": payload.tax_period, "ts": now_ts}
+        )
+
+    elif payload.event_type.startswith("REVERSAL_"):
+        if not p_doc.get("is_availed_in_3b"):
+            raise HTTPException(
+                status_code=400,
+                detail="Statutory Violation: Cannot record reversal for an invoice that has not been availed in GSTR-3B."
+            )
+
+        if payload.event_type == "REVERSAL_RULE_37" and p_doc.get("is_reverse_charge"):
+            raise HTTPException(
+                status_code=400,
+                detail="Statutory Violation: Reverse-charge supplies are explicitly excluded from 180-day payment reversals under Section 16(2) second proviso."
+            )
+
+        dup_rev = db.execute(
+            text("""
+            SELECT id FROM public.itc_ledger_entries
+            WHERE purchase_doc_id = :pid AND event_type = :etype AND tax_period = :rp AND org_id = :org;
+            """),
+            {"pid": p_doc["id"], "etype": payload.event_type, "rp": payload.tax_period, "org": x_org_id}
+        ).fetchone()
+        if dup_rev:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate reversal rejected: {payload.event_type} already recorded for period {payload.tax_period}."
+            )
+
+        rule_map = {
+            "REVERSAL_RULE_37": "RULE_37_180_DAYS",
+            "REVERSAL_RULE_37A": "RULE_37A_NON_FILING",
+            "REVERSAL_PERMANENT_17_5": "SEC_17_5_MOTOR",
+            "REVERSAL_RULE_38": "RULE_38",
+            "REVERSAL_RULE_42_43": "RULE_42",
+            "REVERSAL_OTHER_TEMP": "SEC_16_4"
+        }
+        r_code = rule_map.get(payload.event_type, "RULE_37_180_DAYS")
+
+        rev_id = str(uuid.uuid4())
+        db.execute(
+            text("""
+            INSERT INTO public.itc_reversal_events (
+                id, org_id, purchase_doc_id, rule_code, reversal_reason,
+                reversal_period, reversed_taxable, reversed_cgst, reversed_sgst,
+                reversed_igst, reversed_cess, interest_liability, interest_basis, created_at
+            ) VALUES (
+                :id, :org, :pid, :rule, :reason,
+                :rp, :taxable, :cgst, :sgst,
+                :igst, :cess, :interest, :int_basis, :ts
+            );
+            """),
+            {
+                "id": rev_id,
+                "org": x_org_id,
+                "pid": p_doc["id"],
+                "rule": r_code,
+                "reason": payload.reversal_reason or f"Reversal under {payload.event_type}",
+                "rp": payload.tax_period,
+                "taxable": Decimal("0.00"),
+                "cgst": payload.cgst_amount,
+                "sgst": payload.sgst_amount,
+                "igst": payload.igst_amount,
+                "cess": payload.cess_amount,
+                "interest": payload.interest_amount,
+                "int_basis": payload.interest_basis or "Section 50(3) conditional on utilization",
+                "ts": now_ts
+            }
+        )
+        rev_event_id = rev_id
+
+    elif payload.event_type == "RECLAIM":
+        if not payload.reversal_event_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Reclaim must reference original reversal_event_id."
+            )
+
+        orig_rev = db.execute(
+            text("SELECT * FROM public.itc_reversal_events WHERE id = :id AND org_id = :org;"),
+            {"id": payload.reversal_event_id, "org": x_org_id}
+        ).fetchone()
+        if not orig_rev:
+            raise HTTPException(status_code=404, detail="Referenced reversal event not found.")
+
+        rule_code = orig_rev.rule_code or ""
+        if rule_code.startswith("SEC_17_5") or rule_code in ("RULE_38", "RULE_42", "RULE_43"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Statutory Reclaim Prohibited: Reversal under {rule_code} is permanent and non-reclaimable."
+            )
+
+        tot_rev = Decimal(str(
+            (orig_rev.reversed_cgst or 0) + (orig_rev.reversed_sgst or 0) +
+            (orig_rev.reversed_igst or 0) + (orig_rev.reversed_cess or 0)
+        ))
+        already_reavailed = db.execute(
+            text("""
+            SELECT COALESCE(SUM(reavailed_cgst + reavailed_sgst + reavailed_igst + reavailed_cess), 0) as tot
+            FROM public.itc_reavailment_events
+            WHERE reversal_event_id = :rev_id AND org_id = :org;
+            """),
+            {"rev_id": payload.reversal_event_id, "org": x_org_id}
+        ).scalar() or Decimal("0.00")
+
+        if Decimal(str(already_reavailed)) + total_event_tax > tot_rev:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Reclaim bounds exceeded: Cumulative reclaims (₹{already_reavailed + total_event_tax}) cannot exceed original reversal (₹{tot_rev})."
+            )
+
+        reclaim_id = str(uuid.uuid4())
+        db.execute(
+            text("""
+            INSERT INTO public.itc_reavailment_events (
+                id, org_id, purchase_doc_id, reversal_event_id, reavailment_period,
+                reavailed_cgst, reavailed_sgst, reavailed_igst, reavailed_cess,
+                reavailment_reason, created_at
+            ) VALUES (
+                :id, :org, :pid, :rev_id, :rp,
+                :cgst, :sgst, :igst, :cess,
+                :reason, :ts
+            );
+            """),
+            {
+                "id": reclaim_id,
+                "org": x_org_id,
+                "pid": p_doc["id"],
+                "rev_id": payload.reversal_event_id,
+                "rp": payload.tax_period,
+                "cgst": payload.cgst_amount,
+                "sgst": payload.sgst_amount,
+                "igst": payload.igst_amount,
+                "cess": payload.cess_amount,
+                "reason": payload.reversal_reason or "Statutory re-availment upon condition fulfillment",
+                "ts": now_ts
+            }
+        )
+
+    entry_id = str(uuid.uuid4())
+    prov = payload.provenance or {
+        "supplier_gstin": p_doc.get("supplier_gstin"),
+        "document_number": p_doc.get("document_number"),
+        "document_date": str(p_doc.get("document_date")),
+        "actor_id": x_user_id
+    }
+
+    db.execute(
+        text("""
+        INSERT INTO public.itc_ledger_entries (
+            id, org_id, purchase_doc_id, gstr2b_doc_id, event_type,
+            tax_period, cgst_amount, sgst_amount, igst_amount, cess_amount,
+            total_tax, reversal_event_id, interest_amount, interest_basis,
+            provenance, created_at
+        ) VALUES (
+            :id, :org, :pid, :gid, :etype,
+            :rp, :cgst, :sgst, :igst, :cess,
+            :tot, :rev_id, :interest, :int_basis,
+            :prov, :ts
+        );
+        """),
+        {
+            "id": entry_id,
+            "org": x_org_id,
+            "pid": p_doc["id"],
+            "gid": payload.gstr2b_doc_id,
+            "etype": payload.event_type,
+            "rp": payload.tax_period,
+            "cgst": payload.cgst_amount,
+            "sgst": payload.sgst_amount,
+            "igst": payload.igst_amount,
+            "cess": payload.cess_amount,
+            "tot": total_event_tax,
+            "rev_id": rev_event_id,
+            "interest": payload.interest_amount,
+            "int_basis": payload.interest_basis,
+            "prov": json.dumps(prov),
+            "ts": now_ts
+        }
+    )
+
+    db.commit()
+
+    return ITCLedgerEntryOut(
+        id=entry_id,
+        purchase_doc_id=payload.purchase_doc_id,
+        gstr2b_doc_id=payload.gstr2b_doc_id,
+        event_type=payload.event_type,
+        tax_period=payload.tax_period,
+        cgst_amount=payload.cgst_amount,
+        sgst_amount=payload.sgst_amount,
+        igst_amount=payload.igst_amount,
+        cess_amount=payload.cess_amount,
+        total_tax=total_event_tax,
+        reversal_event_id=rev_event_id,
+        interest_amount=payload.interest_amount,
+        interest_basis=payload.interest_basis,
+        provenance=prov,
+        created_at=now_ts.isoformat()
+    )
+
+
+@router.get("/itc-ledger/{purchase_doc_id}", response_model=List[ITCLedgerEntryOut])
+def get_purchase_doc_itc_history(
+    purchase_doc_id: str,
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Returns full chronological ITC lifecycle audit events for a purchase document.
+    """
+    rows = db.execute(
+        text("""
+        SELECT * FROM public.itc_ledger_entries
+        WHERE purchase_doc_id = :pid AND org_id = :org
+        ORDER BY created_at ASC;
+        """),
+        {"pid": purchase_doc_id, "org": x_org_id}
+    ).fetchall()
+    return [
+        ITCLedgerEntryOut(
+            id=str(r.id),
+            purchase_doc_id=str(r.purchase_doc_id),
+            gstr2b_doc_id=str(r.gstr2b_doc_id) if r.gstr2b_doc_id else None,
+            event_type=r.event_type,
+            tax_period=r.tax_period,
+            cgst_amount=Decimal(str(r.cgst_amount or 0)),
+            sgst_amount=Decimal(str(r.sgst_amount or 0)),
+            igst_amount=Decimal(str(r.igst_amount or 0)),
+            cess_amount=Decimal(str(r.cess_amount or 0)),
+            total_tax=Decimal(str(r.total_tax or 0)),
+            reversal_event_id=str(r.reversal_event_id) if r.reversal_event_id else None,
+            interest_amount=Decimal(str(r.interest_amount or 0)),
+            interest_basis=r.interest_basis,
+            provenance=r.provenance or {},
+            created_at=r.created_at.isoformat()
+        )
+        for r in rows
+    ]
+
+
+@router.get("/itc-ledger/summary", response_model=ITCLedgerSummaryOut)
+def get_itc_ledger_summary(
+    registration_id: Optional[str] = None,
+    tax_period: Optional[str] = None,
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Returns component-level ledger summary: total availed, reversed permanent, reversed temporary, reavailed, and net balance.
+    """
+    query = """
+    SELECT e.event_type,
+           SUM(e.cgst_amount) as cgst,
+           SUM(e.sgst_amount) as sgst,
+           SUM(e.igst_amount) as igst,
+           SUM(e.cess_amount) as cess,
+           SUM(e.total_tax) as total,
+           SUM(e.interest_amount) as interest,
+           COUNT(*) as cnt
+    FROM public.itc_ledger_entries e
+    JOIN public.purchase_documents p ON e.purchase_doc_id = p.id AND e.org_id = p.org_id
+    WHERE e.org_id = :org
+    """
+    params = {"org": x_org_id}
+    if registration_id:
+        query += " AND p.registration_id = :reg_id"
+        params["reg_id"] = registration_id
+    if tax_period:
+        query += " AND e.tax_period = :rp"
+        params["rp"] = tax_period
+    query += " GROUP BY e.event_type;"
+
+    rows = db.execute(text(query), params).fetchall()
+
+    def make_comp():
+        return ComponentTaxAmount(cgst=Decimal("0.00"), sgst=Decimal("0.00"), igst=Decimal("0.00"), cess=Decimal("0.00"), total=Decimal("0.00"))
+
+    tot_avail = make_comp()
+    tot_rev_perm = make_comp()
+    tot_rev_temp = make_comp()
+    tot_reav = make_comp()
+    tot_interest = Decimal("0.00")
+    total_entries = 0
+
+    for r in rows:
+        etype = r.event_type
+        comp = ComponentTaxAmount(
+            cgst=Decimal(str(r.cgst or 0)),
+            sgst=Decimal(str(r.sgst or 0)),
+            igst=Decimal(str(r.igst or 0)),
+            cess=Decimal(str(r.cess or 0)),
+            total=Decimal(str(r.total or 0))
+        )
+        total_entries += r.cnt
+        tot_interest += Decimal(str(r.interest or 0))
+
+        if etype == "AVAIL":
+            tot_avail.cgst += comp.cgst
+            tot_avail.sgst += comp.sgst
+            tot_avail.igst += comp.igst
+            tot_avail.cess += comp.cess
+            tot_avail.total += comp.total
+        elif etype in ("REVERSAL_PERMANENT_17_5", "REVERSAL_RULE_38", "REVERSAL_RULE_42_43"):
+            tot_rev_perm.cgst += comp.cgst
+            tot_rev_perm.sgst += comp.sgst
+            tot_rev_perm.igst += comp.igst
+            tot_rev_perm.cess += comp.cess
+            tot_rev_perm.total += comp.total
+        elif etype in ("REVERSAL_RULE_37", "REVERSAL_RULE_37A", "REVERSAL_OTHER_TEMP"):
+            tot_rev_temp.cgst += comp.cgst
+            tot_rev_temp.sgst += comp.sgst
+            tot_rev_temp.igst += comp.igst
+            tot_rev_temp.cess += comp.cess
+            tot_rev_temp.total += comp.total
+        elif etype == "RECLAIM":
+            tot_reav.cgst += comp.cgst
+            tot_reav.sgst += comp.sgst
+            tot_reav.igst += comp.igst
+            tot_reav.cess += comp.cess
+            tot_reav.total += comp.total
+
+    net_bal = ComponentTaxAmount(
+        cgst=tot_avail.cgst - tot_rev_perm.cgst - tot_rev_temp.cgst + tot_reav.cgst,
+        sgst=tot_avail.sgst - tot_rev_perm.sgst - tot_rev_temp.sgst + tot_reav.sgst,
+        igst=tot_avail.igst - tot_rev_perm.igst - tot_rev_temp.igst + tot_reav.igst,
+        cess=tot_avail.cess - tot_rev_perm.cess - tot_rev_temp.cess + tot_reav.cess,
+        total=tot_avail.total - tot_rev_perm.total - tot_rev_temp.total + tot_reav.total
+    )
+
+    return ITCLedgerSummaryOut(
+        total_availed=tot_avail,
+        total_reversed_permanent=tot_rev_perm,
+        total_reversed_temporary=tot_rev_temp,
+        total_reavailed=tot_reav,
+        net_active_itc_balance=net_bal,
+        total_interest_assessed=tot_interest,
+        entries_count=total_entries
+    )
+
+
+@router.get("/ims/history/{ims_action_id}", response_model=List[IMSActionHistoryOut])
+def get_ims_action_history(
+    ims_action_id: str,
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Returns audit action history for an IMS document record.
+    """
+    rows = db.execute(
+        text("""
+        SELECT * FROM public.ims_action_history
+        WHERE ims_action_id = :id AND org_id = :org
+        ORDER BY created_at ASC;
+        """),
+        {"id": ims_action_id, "org": x_org_id}
+    ).fetchall()
+    return [
+        IMSActionHistoryOut(
+            id=str(r.id),
+            ims_action_id=str(r.ims_action_id),
+            previous_action=r.previous_action,
+            new_action=r.new_action,
+            action_reason=r.action_reason,
+            actor_id=str(r.actor_id) if r.actor_id else None,
+            created_at=r.created_at.isoformat()
+        )
+        for r in rows
+    ]
+
+
+@router.get("/export/audit-report")
+def export_reconciliation_audit_report(
+    registration_id: str,
+    return_period: str,
+    snapshot_id: str,
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Exports a comprehensive reconciliation and ITC ledger audit report with full document provenance.
+    """
+    t4 = get_gstr3b_table4_summary(
+        registration_id=registration_id,
+        return_period=return_period,
+        snapshot_id=snapshot_id,
+        x_org_id=x_org_id,
+        db=db
+    )
+    return {
+        "report_type": "ITC_RECONCILIATION_AUDIT_REPORT",
+        "return_period": return_period,
+        "registration_id": registration_id,
+        "generated_at": datetime.utcnow().isoformat(),
+        "summary": t4.dict(),
+        "unbooked_invoices_count": len(t4.unbooked_gstr2b_documents),
+        "unbooked_invoices": t4.unbooked_gstr2b_documents,
+        "reversals_lineage_count": len(t4.reversals_lineage),
+        "reversals_lineage": t4.reversals_lineage
+    }

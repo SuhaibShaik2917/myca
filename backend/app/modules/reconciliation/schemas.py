@@ -248,6 +248,14 @@ class Rule37AFilingCheck(BaseModel):
     risk_status: ITCEligibilityEnum
 
 
+class ComponentTaxAmount(BaseModel):
+    cgst: Decimal = Decimal("0.00")
+    sgst: Decimal = Decimal("0.00")
+    igst: Decimal = Decimal("0.00")
+    cess: Decimal = Decimal("0.00")
+    total: Decimal = Decimal("0.00")
+
+
 # --- GSTR-3B Working Output ---
 
 class GSTR3BTable4WorkingOutput(BaseModel):
@@ -280,6 +288,80 @@ class GSTR3BTable4WorkingOutput(BaseModel):
     subtotal_books_matched: Decimal = Decimal("0.00")
     subtotal_legally_eligible: Decimal = Decimal("0.00")
     subtotal_human_approved: Decimal = Decimal("0.00")
+    # Component Breakdown for Tax Columns (CGST, SGST, IGST, Cess)
+    components_4a: Optional[Dict[str, ComponentTaxAmount]] = None
+    components_4b: Optional[Dict[str, ComponentTaxAmount]] = None
+    components_4c_net: Optional[ComponentTaxAmount] = None
+    components_4d: Optional[Dict[str, ComponentTaxAmount]] = None
+    # Detailed Traceability & Variance Explanation
+    unbooked_gstr2b_documents: List[Dict[str, Any]] = []
+    unbooked_variance_amount: Decimal = Decimal("0.00")
+    variance_explanation: Optional[str] = None
+    reversals_lineage: List[Dict[str, Any]] = []
+    interest_summary: Dict[str, Any] = {}
+
+
+# --- ITC Ledger & Event Tracking Models ---
+
+class ITCLedgerEventCreate(BaseModel):
+    purchase_doc_id: str
+    gstr2b_doc_id: Optional[str] = None
+    event_type: str  # AVAIL, REVERSAL_RULE_37, REVERSAL_RULE_37A, REVERSAL_PERMANENT_17_5, REVERSAL_RULE_38, REVERSAL_RULE_42_43, REVERSAL_OTHER_TEMP, RECLAIM
+    tax_period: str  # YYYY-MM
+    cgst_amount: Decimal = Decimal("0.00")
+    sgst_amount: Decimal = Decimal("0.00")
+    igst_amount: Decimal = Decimal("0.00")
+    cess_amount: Decimal = Decimal("0.00")
+    reversal_event_id: Optional[str] = None
+    reversal_reason: Optional[str] = None
+    interest_amount: Decimal = Decimal("0.00")
+    interest_basis: Optional[str] = None
+    provenance: Optional[Dict[str, Any]] = None
+
+
+class ITCLedgerEntryOut(BaseModel):
+    id: str
+    purchase_doc_id: str
+    gstr2b_doc_id: Optional[str] = None
+    event_type: str
+    tax_period: str
+    cgst_amount: Decimal
+    sgst_amount: Decimal
+    igst_amount: Decimal
+    cess_amount: Decimal
+    total_tax: Decimal
+    reversal_event_id: Optional[str] = None
+    interest_amount: Decimal
+    interest_basis: Optional[str] = None
+    provenance: Dict[str, Any]
+    created_at: str
+
+
+class ITCLedgerSummaryOut(BaseModel):
+    total_availed: ComponentTaxAmount
+    total_reversed_permanent: ComponentTaxAmount
+    total_reversed_temporary: ComponentTaxAmount
+    total_reavailed: ComponentTaxAmount
+    net_active_itc_balance: ComponentTaxAmount
+    total_interest_assessed: Decimal = Decimal("0.00")
+    entries_count: int = 0
+
+
+class IMSActionHistoryOut(BaseModel):
+    id: str
+    ims_action_id: str
+    previous_action: Optional[str] = None
+    new_action: str
+    action_reason: Optional[str] = None
+    actor_id: Optional[str] = None
+    created_at: str
+
+
+class GSTR3BFilingFreezeRequest(BaseModel):
+    registration_id: str
+    return_period: str
+    filing_status: str = "FILED"  # FILED, DRAFT, SUBMITTED
+    filing_arn: Optional[str] = None
 
 
 # --- Recomputation Models ---

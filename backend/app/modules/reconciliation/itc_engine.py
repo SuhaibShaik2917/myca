@@ -121,8 +121,11 @@ class StatutoryITCRiskEngine:
         unpaid = max(Decimal("0.00"), total_inv_val - total_paid)
         is_reverse_charge = purchase_doc.get("is_reverse_charge", False)
 
-        # Rule 37 applies only to forward charge supplies
-        if not is_reverse_charge and days_elapsed > 180 and unpaid > Decimal("0.00"):
+        # Rule 37 applies only to forward charge supplies and where ITC was availed in GSTR-3B
+        is_availed_in_3b = purchase_doc.get("is_availed_in_3b")
+        if is_availed_in_3b is False:
+            logger.debug("Purchase doc %s not availed in GSTR-3B; Rule 37 reversal not triggered.", p_id)
+        elif not is_reverse_charge and days_elapsed > 180 and unpaid > Decimal("0.00"):
             # Proportionate reversal
             prop_ratio = unpaid / total_inv_val if total_inv_val > 0 else Decimal("1.00")
             reversal_tax = (total_tax * prop_ratio).quantize(Decimal("0.01"))
@@ -138,7 +141,7 @@ class StatutoryITCRiskEngine:
                 eligibility_status=ITCEligibilityEnum.PAYMENT_180_DAY_RISK,
                 potential_itc=total_tax,
                 risk_reversal_amount=reversal_tax,
-                findings_explanation=f"Vendor invoice unpaid after {days_elapsed} days ({days_over} days past 180-day limit). Proportionate reversal required: ₹{reversal_tax}. Estimated interest at 18% p.a.: ₹{interest_estimate}.",
+                findings_explanation=f"Vendor invoice unpaid after {days_elapsed} days ({days_over} days past 180-day limit). Proportionate reversal required: ₹{reversal_tax}. Estimated interest under Section 50(1) at 18% p.a.: ₹{interest_estimate}.",
                 missing_evidence_required="Record payment voucher, bank settlement, or formal credit adjustment to re-avail credit.",
                 evaluation_date=str(eval_dt)
             ))
@@ -204,7 +207,7 @@ class StatutoryITCRiskEngine:
                         evaluation_date=str(eval_dt)
                     ))
                 else:
-                    # After 30th Nov: reversal required along with 18% p.a. interest under Section 50
+                    # After 30th Nov: reversal required along with 18% p.a. interest under Section 50(3)
                     days_delayed = (eval_dt - recipient_reversal_deadline).days
                     interest_liability = (total_tax * Decimal("0.18") * Decimal(days_delayed) / Decimal("365")).quantize(Decimal("0.01"))
                     assessments.append(ITCAssessmentOut(
@@ -215,8 +218,8 @@ class StatutoryITCRiskEngine:
                         eligibility_status=ITCEligibilityEnum.RULE_37A_RISK,
                         potential_itc=total_tax,
                         risk_reversal_amount=total_tax,
-                        findings_explanation=f"Supplier unfiled past 30th September {fy_end_year}. Recipient reversal deadline 30th November {fy_end_year} exceeded by {days_delayed} days. Mandatory reversal of ₹{total_tax} plus Section 50 interest at 18% p.a. (estimated ₹{interest_liability}).",
-                        missing_evidence_required="Pay reversed ITC along with applicable Section 50 interest.",
+                        findings_explanation=f"Supplier unfiled past 30th September {fy_end_year}. Recipient reversal deadline 30th November {fy_end_year} exceeded by {days_delayed} days. Mandatory reversal of ₹{total_tax} plus Section 50 interest at 18% p.a. (estimated ₹{interest_liability}) under Section 50(3). Note: Under Section 50(3) read with Rule 88B(3), interest applies only if credit was actually utilized against output tax liability.",
+                        missing_evidence_required="Pay reversed ITC under Table 4(B)(2) and evaluate Section 50(3) interest based on Electronic Credit Ledger utilization.",
                         evaluation_date=str(eval_dt)
                     ))
             elif gstr3b_status == "FILED":

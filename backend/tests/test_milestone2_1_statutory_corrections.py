@@ -118,12 +118,13 @@ def test_pan_gstin_consistency_trigger(setup_m2_1_tenant):
 
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
-            # Inserting a GSTIN whose PAN does not match the organization PAN must be rejected by trigger
-            with pytest.raises(psycopg.errors.RaiseException) as exc_info:
+            # Inserting a GSTIN whose PAN does not match the organization PAN must be rejected by trigger with SQLSTATE 23514 (CheckViolation)
+            with pytest.raises(psycopg.errors.CheckViolation) as exc_info:
                 cur.execute("""
                     INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, trade_name, legal_name, is_primary)
                     VALUES (%s, %s, %s, '27', 'Mismatched PAN', 'M2.1 Legal', false);
                 """, (str(uuid.uuid4()), t["org_id"], mismatched_gstin))
+            assert exc_info.value.sqlstate == "23514"
             assert "does not match Organization PAN" in str(exc_info.value)
 
 
