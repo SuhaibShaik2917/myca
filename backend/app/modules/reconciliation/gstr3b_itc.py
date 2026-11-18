@@ -40,7 +40,8 @@ def generate_gstr3b_table4_summary(
     assessments: List[Dict[str, Any]],
     human_approved_ids: Optional[set] = None,
     reclaims: Optional[List[Dict[str, Any]]] = None,
-    reversals_ledger: Optional[List[Dict[str, Any]]] = None
+    reversals_ledger: Optional[List[Dict[str, Any]]] = None,
+    auto_reverse_unbooked_unreceived: bool = False
 ) -> GSTR3BTable4WorkingOutput:
     """
     Generates statutory GSTR-3B Table 4 Inward ITC Working Output strictly compliant with
@@ -187,6 +188,7 @@ def generate_gstr3b_table4_summary(
     comp_4b1 = _zero_component()  # Non-reclaimable
     comp_4b2_r37 = _zero_component()
     comp_4b2_r37a = _zero_component()
+    comp_4b2_receipt = _zero_component()  # Section 16(2)(b) goods/services unreceived temporary reversal
     comp_4b2_other = _zero_component()
     reversals_lineage: List[Dict[str, Any]] = []
     purchase_map = {str(p["id"]): p for p in purchase_docs}
@@ -208,17 +210,19 @@ def generate_gstr3b_table4_summary(
                 comp_4b2_r37 = _add_component(comp_4b2_r37, rc, rs, ri, rcs)
             elif rule == "RULE_37A_NON_FILING":
                 comp_4b2_r37a = _add_component(comp_4b2_r37a, rc, rs, ri, rcs)
+            elif rule in ("SEC_16_2_B", "SEC_16_2_B_PENDING_RECEIPT", "RULE_16_2_B", "PENDING_RECEIPT", "UNBOOKED_RECEIPT_REVERSAL", "REVERSAL_SECTION_16_2_B"):
+                comp_4b2_receipt = _add_component(comp_4b2_receipt, rc, rs, ri, rcs)
             else:
                 comp_4b2_other = _add_component(comp_4b2_other, rc, rs, ri, rcs)
 
             reversals_lineage.append({
                 "reversal_id": str(rev.get("id")),
                 "purchase_doc_id": p_id,
-                "document_number": p_doc.get("document_number", "N/A"),
-                "document_date": str(p_doc.get("document_date", "")),
-                "supplier_gstin": p_doc.get("supplier_gstin", "N/A"),
-                "availed_period": p_doc.get("availed_period", "N/A"),
-                "is_availed_in_3b": p_doc.get("is_availed_in_3b", False),
+                "document_number": p_doc.get("document_number", rev.get("document_number", "N/A")),
+                "document_date": str(p_doc.get("document_date", rev.get("document_date", ""))),
+                "supplier_gstin": p_doc.get("supplier_gstin", rev.get("supplier_gstin", "N/A")),
+                "availed_period": p_doc.get("availed_period", rev.get("reversal_period", "N/A")),
+                "is_availed_in_3b": p_doc.get("is_availed_in_3b", True),
                 "rule_code": rule,
                 "reversal_amount": rc + rs + ri + rcs,
                 "cgst": rc, "sgst": rs, "igst": ri, "cess": rcs,
@@ -258,6 +262,8 @@ def generate_gstr3b_table4_summary(
                 comp_4b2_r37 = _add_component(comp_4b2_r37, rc, rs, ri, rcs)
             elif rule == "RULE_37A_NON_FILING" or status == ITCEligibilityEnum.RULE_37A_RISK:
                 comp_4b2_r37a = _add_component(comp_4b2_r37a, rc, rs, ri, rcs)
+            elif rule in ("SEC_16_2_B", "SEC_16_2_B_PENDING_RECEIPT") or status == ITCEligibilityEnum.PENDING_GOODS_OR_SERVICE_RECEIPT:
+                comp_4b2_receipt = _add_component(comp_4b2_receipt, rc, rs, ri, rcs)
             elif status in (ITCEligibilityEnum.TIME_LIMIT_RISK, ITCEligibilityEnum.REVERSED):
                 comp_4b2_other = _add_component(comp_4b2_other, rc, rs, ri, rcs)
 
@@ -276,12 +282,39 @@ def generate_gstr3b_table4_summary(
                     "interest_basis": "Statutory assessment under Section 50"
                 })
 
+    # Auto-reverse unbooked / unreceived documents if auto_reverse_unbooked_unreceived is enabled
+    if auto_reverse_unbooked_unreceived:
+        for u_doc in unbooked_docs:
+            u_gid = u_doc.get("gstr2b_doc_id")
+            # If not already recorded in reversals
+            already_reversed = any(r.get("purchase_doc_id") == u_gid or r.get("reversal_id") == f"rev_unbooked_{u_gid}" for r in reversals_lineage)
+            if not already_reversed:
+                uc = u_doc.get("cgst_amount", Decimal("0.00"))
+                us = u_doc.get("sgst_amount", Decimal("0.00"))
+                ui = u_doc.get("igst_amount", Decimal("0.00"))
+                ucs = u_doc.get("cess_amount", Decimal("0.00"))
+                comp_4b2_receipt = _add_component(comp_4b2_receipt, uc, us, ui, ucs)
+                reversals_lineage.append({
+                    "reversal_id": f"rev_unbooked_{u_gid}",
+                    "purchase_doc_id": u_gid,
+                    "document_number": u_doc.get("document_number", "N/A"),
+                    "document_date": str(u_doc.get("document_date", "")),
+                    "supplier_gstin": u_doc.get("supplier_gstin", "N/A"),
+                    "availed_period": return_period,
+                    "is_availed_in_3b": True,
+                    "rule_code": "SEC_16_2_B_PENDING_RECEIPT",
+                    "reversal_amount": uc + us + ui + ucs,
+                    "cgst": uc, "sgst": us, "igst": ui, "cess": ucs,
+                    "interest_liability": Decimal("0.00"),
+                    "interest_basis": "Section 50(3) Nil - Not utilized in cash offset"
+                })
+
     comp_4b2_total = ComponentTaxAmount(
-        cgst=comp_4b2_r37.cgst + comp_4b2_r37a.cgst + comp_4b2_other.cgst,
-        sgst=comp_4b2_r37.sgst + comp_4b2_r37a.sgst + comp_4b2_other.sgst,
-        igst=comp_4b2_r37.igst + comp_4b2_r37a.igst + comp_4b2_other.igst,
-        cess=comp_4b2_r37.cess + comp_4b2_r37a.cess + comp_4b2_other.cess,
-        total=comp_4b2_r37.total + comp_4b2_r37a.total + comp_4b2_other.total
+        cgst=comp_4b2_r37.cgst + comp_4b2_r37a.cgst + comp_4b2_receipt.cgst + comp_4b2_other.cgst,
+        sgst=comp_4b2_r37.sgst + comp_4b2_r37a.sgst + comp_4b2_receipt.sgst + comp_4b2_other.sgst,
+        igst=comp_4b2_r37.igst + comp_4b2_r37a.igst + comp_4b2_receipt.igst + comp_4b2_other.igst,
+        cess=comp_4b2_r37.cess + comp_4b2_r37a.cess + comp_4b2_receipt.cess + comp_4b2_other.cess,
+        total=comp_4b2_r37.total + comp_4b2_r37a.total + comp_4b2_receipt.total + comp_4b2_other.total
     )
 
     comp_4b_total = ComponentTaxAmount(
@@ -339,6 +372,7 @@ def generate_gstr3b_table4_summary(
         itc_reversed_rule_38_42_43=comp_4b1.total,
         itc_reversed_rule_37_180_days=comp_4b2_r37.total,
         itc_reversed_rule_37a=comp_4b2_r37a.total,
+        itc_reversed_sec_16_2_b_receipt=comp_4b2_receipt.total,
         itc_reversed_other=comp_4b2_other.total,
         total_itc_reversed_reclaimable_4b2=comp_4b2_total.total,
         total_itc_reversed=comp_4b_total.total,
@@ -369,6 +403,7 @@ def generate_gstr3b_table4_summary(
             "4B1_permanent": comp_4b1,
             "4B2_rule37": comp_4b2_r37,
             "4B2_rule37a": comp_4b2_r37a,
+            "4B2_receipt": comp_4b2_receipt,
             "4B2_other": comp_4b2_other,
             "4B2_total": comp_4b2_total,
             "4B_total": comp_4b_total

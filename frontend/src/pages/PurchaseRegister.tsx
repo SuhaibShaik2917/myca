@@ -14,6 +14,9 @@ interface PurchaseDoc {
   status: "draft" | "pending_approval" | "approved";
   is_reverse_charge: boolean;
   goods_services_type: string;
+  receipt_status: "UNKNOWN" | "NOT_RECEIVED" | "PARTIALLY_RECEIVED" | "RECEIVED" | "DEEMED_RECEIVED";
+  delivery_proof_ref?: string;
+  lot_info?: string;
 }
 
 export const PurchaseRegister: React.FC = () => {
@@ -30,7 +33,9 @@ export const PurchaseRegister: React.FC = () => {
       total_invoice_value: "1,18,000.00",
       status: "approved",
       is_reverse_charge: false,
-      goods_services_type: "goods"
+      goods_services_type: "goods",
+      receipt_status: "RECEIVED",
+      delivery_proof_ref: "GRN-2026-8812"
     },
     {
       id: "doc-pur-002",
@@ -44,7 +49,8 @@ export const PurchaseRegister: React.FC = () => {
       total_invoice_value: "59,000.00",
       status: "draft",
       is_reverse_charge: false,
-      goods_services_type: "services"
+      goods_services_type: "services",
+      receipt_status: "UNKNOWN"
     },
     {
       id: "doc-pur-003",
@@ -58,12 +64,35 @@ export const PurchaseRegister: React.FC = () => {
       total_invoice_value: "21,000.00",
       status: "pending_approval",
       is_reverse_charge: true,
-      goods_services_type: "services"
+      goods_services_type: "services",
+      receipt_status: "RECEIVED",
+      delivery_proof_ref: "LR-CN-88102"
+    },
+    {
+      id: "doc-pur-004",
+      document_number: "LOT-2026-99",
+      document_date: "2026-11-14",
+      supplier_gstin: "27AABCA9911F1ZZ",
+      supplier_legal_name: "Bharat Raw Materials Corp",
+      place_of_supply: "27",
+      total_taxable_amount: "80,000.00",
+      tax_amount: "14,400.00",
+      total_invoice_value: "94,400.00",
+      status: "approved",
+      is_reverse_charge: false,
+      goods_services_type: "goods",
+      receipt_status: "PARTIALLY_RECEIVED",
+      lot_info: "Lot 1 of 2 (Proviso Hold)",
+      delivery_proof_ref: "DC-LOT-01"
     }
   ]);
 
   const [showAddForm, setShowAddForm] = useState(false);
   const [showPaymentModal, setShowPaymentModal] = useState<string | null>(null);
+  const [showReceiptModal, setShowReceiptModal] = useState<string | null>(null);
+  const [receiptProofRef, setReceiptProofRef] = useState("GRN-2026-");
+  const [receiptDate, setReceiptDate] = useState("2026-11-18");
+  const [selectedReceiptStatus, setSelectedReceiptStatus] = useState<"RECEIVED" | "PARTIALLY_RECEIVED">("RECEIVED");
 
   // Form State
   const [docNum, setDocNum] = useState("");
@@ -99,7 +128,8 @@ export const PurchaseRegister: React.FC = () => {
       total_invoice_value: total.toLocaleString("en-IN", { minimumFractionDigits: 2 }),
       status: "draft",
       is_reverse_charge: isRcm,
-      goods_services_type: "goods"
+      goods_services_type: "goods",
+      receipt_status: "UNKNOWN"
     };
 
     setDocuments(prev => [newDoc, ...prev]);
@@ -119,6 +149,22 @@ export const PurchaseRegister: React.FC = () => {
     e.preventDefault();
     setShowPaymentModal(null);
     setPayAmount("");
+  };
+
+  const handleVerifyReceipt = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!showReceiptModal) return;
+    setDocuments(prev => prev.map(doc => 
+      doc.id === showReceiptModal 
+        ? { 
+            ...doc, 
+            receipt_status: selectedReceiptStatus, 
+            delivery_proof_ref: receiptProofRef,
+            lot_info: selectedReceiptStatus === "PARTIALLY_RECEIVED" ? "Lot 1 of 2 (Proviso Hold)" : undefined
+          } 
+        : doc
+    ));
+    setShowReceiptModal(null);
   };
 
   return (
@@ -309,7 +355,8 @@ export const PurchaseRegister: React.FC = () => {
                 <th className="px-4 py-3 text-right">Taxable (₹)</th>
                 <th className="px-4 py-3 text-right">Tax (₹)</th>
                 <th className="px-4 py-3 text-right">Total Value (₹)</th>
-                <th className="px-4 py-3 text-center">Status</th>
+                <th className="px-4 py-3 text-center">Sec 16(2)(b) Receipt Gate</th>
+                <th className="px-4 py-3 text-center">Approval Status</th>
                 <th className="px-4 py-3 text-center">Actions</th>
               </tr>
             </thead>
@@ -327,6 +374,25 @@ export const PurchaseRegister: React.FC = () => {
                   <td className="px-4 py-3 text-right font-medium text-slate-800">{doc.total_taxable_amount}</td>
                   <td className="px-4 py-3 text-right font-medium text-slate-800">{doc.tax_amount}</td>
                   <td className="px-4 py-3 text-right font-bold text-slate-900">{doc.total_invoice_value}</td>
+                  <td className="px-4 py-3 text-center font-sans">
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                      doc.receipt_status === 'RECEIVED'
+                        ? 'bg-emerald-100 text-emerald-800'
+                        : doc.receipt_status === 'PARTIALLY_RECEIVED'
+                        ? 'bg-purple-100 text-purple-800'
+                        : doc.receipt_status === 'DEEMED_RECEIVED'
+                        ? 'bg-sky-100 text-sky-800'
+                        : 'bg-amber-100 text-amber-800'
+                    }`}>
+                      {doc.receipt_status}
+                    </span>
+                    {doc.delivery_proof_ref && (
+                      <div className="text-[9px] text-slate-500 font-mono mt-0.5">{doc.delivery_proof_ref}</div>
+                    )}
+                    {doc.lot_info && (
+                      <div className="text-[9px] text-purple-700 font-sans mt-0.5">{doc.lot_info}</div>
+                    )}
+                  </td>
                   <td className="px-4 py-3 text-center">
                     <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-semibold ${
                       doc.status === 'approved' 
@@ -347,6 +413,15 @@ export const PurchaseRegister: React.FC = () => {
                         Approve
                       </button>
                     )}
+                    <button
+                      onClick={() => {
+                        setShowReceiptModal(doc.id);
+                        setReceiptProofRef(doc.delivery_proof_ref || "GRN-2026-");
+                      }}
+                      className="px-2 py-1 bg-sky-50 hover:bg-sky-100 text-sky-700 rounded text-[10px] font-medium border border-sky-200"
+                    >
+                      Receipt Gate
+                    </button>
                     <button
                       onClick={() => setShowPaymentModal(doc.id)}
                       className="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded text-[10px] font-medium border border-indigo-200"
@@ -435,6 +510,74 @@ export const PurchaseRegister: React.FC = () => {
                   className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium"
                 >
                   Save & Allocate Payment
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Section 16(2)(b) Receipt Verification Modal */}
+      {showReceiptModal && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-xl border border-slate-200 max-w-md w-full p-6 space-y-4">
+            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-sky-600" />
+              Section 16(2)(b) Receipt Gate Verification
+            </h3>
+            <p className="text-xs text-slate-500">
+              Statutory verification required before availing ITC. Under Section 16(2)(b) first proviso, supplies in lots require final lot receipt before full ITC claim.
+            </p>
+
+            <form onSubmit={handleVerifyReceipt} className="space-y-3 text-xs">
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Receipt Status</label>
+                <select
+                  value={selectedReceiptStatus}
+                  onChange={e => setSelectedReceiptStatus(e.target.value as any)}
+                  className="w-full px-3 py-2 border border-slate-300 rounded"
+                >
+                  <option value="RECEIVED">RECEIVED (Full Delivery / Service Completion)</option>
+                  <option value="PARTIALLY_RECEIVED">PARTIALLY_RECEIVED (Intermediate Lot - Proviso Hold)</option>
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Receipt Date</label>
+                  <input
+                    type="date"
+                    value={receiptDate}
+                    onChange={e => setReceiptDate(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Proof Reference (GRN / Challan / Cert)</label>
+                  <input
+                    type="text"
+                    value={receiptProofRef}
+                    onChange={e => setReceiptProofRef(e.target.value)}
+                    placeholder="GRN-2026-XXXX"
+                    className="w-full px-3 py-2 border border-slate-300 rounded font-mono"
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowReceiptModal(null)}
+                  className="px-3 py-1.5 border border-slate-300 rounded text-slate-700 text-xs"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white rounded text-xs font-medium"
+                >
+                  Save Receipt Verification
                 </button>
               </div>
             </form>

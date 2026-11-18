@@ -81,6 +81,22 @@ def create_purchase_document(
         calc_cess = sum((item.cess_amount or Decimal("0.00")) for item in payload.line_items)
         calc_total = calc_taxable + calc_cgst + calc_sgst + calc_igst + calc_cess
 
+    # Statutory Section 16(2)(b) receipt verification gate check on creation:
+    # A purchase document cannot be created as RECEIVED without verifiable receipt proof
+    initial_receipt_status = getattr(payload, "receipt_status", "UNKNOWN") or "UNKNOWN"
+    has_goods_proof = bool(payload.goods_receipt_note_ref or payload.delivery_challan_ref or payload.goods_receipt_date)
+    has_service_proof = bool(payload.service_completion_date or getattr(payload, "service_acceptance_cert_ref", None))
+    has_deemed_proof = bool(payload.deemed_receipt_reason)
+
+    if initial_receipt_status == "RECEIVED" and not (has_goods_proof or has_service_proof or has_deemed_proof):
+        initial_receipt_status = "UNKNOWN"
+
+    # Last-lot proviso: if supply is in lots and final lot is not confirmed, cannot be RECEIVED
+    total_lots = getattr(payload, "total_lots_expected", 1) or 1
+    is_last_lot = getattr(payload, "is_last_lot_received", False)
+    if total_lots > 1 and not is_last_lot and initial_receipt_status == "RECEIVED":
+        initial_receipt_status = "PARTIALLY_RECEIVED"
+
     doc_id = str(uuid.uuid4())
     insert_doc = session.execute(
         text("""
@@ -92,7 +108,10 @@ def create_purchase_document(
             total_invoice_value, goods_services_type, goods_receipt_date,
             goods_receipt_note_ref, purchase_ledger_code, status,
             is_availed_in_3b, availed_period, receipt_status,
-            delivery_challan_ref, service_completion_date, deemed_receipt_reason
+            delivery_challan_ref, service_completion_date, deemed_receipt_reason,
+            total_lots_expected, lots_received_count, is_last_lot_received,
+            quantity_expected, quantity_received, remaining_quantity,
+            service_acceptance_cert_ref
         ) VALUES (
             :id, :org_id, :registration_id, :document_type, :document_number,
             :document_date, :financial_period, :supplier_gstin, :supplier_legal_name,
@@ -101,7 +120,10 @@ def create_purchase_document(
             :total_invoice_value, :goods_services_type, :goods_receipt_date,
             :goods_receipt_note_ref, :purchase_ledger_code, 'draft',
             :is_availed_in_3b, :availed_period, :receipt_status,
-            :delivery_challan_ref, :service_completion_date, :deemed_receipt_reason
+            :delivery_challan_ref, :service_completion_date, :deemed_receipt_reason,
+            :total_lots_expected, :lots_received_count, :is_last_lot_received,
+            :quantity_expected, :quantity_received, :remaining_quantity,
+            :service_acceptance_cert_ref
         ) RETURNING id, status, created_at;
         """),
         {
@@ -130,10 +152,17 @@ def create_purchase_document(
             "purchase_ledger_code": payload.purchase_ledger_code,
             "is_availed_in_3b": getattr(payload, "is_availed_in_3b", False),
             "availed_period": getattr(payload, "availed_period", None),
-            "receipt_status": getattr(payload, "receipt_status", "UNKNOWN") or "UNKNOWN",
+            "receipt_status": initial_receipt_status,
             "delivery_challan_ref": getattr(payload, "delivery_challan_ref", None),
             "service_completion_date": getattr(payload, "service_completion_date", None),
-            "deemed_receipt_reason": getattr(payload, "deemed_receipt_reason", None)
+            "deemed_receipt_reason": getattr(payload, "deemed_receipt_reason", None),
+            "total_lots_expected": total_lots,
+            "lots_received_count": getattr(payload, "lots_received_count", 0) or 0,
+            "is_last_lot_received": is_last_lot,
+            "quantity_expected": getattr(payload, "quantity_expected", None),
+            "quantity_received": getattr(payload, "quantity_received", None),
+            "remaining_quantity": getattr(payload, "remaining_quantity", None),
+            "service_acceptance_cert_ref": getattr(payload, "service_acceptance_cert_ref", None)
         }
     ).fetchone()
 

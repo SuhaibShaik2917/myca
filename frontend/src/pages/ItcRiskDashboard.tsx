@@ -47,18 +47,18 @@ export const ItcRiskDashboard: React.FC = () => {
   const [drillDownModal, setDrillDownModal] = useState<Table4DrillDown | null>(null);
   const [isExporting, setIsExporting] = useState(false);
 
-  // Exact Reconciled Statutory Metrics (Milestone 2.3 Verified Engine)
+  // Exact Reconciled Statutory Metrics (Milestone 2.6 Verified Engine)
   const statutoryMetrics = {
-    gstr2bStatementTotal: "4,65,250.00",
+    gstr2bStatementTotal: "4,82,500.00",
     booksMatchedCurrent: "4,47,250.00",
     unbookedVariance: "18,000.00",
     priorReclaims4d1: "17,250.00",
     table4AGrossAvailable: "4,82,500.00",
     table4BPermanentReversals: "77,500.00",
-    table4BReclaimableReversals: "50,400.00",
-    table4BTotalReversals: "1,27,900.00",
-    table4CNetItcAvailable: "3,54,600.00",
-    humanApprovedSafeClaim: "3,54,600.00"
+    table4BReclaimableReversals: "68,400.00",
+    table4BTotalReversals: "1,45,900.00",
+    table4CNetItcAvailable: "3,36,600.00",
+    humanApprovedSafeClaim: "3,36,600.00"
   };
 
   const rule37AgingRows = [
@@ -340,7 +340,7 @@ export const ItcRiskDashboard: React.FC = () => {
     },
     "4B2": {
       sectionCode: "Table 4(B)(2)",
-      title: "Reclaimable Reversals (Rule 37 180-Day & Rule 37A Supplier Non-Filing)",
+      title: "Reclaimable Reversals (Rule 37 180-Day, Rule 37A Supplier Non-Filing & Section 16(2)(b) Receipt Reversal)",
       items: [
         {
           docNo: "INV-2026-088",
@@ -375,6 +375,22 @@ export const ItcRiskDashboard: React.FC = () => {
           priorPeriod: "2026-02",
           isAvailedIn3B: true,
           interestBasis: "Reversed on or before 30-Nov-2026 -> Nil interest under Rule 37A proviso."
+        },
+        {
+          docNo: "SUP-2B-998",
+          docDate: "2026-11-20",
+          supplierGstin: "24AAACR1234K1ZA",
+          supplierName: "Reliance Polymers Dist",
+          taxable: "1,00,000.00",
+          cgst: "0.00",
+          sgst: "0.00",
+          igst: "18,000.00",
+          cess: "0.00",
+          total: "18,000.00",
+          ruleCode: "SEC_16_2_B_RECEIPT_REVERSAL",
+          priorPeriod: "2026-11",
+          isAvailedIn3B: false,
+          interestBasis: "Circular 170/2022-GST: Retained in statement 4(A)(5) and temporarily reversed under 4(B)(2) pending physical goods receipt verification."
         }
       ]
     },
@@ -870,9 +886,9 @@ export const ItcRiskDashboard: React.FC = () => {
                 <td className="px-4 py-2 pl-8 font-sans text-slate-700">
                   (1) Rules 38, 42, 43 and Section 17(5) (Permanent Non-Reclaimable Reversals)
                 </td>
-                <td className="px-4 py-2 text-right text-rose-600">65,000.00</td>
-                <td className="px-4 py-2 text-right text-rose-600">6,250.00</td>
-                <td className="px-4 py-2 text-right text-rose-600">6,250.00</td>
+                <td className="px-4 py-2 text-right text-rose-600">0.00</td>
+                <td className="px-4 py-2 text-right text-rose-600">38,750.00</td>
+                <td className="px-4 py-2 text-right text-rose-600">38,750.00</td>
                 <td className="px-4 py-2 text-right text-rose-600">0.00</td>
                 <td className="px-4 py-2 text-right font-bold text-rose-700">77,500.00</td>
                 <td className="px-4 py-2 text-center text-indigo-600 font-sans"><ChevronRight className="w-4 h-4 mx-auto" /></td>
@@ -882,26 +898,26 @@ export const ItcRiskDashboard: React.FC = () => {
                 className="hover:bg-slate-50 cursor-pointer transition-colors"
               >
                 <td className="px-4 py-2 pl-8 font-sans text-slate-700">
-                  (2) Others: Rule 37 (180-Day) + Rule 37A (Supplier Non-Filing) (Reclaimable)
+                  (2) Others: Rule 37 (180-Day) + Rule 37A + Sec 16(2)(b) Receipt Reversal (Reclaimable)
                 </td>
-                <td className="px-4 py-2 text-right text-rose-600">32,400.00</td>
+                <td className="px-4 py-2 text-right text-rose-600">50,400.00</td>
                 <td className="px-4 py-2 text-right text-rose-600">9,000.00</td>
                 <td className="px-4 py-2 text-right text-rose-600">9,000.00</td>
                 <td className="px-4 py-2 text-right text-rose-600">0.00</td>
-                <td className="px-4 py-2 text-right font-bold text-rose-700">50,400.00</td>
+                <td className="px-4 py-2 text-right font-bold text-rose-700">68,400.00</td>
                 <td className="px-4 py-2 text-center text-indigo-600 font-sans"><ChevronRight className="w-4 h-4 mx-auto" /></td>
               </tr>
 
               {/* 4(C) Net ITC */}
               <tr className="bg-indigo-50 font-sans font-bold text-slate-900">
                 <td className="px-4 py-2.5">
-                  (C) Net ITC Available (A) - (B) [4(A) ₹4,82,500 - 4(B)(1) ₹77,500 - 4(B)(2) ₹50,400]
+                  (C) Net ITC Available (A) - (B) [4(A) ₹4,82,500 - 4(B)(1) ₹77,500 - 4(B)(2) ₹68,400]
                 </td>
-                <td className="px-4 py-2.5 text-right font-mono">1,25,100.00</td>
-                <td className="px-4 py-2.5 text-right font-mono">1,14,750.00</td>
-                <td className="px-4 py-2.5 text-right font-mono">1,14,750.00</td>
+                <td className="px-4 py-2.5 text-right font-mono">1,72,100.00</td>
+                <td className="px-4 py-2.5 text-right font-mono">82,250.00</td>
+                <td className="px-4 py-2.5 text-right font-mono">82,250.00</td>
                 <td className="px-4 py-2.5 text-right font-mono">0.00</td>
-                <td className="px-4 py-2.5 text-right font-mono text-indigo-700 text-sm font-extrabold">3,54,600.00</td>
+                <td className="px-4 py-2.5 text-right font-mono text-indigo-700 text-sm font-extrabold">3,36,600.00</td>
                 <td className="px-4 py-2.5 text-center font-sans text-xs text-slate-400">Calculated</td>
               </tr>
 

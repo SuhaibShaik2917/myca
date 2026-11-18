@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from app.core.dependencies import get_tenant_db
+from app.database import set_tenant_context
 from app.modules.reconciliation.schemas import (
     GSTR2BParsedStatement, GSTR2BUploadResponse, IMSActionRequest, IMSActionResponse,
     PurchaseDocumentCreate, ReconciliationRunConfig, ReconciliationSummaryOut,
@@ -18,8 +19,11 @@ from app.modules.reconciliation.schemas import (
     GSTR3BTable4WorkingOutput, ITCRiskEvaluateRequest,
     GSTRegistrationCreate, GSTRegistrationOut, GSTR2BRecomputeRequest, GSTR2BRecomputeResponse,
     ITCLedgerEventCreate, ITCLedgerEntryOut, ITCLedgerSummaryOut, IMSActionHistoryOut, ComponentTaxAmount,
-    Rule37InterestCalculationRequest, Rule37InterestCalculationResponse
+    Rule37InterestCalculationRequest, Rule37InterestCalculationResponse,
+    ReceiptVerificationRequest, RecordLotDeliveryRequest, UnbookedCandidateOut,
+    BookUnbookedCandidateRequest, RCMValidationRequest, RCMValidationResponse
 )
+from app.modules.reconciliation.rcm_service import validate_rcm_and_gta_eligibility, RCMValidationResult
 from app.modules.reconciliation.gstr2b_parser import parse_gstr2b_json, parse_gstr2b_excel
 from app.modules.reconciliation.purchase_service import (
     create_purchase_document, approve_purchase_document, record_purchase_payment,
@@ -865,7 +869,39 @@ def update_receipt_evidence(
     x_org_id: str = Header(..., alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
-    """Updates Section 16(2)(b) receipt verification status and proof."""
+    """
+    Statutory Section 16(2)(b) Receipt Gate Verification.
+    Enforces that transitions to RECEIVED or DEEMED_RECEIVED require verifiable proof:
+    - Goods: Valid GRN or Delivery Challan and receipt date.
+    - Goods in Lots: Section 16(2)(b) First Proviso last-lot rule.
+    - Services: Service completion date and service acceptance certificate.
+    - Deemed Receipt: Statutory legal basis under Section 16(2)(b) Explanation.
+    Rejects unauthorized or bare client status updates.
+    """
+    # 1. Authorization check: Verify user is an active member with role
+    membership = db.execute(
+        text("SELECT role FROM public.organization_memberships WHERE org_id = :org AND user_id = :uid AND status = 'active';"),
+        {"org": x_org_id, "uid": x_user_id}
+    ).fetchone()
+    if not membership:
+        raise HTTPException(
+            status_code=403,
+            detail="Unauthorized: User does not have active authorized membership in this organization to verify statutory receipt."
+        )
+
+    # 2. Fetch target purchase document
+    doc = db.execute(
+        text("""
+        SELECT id, goods_services_type, receipt_status, total_lots_expected,
+               lots_received_count, is_last_lot_received, quantity_expected, quantity_received, remaining_quantity
+        FROM public.purchase_documents
+        WHERE id = :id AND org_id = :org;
+        """),
+        {"id": id, "org": x_org_id}
+    ).fetchone()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Purchase document not found")
+
     status_val = (payload.get("receipt_status") or "RECEIVED").upper()
     valid_statuses = ("RECEIVED", "PARTIALLY_RECEIVED", "NOT_RECEIVED", "DEEMED_RECEIVED", "UNKNOWN")
     if status_val not in valid_statuses:
@@ -874,7 +910,49 @@ def update_receipt_evidence(
             detail=f"Invalid receipt_status '{status_val}'. Must be one of {valid_statuses}."
         )
 
+    srv_type = (doc.goods_services_type or "goods").lower()
+
+    # 3. Evidence Validation Rules:
+    if status_val == "RECEIVED":
+        if srv_type == "services":
+            sc_dt = payload.get("service_completion_date")
+            sc_cert = payload.get("service_acceptance_cert_ref")
+            if not sc_dt or not sc_cert:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Statutory Violation: Service receipt verification requires both service_completion_date and service_acceptance_cert_ref under Section 16(2)(b)."
+                )
+        else:
+            # Goods, Capital Goods, Both
+            grn_dt = payload.get("goods_receipt_date")
+            grn_ref = payload.get("goods_receipt_note_ref") or payload.get("delivery_challan_ref")
+            if not grn_dt or not grn_ref:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Statutory Violation: Goods receipt verification requires goods_receipt_date and either goods_receipt_note_ref or delivery_challan_ref under Section 16(2)(b)."
+                )
+
+            # Section 16(2)(b) First Proviso: Last-Lot Rule
+            total_lots = doc.total_lots_expected or 1
+            is_last = payload.get("is_last_lot", False) or payload.get("is_last_lot_received", False)
+            rem_qty = payload.get("remaining_quantity")
+            if total_lots > 1 and not is_last and (rem_qty is not None and Decimal(str(rem_qty)) > Decimal("0.00")):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Section 16(2)(b) First Proviso: Where goods against an invoice are received in lots or instalments, ITC can only be availed upon receipt of the last lot. Status must remain PARTIALLY_RECEIVED until the final lot is received."
+                )
+
+    elif status_val == "DEEMED_RECEIVED":
+        d_reason = payload.get("deemed_receipt_reason") or payload.get("deemed_receipt_legal_basis")
+        if not d_reason:
+            raise HTTPException(
+                status_code=400,
+                detail="Statutory Violation: Deemed receipt requires statutory legal basis under Section 16(2)(b) Explanation."
+            )
+
     now_ts = datetime.utcnow()
+    is_last_flag = bool(payload.get("is_last_lot") or payload.get("is_last_lot_received") or (status_val == "RECEIVED"))
+
     row = db.execute(
         text("""
         UPDATE public.purchase_documents
@@ -883,12 +961,18 @@ def update_receipt_evidence(
             goods_receipt_note_ref = :grn_ref,
             delivery_challan_ref = :dc_ref,
             service_completion_date = :sc_dt,
+            service_acceptance_cert_ref = :sc_cert,
             deemed_receipt_reason = :d_reason,
+            quantity_received = COALESCE(:qty_rec, quantity_received),
+            remaining_quantity = COALESCE(:rem_qty, remaining_quantity),
+            is_last_lot_received = :is_last,
             receipt_verified_by = :uid,
             receipt_verified_at = :ts,
             updated_at = :ts
         WHERE id = :id AND org_id = :org
-        RETURNING id, receipt_status, goods_receipt_date, goods_receipt_note_ref;
+        RETURNING id, receipt_status, goods_receipt_date, goods_receipt_note_ref,
+                  delivery_challan_ref, service_completion_date, service_acceptance_cert_ref,
+                  is_last_lot_received, remaining_quantity;
         """),
         {
             "st": status_val,
@@ -896,15 +980,76 @@ def update_receipt_evidence(
             "grn_ref": payload.get("goods_receipt_note_ref"),
             "dc_ref": payload.get("delivery_challan_ref"),
             "sc_dt": payload.get("service_completion_date"),
-            "d_reason": payload.get("deemed_receipt_reason"),
+            "sc_cert": payload.get("service_acceptance_cert_ref"),
+            "d_reason": payload.get("deemed_receipt_reason") or payload.get("deemed_receipt_legal_basis"),
+            "qty_rec": payload.get("quantity_received"),
+            "rem_qty": payload.get("remaining_quantity"),
+            "is_last": is_last_flag,
             "uid": x_user_id,
             "ts": now_ts,
             "id": id,
             "org": x_org_id
         }
     ).fetchone()
-    if not row:
+    db.commit()
+    return dict(row._mapping)
+
+
+@router.post("/purchase/{id}/record-lot")
+def record_purchase_lot_delivery(
+    id: str,
+    payload: RecordLotDeliveryRequest,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Records receipt of a delivery lot or instalment under Section 16(2)(b) First Proviso.
+    If is_last_lot is True (or remaining_quantity is 0), transitions to RECEIVED.
+    Otherwise sets status to PARTIALLY_RECEIVED (withholding full ITC availment).
+    """
+    doc = db.execute(
+        text("SELECT id, total_lots_expected, lots_received_count FROM public.purchase_documents WHERE id = :id AND org_id = :org;"),
+        {"id": id, "org": x_org_id}
+    ).fetchone()
+    if not doc:
         raise HTTPException(status_code=404, detail="Purchase document not found")
+
+    new_count = (doc.lots_received_count or 0) + 1
+    is_last = payload.is_last_lot or (payload.remaining_quantity <= Decimal("0.00")) or (new_count >= (doc.total_lots_expected or 1))
+    target_status = "RECEIVED" if is_last else "PARTIALLY_RECEIVED"
+
+    now_ts = datetime.utcnow()
+    row = db.execute(
+        text("""
+        UPDATE public.purchase_documents
+        SET receipt_status = :st,
+            delivery_challan_ref = :dc_ref,
+            goods_receipt_date = :dt,
+            quantity_received = COALESCE(quantity_received, 0) + :qty,
+            remaining_quantity = :rem_qty,
+            lots_received_count = :cnt,
+            is_last_lot_received = :is_last,
+            receipt_verified_by = :uid,
+            receipt_verified_at = :ts,
+            updated_at = :ts
+        WHERE id = :id AND org_id = :org
+        RETURNING id, receipt_status, lots_received_count, is_last_lot_received, remaining_quantity;
+        """),
+        {
+            "st": target_status,
+            "dc_ref": payload.delivery_challan_ref,
+            "dt": payload.receipt_date,
+            "qty": payload.quantity_received,
+            "rem_qty": payload.remaining_quantity,
+            "cnt": new_count,
+            "is_last": is_last,
+            "uid": x_user_id,
+            "ts": now_ts,
+            "id": id,
+            "org": x_org_id
+        }
+    ).fetchone()
     db.commit()
     return dict(row._mapping)
 
@@ -1262,6 +1407,7 @@ def get_gstr3b_table4_summary(
     registration_id: str,
     return_period: str,
     snapshot_id: str,
+    auto_reverse_unreceived: bool = Query(True, description="Automatically reverse unreceived GSTR-2B documents under Table 4(B)(2) per Circular 170"),
     x_org_id: str = Header(..., alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
@@ -1362,7 +1508,8 @@ def get_gstr3b_table4_summary(
         assessments=assessments,
         human_approved_ids=approved_set,
         reclaims=reclaims,
-        reversals_ledger=reversals_ledger
+        reversals_ledger=reversals_ledger,
+        auto_reverse_unbooked_unreceived=auto_reverse_unreceived
     )
 
 
@@ -1491,7 +1638,7 @@ def record_itc_ledger_event(
         )
 
     elif payload.event_type.startswith("REVERSAL_"):
-        if not p_doc.get("is_availed_in_3b"):
+        if payload.event_type != "REVERSAL_SECTION_16_2_B" and not p_doc.get("is_availed_in_3b"):
             raise HTTPException(
                 status_code=400,
                 detail="Statutory Violation: Cannot record reversal for an invoice that has not been availed in GSTR-3B."
@@ -1522,7 +1669,8 @@ def record_itc_ledger_event(
             "REVERSAL_PERMANENT_17_5": "SEC_17_5_MOTOR",
             "REVERSAL_RULE_38": "RULE_38",
             "REVERSAL_RULE_42_43": "RULE_42",
-            "REVERSAL_OTHER_TEMP": "SEC_16_4"
+            "REVERSAL_OTHER_TEMP": "SEC_16_4",
+            "REVERSAL_SECTION_16_2_B": "SEC_16_2_B"
         }
         r_code = rule_map.get(payload.event_type, "RULE_37_180_DAYS")
 
@@ -1796,7 +1944,7 @@ def get_itc_ledger_summary(
             tot_rev_perm.igst += comp.igst
             tot_rev_perm.cess += comp.cess
             tot_rev_perm.total += comp.total
-        elif etype in ("REVERSAL_RULE_37", "REVERSAL_RULE_37A", "REVERSAL_OTHER_TEMP"):
+        elif etype in ("REVERSAL_RULE_37", "REVERSAL_RULE_37A", "REVERSAL_OTHER_TEMP", "REVERSAL_SECTION_16_2_B"):
             tot_rev_temp.cgst += comp.cgst
             tot_rev_temp.sgst += comp.sgst
             tot_rev_temp.igst += comp.igst
@@ -1888,3 +2036,307 @@ def export_reconciliation_audit_report(
         "reversals_lineage_count": len(t4.reversals_lineage),
         "reversals_lineage": t4.reversals_lineage
     }
+
+
+# -----------------------------------------------------------------------------
+# 11. Milestone 2.6: Unbooked GSTR-2B Candidate Receipt Workflow & RCM Validation
+# -----------------------------------------------------------------------------
+
+@router.get("/unbooked-candidates", response_model=List[UnbookedCandidateOut])
+def list_unbooked_candidates(
+    snapshot_id: str,
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Returns unbooked GSTR-2B candidate documents for receipt verification and booking workflow.
+    Automatically populates candidate records from GSTR-2B source documents if not yet seeded.
+    """
+    candidates = db.execute(
+        text("""
+        SELECT * FROM public.gstr2b_unbooked_candidates
+        WHERE snapshot_id = :sid AND org_id = :org
+        ORDER BY document_date DESC;
+        """),
+        {"sid": snapshot_id, "org": x_org_id}
+    ).fetchall()
+
+    if not candidates:
+        # Populate from unbooked documents in snapshot
+        db.execute(
+            text("""
+            INSERT INTO public.gstr2b_unbooked_candidates (
+                org_id, snapshot_id, gstr2b_doc_id, supplier_gstin, supplier_name,
+                document_number, document_date, taxable_value, cgst_amount,
+                sgst_amount, igst_amount, cess_amount, total_tax,
+                receipt_status, reconciliation_status, is_reversed_under_4b2
+            )
+            SELECT d.org_id, d.snapshot_id, d.id, d.supplier_gstin, d.supplier_name,
+                   d.document_number, d.document_date, COALESCE(d.taxable_value, 0),
+                   COALESCE(d.central_tax, 0), COALESCE(d.state_ut_tax, 0),
+                   COALESCE(d.integrated_tax, 0), COALESCE(d.cess_amount, 0),
+                   (COALESCE(d.central_tax, 0) + COALESCE(d.state_ut_tax, 0) + COALESCE(d.integrated_tax, 0) + COALESCE(d.cess_amount, 0)),
+                   'UNKNOWN', 'MISSING_IN_BOOKS', true
+            FROM public.gstr2b_source_documents d
+            WHERE d.snapshot_id = :sid AND d.org_id = :org
+              AND d.itc_availability = 'available'
+              AND NOT EXISTS (
+                  SELECT 1 FROM public.reconciliation_matches m
+                  WHERE m.gstr2b_doc_id = d.id AND m.org_id = d.org_id
+              )
+            ON CONFLICT (org_id, gstr2b_doc_id) DO NOTHING;
+            """),
+            {"sid": snapshot_id, "org": x_org_id}
+        )
+
+        candidates = db.execute(
+            text("""
+            SELECT * FROM public.gstr2b_unbooked_candidates
+            WHERE snapshot_id = :sid AND org_id = :org
+            ORDER BY document_date DESC;
+            """),
+            {"sid": snapshot_id, "org": x_org_id}
+        ).fetchall()
+        db.commit()
+        set_tenant_context(db, org_id=x_org_id, user_id=None)
+
+    return [
+        UnbookedCandidateOut(
+            id=str(c.id),
+            snapshot_id=str(c.snapshot_id),
+            gstr2b_doc_id=str(c.gstr2b_doc_id),
+            supplier_gstin=c.supplier_gstin,
+            supplier_name=c.supplier_name,
+            document_number=c.document_number,
+            document_date=str(c.document_date),
+            taxable_value=Decimal(str(c.taxable_value or 0)),
+            cgst_amount=Decimal(str(c.cgst_amount or 0)),
+            sgst_amount=Decimal(str(c.sgst_amount or 0)),
+            igst_amount=Decimal(str(c.igst_amount or 0)),
+            cess_amount=Decimal(str(c.cess_amount or 0)),
+            total_tax=Decimal(str(c.total_tax or 0)),
+            receipt_status=c.receipt_status,
+            delivery_challan_ref=c.delivery_challan_ref,
+            goods_receipt_note_ref=c.goods_receipt_note_ref,
+            goods_receipt_date=str(c.goods_receipt_date) if c.goods_receipt_date else None,
+            service_completion_date=str(c.service_completion_date) if c.service_completion_date else None,
+            service_acceptance_cert_ref=c.service_acceptance_cert_ref,
+            deemed_receipt_reason=c.deemed_receipt_reason,
+            reconciliation_status=c.reconciliation_status,
+            is_reversed_under_4b2=c.is_reversed_under_4b2,
+            is_reclaimed=c.is_reclaimed,
+            reclaimed_period=c.reclaimed_period,
+            linked_purchase_doc_id=str(c.linked_purchase_doc_id) if c.linked_purchase_doc_id else None,
+            created_at=c.created_at.isoformat()
+        )
+        for c in candidates
+    ]
+
+
+@router.post("/unbooked-candidates/{id}/verify-receipt")
+def verify_unbooked_candidate_receipt(
+    id: str,
+    payload: Dict[str, Any],
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Attaches GRN / delivery proof or service completion evidence to an unbooked candidate.
+    """
+    status_val = (payload.get("receipt_status") or "RECEIVED").upper()
+    valid_statuses = ("RECEIVED", "PARTIALLY_RECEIVED", "NOT_RECEIVED", "DEEMED_RECEIVED", "UNKNOWN")
+    if status_val not in valid_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid receipt_status '{status_val}'. Must be one of {valid_statuses}."
+        )
+
+    # Require evidence for RECEIVED
+    if status_val == "RECEIVED":
+        grn_ref = payload.get("goods_receipt_note_ref") or payload.get("delivery_challan_ref")
+        grn_dt = payload.get("goods_receipt_date") or payload.get("service_completion_date")
+        if not grn_ref or not grn_dt:
+            raise HTTPException(
+                status_code=400,
+                detail="Statutory Violation: Unbooked candidate receipt confirmation requires GRN/Challan reference and date."
+            )
+
+    now_ts = datetime.utcnow()
+    row = db.execute(
+        text("""
+        UPDATE public.gstr2b_unbooked_candidates
+        SET receipt_status = :st,
+            goods_receipt_note_ref = :grn_ref,
+            goods_receipt_date = :grn_dt,
+            delivery_challan_ref = :dc_ref,
+            service_completion_date = :sc_dt,
+            service_acceptance_cert_ref = :sc_cert,
+            deemed_receipt_reason = :d_reason,
+            receipt_verified_by = :uid,
+            receipt_verified_at = :ts,
+            updated_at = :ts
+        WHERE id = :id AND org_id = :org
+        RETURNING id, receipt_status, goods_receipt_note_ref, goods_receipt_date, delivery_challan_ref;
+        """),
+        {
+            "st": status_val,
+            "grn_ref": payload.get("goods_receipt_note_ref"),
+            "grn_dt": payload.get("goods_receipt_date"),
+            "dc_ref": payload.get("delivery_challan_ref"),
+            "sc_dt": payload.get("service_completion_date"),
+            "sc_cert": payload.get("service_acceptance_cert_ref"),
+            "d_reason": payload.get("deemed_receipt_reason"),
+            "uid": x_user_id,
+            "ts": now_ts,
+            "id": id,
+            "org": x_org_id
+        }
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Unbooked candidate not found")
+    db.commit()
+    return dict(row._mapping)
+
+
+@router.post("/unbooked-candidates/{id}/book-entry")
+def book_unbooked_candidate_entry(
+    id: str,
+    payload: BookUnbookedCandidateRequest,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Converts an unbooked candidate into an approved/pending purchase document in the purchase register.
+    Preserves MISSING_IN_BOOKS history on the candidate for audit trail.
+    """
+    cand = db.execute(
+        text("SELECT * FROM public.gstr2b_unbooked_candidates WHERE id = :id AND org_id = :org;"),
+        {"id": id, "org": x_org_id}
+    ).fetchone()
+    if not cand:
+        raise HTTPException(status_code=404, detail="Unbooked candidate not found")
+
+    reg = db.execute(
+        text("SELECT gstin FROM public.gst_registrations WHERE id = :rid AND org_id = :org;"),
+        {"rid": payload.registration_id, "org": x_org_id}
+    ).fetchone()
+    if not reg:
+        raise HTTPException(status_code=404, detail="GST Registration not found")
+
+    # Create new purchase document
+    p_id = str(uuid.uuid4())
+    now_ts = datetime.utcnow()
+    db.execute(
+        text("""
+        INSERT INTO public.purchase_documents (
+            id, org_id, registration_id, document_type, document_number,
+            document_date, financial_period, supplier_gstin, supplier_legal_name,
+            recipient_gstin, place_of_supply, is_reverse_charge, supply_category,
+            total_taxable_amount, cgst_amount, sgst_amount, igst_amount, cess_amount,
+            total_invoice_value, goods_services_type, goods_receipt_date,
+            goods_receipt_note_ref, delivery_challan_ref, service_completion_date,
+            service_acceptance_cert_ref, deemed_receipt_reason, receipt_status,
+            purchase_ledger_code, status, created_at, updated_at
+        ) VALUES (
+            :id, :org, :reg_id, 'tax_invoice', :doc_num,
+            :doc_dt, :period, :supp_gstin, :supp_name,
+            :rec_gstin, :pos, false, 'B2B_REGULAR',
+            :taxable, :cgst, :sgst, :igst, :cess,
+            :total_val, 'goods', :grn_dt,
+            :grn_ref, :dc_ref, :sc_dt,
+            :sc_cert, :d_reason, :r_st,
+            :ledger_code, 'draft', :ts, :ts
+        );
+        """),
+        {
+            "id": p_id,
+            "org": x_org_id,
+            "reg_id": payload.registration_id,
+            "doc_num": cand.document_number,
+            "doc_dt": cand.document_date,
+            "period": payload.financial_period,
+            "supp_gstin": cand.supplier_gstin,
+            "supp_name": cand.supplier_name or "Unknown Supplier",
+            "rec_gstin": reg.gstin,
+            "pos": reg.gstin[:2],
+            "taxable": cand.taxable_value,
+            "cgst": cand.cgst_amount,
+            "sgst": cand.sgst_amount,
+            "igst": cand.igst_amount,
+            "cess": cand.cess_amount,
+            "total_val": (cand.taxable_value or Decimal("0.00")) + (cand.total_tax or Decimal("0.00")),
+            "grn_dt": cand.goods_receipt_date,
+            "grn_ref": cand.goods_receipt_note_ref,
+            "dc_ref": cand.delivery_challan_ref,
+            "sc_dt": cand.service_completion_date,
+            "sc_cert": cand.service_acceptance_cert_ref,
+            "d_reason": cand.deemed_receipt_reason,
+            "r_st": cand.receipt_status,
+            "ledger_code": payload.purchase_ledger_code,
+            "ts": now_ts
+        }
+    )
+
+    # Link candidate to newly created purchase document
+    db.execute(
+        text("""
+        UPDATE public.gstr2b_unbooked_candidates
+        SET linked_purchase_doc_id = :pid,
+            updated_at = :ts
+        WHERE id = :id AND org_id = :org;
+        """),
+        {"pid": p_id, "ts": now_ts, "id": id, "org": x_org_id}
+    )
+    db.commit()
+
+    return {
+        "candidate_id": id,
+        "purchase_doc_id": p_id,
+        "status": "BOOKED_FROM_GSTR2B",
+        "reconciliation_status": cand.reconciliation_status,
+        "receipt_status": cand.receipt_status,
+        "created_at": now_ts.isoformat()
+    }
+
+
+@router.post("/rcm/validate", response_model=RCMValidationResponse)
+def validate_rcm_service_endpoint(
+    payload: RCMValidationRequest,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Statutory Section 9(3) / 5(3) Reverse Charge Mechanism & GTA Service Validation.
+    Verifies supplier forward charge declarations (Annexure V), consignment note requirements,
+    recipient category conditions, place of supply (Section 12(8) IGST Act), and cash discharge status.
+    """
+    res = validate_rcm_and_gta_eligibility(
+        service_type=payload.service_type,
+        taxable_value=payload.taxable_value,
+        gst_rate=payload.gst_rate,
+        supplier_gstin=payload.supplier_gstin,
+        recipient_gstin=payload.recipient_gstin,
+        place_of_supply=payload.place_of_supply,
+        has_consignment_note=payload.has_consignment_note,
+        consignment_note_number=payload.consignment_note_number,
+        gta_opted_forward_charge=payload.gta_opted_forward_charge,
+        supplier_annexure_v_declaration=payload.supplier_annexure_v_declaration,
+        recipient_constitution=payload.recipient_constitution,
+        cash_payment_challan_ref=payload.cash_payment_challan_ref,
+        cash_payment_date=payload.cash_payment_date
+    )
+    return RCMValidationResponse(
+        is_rcm_applicable=res.is_rcm_applicable,
+        tax_type=res.tax_type,
+        cgst_amount=res.cgst_amount,
+        sgst_amount=res.sgst_amount,
+        igst_amount=res.igst_amount,
+        total_rcm_tax=res.total_rcm_tax,
+        is_cash_discharged=res.is_cash_discharged,
+        itc_eligibility_status=res.itc_eligibility_status,
+        statutory_basis=res.statutory_basis,
+        explanation=res.explanation
+    )

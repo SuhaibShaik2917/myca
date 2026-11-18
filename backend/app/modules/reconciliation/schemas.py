@@ -154,6 +154,15 @@ class PurchaseDocumentCreate(BaseModel):
     deemed_receipt_reason: Optional[str] = None
     goods_receipt_date: Optional[str] = None
     goods_receipt_note_ref: Optional[str] = None
+    service_acceptance_cert_ref: Optional[str] = None
+    total_lots_expected: int = 1
+    lots_received_count: int = 0
+    is_last_lot_received: bool = False
+    quantity_expected: Optional[Decimal] = None
+    quantity_received: Optional[Decimal] = None
+    remaining_quantity: Optional[Decimal] = None
+    supplier_delivery_evidence: Optional[Dict[str, Any]] = None
+    lot_details: Optional[List[Dict[str, Any]]] = None
     purchase_ledger_code: Optional[str] = None
     is_availed_in_3b: bool = False
     availed_period: Optional[str] = None
@@ -285,6 +294,7 @@ class GSTR3BTable4WorkingOutput(BaseModel):
     itc_reversed_rule_38_42_43: Decimal = Decimal("0.00")              # 4(B)(1) Non-reclaimable: Rules 38, 42, 43 and Section 17(5)
     itc_reversed_rule_37_180_days: Decimal = Decimal("0.00")           # Part of 4(B)(2) Reclaimable
     itc_reversed_rule_37a: Decimal = Decimal("0.00")                   # Part of 4(B)(2) Reclaimable
+    itc_reversed_sec_16_2_b_receipt: Decimal = Decimal("0.00")        # Part of 4(B)(2) Reclaimable: Section 16(2)(b) goods/services unreceived
     itc_reversed_other: Decimal = Decimal("0.00")                      # Part of 4(B)(2) Reclaimable
     total_itc_reversed_reclaimable_4b2: Decimal = Decimal("0.00")     # Total 4(B)(2)
     total_itc_reversed: Decimal = Decimal("0.00")                     # Total 4(B) = 4(B)(1) + 4(B)(2)
@@ -482,5 +492,102 @@ class Rule37InterestCalculationResponse(BaseModel):
     statutory_basis: str
     explanation: str
     source_ecl_transactions: Optional[List[Dict[str, Any]]] = None
+
+
+# --- Milestone 2.6: Receipt Gate & Unbooked Candidates Models ---
+
+class ReceiptVerificationRequest(BaseModel):
+    receipt_status: ReceiptStatusEnum
+    goods_receipt_date: Optional[str] = None
+    goods_receipt_note_ref: Optional[str] = None
+    delivery_challan_ref: Optional[str] = None
+    quantity_received: Optional[Decimal] = None
+    remaining_quantity: Optional[Decimal] = None
+    is_last_lot: Optional[bool] = False
+    service_completion_date: Optional[str] = None
+    service_acceptance_cert_ref: Optional[str] = None
+    deemed_receipt_legal_basis: Optional[str] = None
+    supplier_delivery_evidence: Optional[Dict[str, Any]] = None
+
+
+class RecordLotDeliveryRequest(BaseModel):
+    lot_number: int
+    delivery_challan_ref: str
+    receipt_date: str
+    quantity_received: Decimal
+    remaining_quantity: Decimal
+    is_last_lot: bool = False
+    carrier_details: Optional[Dict[str, Any]] = None
+
+
+class UnbookedCandidateOut(BaseModel):
+    id: str
+    snapshot_id: str
+    gstr2b_doc_id: str
+    supplier_gstin: str
+    supplier_name: Optional[str] = None
+    document_number: str
+    document_date: str
+    taxable_value: Decimal
+    cgst_amount: Decimal
+    sgst_amount: Decimal
+    igst_amount: Decimal
+    cess_amount: Decimal
+    total_tax: Decimal
+    receipt_status: str
+    delivery_challan_ref: Optional[str] = None
+    goods_receipt_note_ref: Optional[str] = None
+    goods_receipt_date: Optional[str] = None
+    service_completion_date: Optional[str] = None
+    service_acceptance_cert_ref: Optional[str] = None
+    deemed_receipt_reason: Optional[str] = None
+    reconciliation_status: str
+    is_reversed_under_4b2: bool
+    is_reclaimed: bool
+    reclaimed_period: Optional[str] = None
+    linked_purchase_doc_id: Optional[str] = None
+    created_at: str
+
+
+class BookUnbookedCandidateRequest(BaseModel):
+    registration_id: str
+    financial_period: str
+    purchase_ledger_code: Optional[str] = "PUR-2026-B2B"
+    notes: Optional[str] = None
+
+
+class RCMValidationRequest(BaseModel):
+    supplier_gstin: str
+    recipient_gstin: str
+    document_number: str
+    document_date: str
+    service_type: str  # GTA_ROAD_TRANSPORT, LEGAL_SERVICES, DIRECTOR_SERVICES, IMPORT_SERVICES, SECURITY_SERVICES, OTHER
+    taxable_value: Decimal
+    gst_rate: Decimal = Decimal("5.00")
+    has_consignment_note: bool = True
+    consignment_note_number: Optional[str] = None
+    consignment_note_date: Optional[str] = None
+    origin_state_code: str
+    destination_state_code: str
+    place_of_supply: str
+    gta_opted_forward_charge: bool = False
+    supplier_annexure_v_declaration: bool = False
+    recipient_constitution: str = "COMPANY"  # COMPANY, REGISTERED_PERSON, FACTORY, SOCIETY, PARTNERSHIP_FIRM, CASUAL_TAXABLE_PERSON, UNREGISTERED_INDIVIDUAL
+    cash_payment_challan_ref: Optional[str] = None
+    cash_payment_date: Optional[str] = None
+
+
+class RCMValidationResponse(BaseModel):
+    is_rcm_applicable: bool
+    tax_type: str  # INTRA_STATE (CGST+SGST) or INTER_STATE (IGST)
+    cgst_amount: Decimal = Decimal("0.00")
+    sgst_amount: Decimal = Decimal("0.00")
+    igst_amount: Decimal = Decimal("0.00")
+    total_rcm_tax: Decimal = Decimal("0.00")
+    is_cash_discharged: bool = False
+    itc_eligibility_status: str  # ELIGIBLE_4A3, PENDING_CASH_DISCHARGE_31D, EXEMPT_NO_RCM, FORWARD_CHARGE_GTA
+    statutory_basis: str
+    explanation: str
+
 
 
