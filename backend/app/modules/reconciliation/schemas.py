@@ -473,6 +473,7 @@ class Rule37InterestCalculationRequest(BaseModel):
     tax_head: Optional[str] = "TOTAL"       # 'IGST', 'CGST', 'SGST', 'CESS', 'TOTAL'
     ecl_head_balances: Optional[Dict[str, Decimal]] = None
     ecl_transactions: Optional[List[Dict[str, Any]]] = None
+    daily_ledger_chronology: Optional[List[Dict[str, Any]]] = None
 
 
 class Rule37InterestCalculationResponse(BaseModel):
@@ -492,6 +493,9 @@ class Rule37InterestCalculationResponse(BaseModel):
     statutory_basis: str
     explanation: str
     source_ecl_transactions: Optional[List[Dict[str, Any]]] = None
+    daily_ledger_chronology: Optional[List[Dict[str, Any]]] = None
+    utilization_episodes: Optional[int] = None
+    recovery_episodes: Optional[int] = None
 
 
 # --- Milestone 2.6: Receipt Gate & Unbooked Candidates Models ---

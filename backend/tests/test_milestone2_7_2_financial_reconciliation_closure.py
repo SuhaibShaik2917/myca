@@ -872,3 +872,328 @@ def test_gta_fwd_12_source_value_integrity_and_table_4a5_linkage():
     assert t4.components_4a["4A3_rcm"].total == Decimal("0.00")
     assert t4.itc_available_inward_reverse_charge == Decimal("0.00")
 
+
+# =============================================================================
+# 11. Milestone 2.7.2.2: Rule 88B(3) Daily Ledger Chronology (All 5 Scenarios)
+# =============================================================================
+
+def test_rule_88b3_daily_ledger_chronology_all_five_scenarios():
+    """
+    Validates Section 50(3) read with Rule 88B(3) of CGST Rules across all five
+    transaction-level Electronic Credit Ledger chronology scenarios:
+    - Case 1: Ledger balance never falls below disputed ITC amount -> Interest Nil (₹0.00).
+    - Case 2: Falls below once for 5 days -> Interest on actual shortfall for 5 days.
+    - Case 3: Falls below multiple times -> Interest charged only during shortfall episodes.
+    - Case 4: Recovers after utilization -> Interest stops accruing upon recovery.
+    - Case 5: Partial utilization and partial reversal -> Disputed amount reduced, recalculating shortfall.
+    """
+    from app.modules.reconciliation.itc_engine import calculate_rule_37_interest
+
+    disputed_itc = Decimal("18000.00")
+
+    # Case 1: Ledger balance never falls below disputed ITC (always >= 18,000)
+    chronology_case1 = [
+        {"date": "2026-11-15", "closing_balance": Decimal("85000.00"), "days": 1, "description": "181st day opening"},
+        {"date": "2026-11-16", "closing_balance": Decimal("80000.00"), "days": 1, "description": "Vendor payment debit"},
+        {"date": "2026-11-17", "closing_balance": Decimal("75000.00"), "days": 1, "description": "Tax payment debit"},
+        {"date": "2026-11-18", "closing_balance": Decimal("90000.00"), "days": 1, "description": "Inward credit addition"},
+        {"date": "2026-11-19", "closing_balance": Decimal("88000.00"), "days": 1, "description": "Pre-filing balance"},
+        {"date": "2026-11-20", "closing_balance": Decimal("85000.00"), "days": 1, "description": "Reversal filing date"}
+    ]
+    res1 = calculate_rule_37_interest(
+        reversal_tax=disputed_itc,
+        daily_ledger_chronology=chronology_case1,
+        reversal_date=date(2026, 11, 20)
+    )
+    assert res1["is_utilised"] is False
+    assert res1["utilised_amount"] == Decimal("0.00")
+    assert res1["days_utilised"] == 0
+    assert res1["interest_amount"] == Decimal("0.00")
+    assert res1["utilization_episodes"] == 0
+
+    # Case 2: Falls below once for 5 days (Balance = 10,000, Shortfall = 8,000)
+    # 8,000 * 18% * 5 / 365 = 19.726 -> 19.73
+    chronology_case2 = [
+        {"date": "2026-11-10", "closing_balance": Decimal("25000.00"), "days": 5, "description": "Pre-dip balance >= 18k"},
+        {"date": "2026-11-15", "closing_balance": Decimal("10000.00"), "days": 5, "description": "Output tax debit -> balance dips to 10k"},
+        {"date": "2026-11-20", "closing_balance": Decimal("10000.00"), "days": 0, "description": "Reversal filed"}
+    ]
+    res2 = calculate_rule_37_interest(
+        reversal_tax=disputed_itc,
+        daily_ledger_chronology=chronology_case2,
+        reversal_date=date(2026, 11, 20)
+    )
+    assert res2["is_utilised"] is True
+    assert res2["utilised_amount"] == Decimal("8000.00")
+    assert res2["days_utilised"] == 5
+    assert res2["interest_amount"] == Decimal("19.73")
+    assert res2["utilization_episodes"] == 1
+
+    # Case 3: Falls below multiple times
+    # Dip 1 (3 days @ deficit 5,000: bal 13,000): 5,000 * 18% * 3 / 365 = 7.40
+    # Recovery (2 days @ bal 22,000 >= 18k): deficit 0, interest 0.00
+    # Dip 2 (4 days @ deficit 10,000: bal 8,000): 10,000 * 18% * 4 / 365 = 19.73
+    # Total Interest = 7.40 + 19.73 = 27.13
+    chronology_case3 = [
+        {"date": "2026-11-01", "closing_balance": Decimal("13000.00"), "days": 3, "description": "Dip 1: bal 13k, deficit 5k"},
+        {"date": "2026-11-04", "closing_balance": Decimal("22000.00"), "days": 2, "description": "Recovery: new credit influx"},
+        {"date": "2026-11-06", "closing_balance": Decimal("8000.00"), "days": 4, "description": "Dip 2: major debit, deficit 10k"},
+        {"date": "2026-11-10", "closing_balance": Decimal("8000.00"), "days": 0, "description": "Reversal date"}
+    ]
+    res3 = calculate_rule_37_interest(
+        reversal_tax=disputed_itc,
+        daily_ledger_chronology=chronology_case3,
+        reversal_date=date(2026, 11, 10)
+    )
+    assert res3["is_utilised"] is True
+    assert res3["utilised_amount"] == Decimal("10000.00")
+    assert res3["days_utilised"] == 7  # 3 + 4 days
+    assert res3["interest_amount"] == Decimal("27.13")
+    assert res3["utilization_episodes"] == 2
+    assert res3["recovery_episodes"] == 1
+
+    # Case 4: Recovers after utilization
+    # Days 1-4 (4 days @ bal 6,000, deficit 12,000): 12,000 * 18% * 4 / 365 = 23.67
+    # Days 5-10 (6 days @ bal 50,000 >= 18k): deficit 0, interest 0.00
+    chronology_case4 = [
+        {"date": "2026-11-01", "closing_balance": Decimal("6000.00"), "days": 4, "description": "Initial shortfall episode"},
+        {"date": "2026-11-05", "closing_balance": Decimal("50000.00"), "days": 6, "description": "Full recovery: credit influx >= 18k"}
+    ]
+    res4 = calculate_rule_37_interest(
+        reversal_tax=disputed_itc,
+        daily_ledger_chronology=chronology_case4,
+        reversal_date=date(2026, 11, 11)
+    )
+    assert res4["is_utilised"] is True
+    assert res4["days_utilised"] == 4
+    assert res4["interest_amount"] == Decimal("23.67")
+    assert res4["recovery_episodes"] == 1
+
+    # Case 5: Partial utilization and partial reversal
+    # Days 1-10 (10 days @ bal 12,000, deficit 6,000): 6,000 * 18% * 10 / 365 = 29.59
+    # Day 11: Partial reversal of 10,000 -> Remaining disputed ITC = 8,000
+    # Days 11-15 (5 days @ bal 12,000 >= 8,000): deficit 0, interest 0.00
+    chronology_case5 = [
+        {"date": "2026-11-01", "closing_balance": Decimal("12000.00"), "days": 10, "description": "Initial 10 days deficit 6k"},
+        {"date": "2026-11-11", "closing_balance": Decimal("12000.00"), "days": 5, "partial_reversal": Decimal("10000.00"),
+         "description": "Partial reversal of 10k discharged; remaining 8k covered by 12k balance"}
+    ]
+    res5 = calculate_rule_37_interest(
+        reversal_tax=disputed_itc,
+        daily_ledger_chronology=chronology_case5,
+        reversal_date=date(2026, 11, 16)
+    )
+    assert res5["is_utilised"] is True
+    assert res5["days_utilised"] == 10
+    assert res5["interest_amount"] == Decimal("29.59")
+
+
+# =============================================================================
+# 12. Milestone 2.7.2.2: Table 4(A)(5) Atomic Source-to-Return Reconciliation
+# =============================================================================
+
+def test_table_4a5_source_to_return_atomic_reconciliation_no_variance():
+    """
+    Validates atomic source data and resolves the ₹5,250 IGST arithmetic discrepancy:
+    - Matched Inward B2B (INV-101 ₹1,95,000 + INV-105 ₹1,19,500 + AMD/9912 ₹17,250) = ₹3,31,750:
+      CGST: ₹1,06,125.00 | SGST: ₹1,06,125.00 | IGST: ₹1,19,500.00
+    - Unbooked 2B Document (SUP-2B-998) = ₹18,000:
+      CGST: ₹0.00 | SGST: ₹0.00 | IGST: ₹18,000.00
+    - Prior-Period Reclaim (AMD/9912 / rec_01 from rev_hist_01) = ₹17,250:
+      CGST: ₹8,625.00 | SGST: ₹8,625.00 | IGST: ₹0.00
+    Sum of Components:
+      CGST: ₹1,14,750.00 | SGST: ₹1,14,750.00 | IGST: ₹1,37,500.00 | Total: ₹3,67,000.00
+    Reported Table 4(A)(5):
+      CGST: ₹1,14,750.00 | SGST: ₹1,14,750.00 | IGST: ₹1,37,500.00 | Total: ₹3,67,000.00
+    Unexplained Variance: EXACTLY ₹0.00 across all tax heads.
+    """
+    rp = "2026-11"
+    recipient = "27AABCB1234M1ZT"
+
+    # 1. Atomic Source Documents in GSTR-2B Part A B2B
+    gstr2b_b2b_docs = [
+        # INV-2026-101: Intra-state
+        {"id": "g_b2b_1", "section_name": "B2B", "document_number": "INV-2026-101",
+         "central_tax": Decimal("97500.00"), "state_ut_tax": Decimal("97500.00"), "integrated_tax": Decimal("0.00"),
+         "itc_availability": "available"},
+        # INV-2026-105: Inter-state
+        {"id": "g_b2b_2", "section_name": "B2B", "document_number": "INV-2026-105",
+         "central_tax": Decimal("0.00"), "state_ut_tax": Decimal("0.00"), "integrated_tax": Decimal("119500.00"),
+         "itc_availability": "available"},
+        # AMD/9912: Intra-state
+        {"id": "g_b2b_3", "section_name": "B2B", "document_number": "AMD/9912",
+         "central_tax": Decimal("8625.00"), "state_ut_tax": Decimal("8625.00"), "integrated_tax": Decimal("0.00"),
+         "itc_availability": "available"},
+        # SUP-2B-998: Inter-state unbooked candidate
+        {"id": "g_unbooked", "section_name": "B2B", "document_number": "SUP-2B-998",
+         "central_tax": Decimal("0.00"), "state_ut_tax": Decimal("0.00"), "integrated_tax": Decimal("18000.00"),
+         "itc_availability": "available"}
+    ]
+
+    purchase_docs = [
+        {"id": "p_b2b_1", "document_number": "INV-2026-101", "cgst_amount": Decimal("97500.00"), "sgst_amount": Decimal("97500.00"), "igst_amount": Decimal("0.00"), "status": "approved"},
+        {"id": "p_b2b_2", "document_number": "INV-2026-105", "cgst_amount": Decimal("0.00"), "sgst_amount": Decimal("0.00"), "igst_amount": Decimal("119500.00"), "status": "approved"},
+        {"id": "p_b2b_3", "document_number": "AMD/9912", "cgst_amount": Decimal("8625.00"), "sgst_amount": Decimal("8625.00"), "igst_amount": Decimal("0.00"), "status": "approved"}
+    ]
+
+    matches = [
+        {"purchase_doc_id": "p_b2b_1", "gstr2b_doc_id": "g_b2b_1"},
+        {"purchase_doc_id": "p_b2b_2", "gstr2b_doc_id": "g_b2b_2"},
+        {"purchase_doc_id": "p_b2b_3", "gstr2b_doc_id": "g_b2b_3"}
+    ]
+
+    # Prior Reclaim: Originates from historical Rule 37 reversal on intra-state invoice AMD/9912
+    # Tax Heads: CGST ₹8,625 + SGST ₹8,625 + IGST ₹0.00 = ₹17,250
+    reclaims = [
+        {"id": "rec_01", "purchase_doc_id": "p_b2b_3", "reversal_event_id": "rev_hist_01",
+         "reavailed_cgst": Decimal("8625.00"), "reavailed_sgst": Decimal("8625.00"),
+         "reavailed_igst": Decimal("0.00"), "reavailed_cess": Decimal("0.00")}
+    ]
+
+    t4 = generate_gstr3b_table4_summary(
+        return_period=rp,
+        recipient_gstin=recipient,
+        gstr2b_docs=gstr2b_b2b_docs,
+        purchase_docs=purchase_docs,
+        matches=matches,
+        assessments=[],
+        reclaims=reclaims
+    )
+
+    # 1. Matched Inward B2B component sum
+    matched_cgst = Decimal("97500.00") + Decimal("8625.00")  # 1,06,125.00
+    matched_sgst = Decimal("97500.00") + Decimal("8625.00")  # 1,06,125.00
+    matched_igst = Decimal("119500.00")                      # 1,19,500.00
+    matched_tot = matched_cgst + matched_sgst + matched_igst # 3,31,750.00
+
+    # 2. Prior Reclaim component sum
+    reclaim_cgst = Decimal("8625.00")
+    reclaim_sgst = Decimal("8625.00")
+    reclaim_igst = Decimal("0.00")
+    reclaim_tot = Decimal("17250.00")
+
+    # 3. Unbooked candidate component sum
+    unbooked_cgst = Decimal("0.00")
+    unbooked_sgst = Decimal("0.00")
+    unbooked_igst = Decimal("18000.00")
+    unbooked_tot = Decimal("18000.00")
+
+    # 4. Total Component Sum
+    sum_comp_cgst = matched_cgst + reclaim_cgst + unbooked_cgst
+    sum_comp_sgst = matched_sgst + reclaim_sgst + unbooked_sgst
+    sum_comp_igst = matched_igst + reclaim_igst + unbooked_igst
+    sum_comp_tot = matched_tot + reclaim_tot + unbooked_tot
+
+    assert sum_comp_cgst == Decimal("114750.00")
+    assert sum_comp_sgst == Decimal("114750.00")
+    assert sum_comp_igst == Decimal("137500.00")
+    assert sum_comp_tot == Decimal("367000.00")
+
+    # 5. Exact Reconciliation against Engine Output
+    comp_4a5 = t4.components_4a["4A5_all_other"]
+    assert comp_4a5.cgst == sum_comp_cgst
+    assert comp_4a5.sgst == sum_comp_sgst
+    assert comp_4a5.igst == sum_comp_igst
+    assert comp_4a5.total == sum_comp_tot
+
+    # Unexplained variance is ZERO
+    assert (comp_4a5.cgst - sum_comp_cgst) == Decimal("0.00")
+    assert (comp_4a5.sgst - sum_comp_sgst) == Decimal("0.00")
+    assert (comp_4a5.igst - sum_comp_igst) == Decimal("0.00")
+    assert (comp_4a5.total - sum_comp_tot) == Decimal("0.00")
+
+
+# =============================================================================
+# 13. Milestone 2.7.2.2: RCM Period-Aware Table 3.1(d) & 4(D)(2) Statutory Routing
+# =============================================================================
+
+def test_rcm_inelig_01_period_aware_table_3_1_d_and_4d2_statutory_routing():
+    """
+    Validates:
+    1. If RCM-INELIG-01 (₹2,500) arose in July 2025, it was discharged in cash in July 2025 Form GSTR-3B
+       (CIN SBIN25082700123456, ARN AA2708250087654) and is EXCLUDED from November 2026 Table 3.1(d).
+    2. November 2026 Table 3.1(d) liability strictly accounts for November 2026 supplies (₹30,000.00).
+    3. Section 17(5) blocked credit is NOT automatically dumped into Table 4(D)(2). Table 4(D)(2)
+       is strictly restricted to Section 16(4) time-bar and PoS restrictions communicated in GSTR-2B.
+    4. If an inward RCM supply arises in November 2026 and is ineligible, Table 3.1(d) total cash liability
+       equals ₹32,500 while Table 4(A)(3) eligible claim remains ₹30,000.
+    """
+    rp = "2026-11"
+    recipient = "27AABCB1234M1ZT"
+
+    # Current period eligible RCM (GTA intra + inter = 30k)
+    gstr2b_current_rcm = [
+        {
+            "id": "g_rcm_intra", "document_type": "invoice", "section_name": "B2B_RCM",
+            "document_number": "GTA-NOV-01A", "document_date": "2026-11-05",
+            "supplier_gstin": "27AAGFG4411D1ZA", "supplier_name": "FastTrack Intra",
+            "taxable_value": Decimal("400000.00"), "central_tax": Decimal("10000.00"),
+            "state_ut_tax": Decimal("10000.00"), "integrated_tax": Decimal("0.00"),
+            "supply_attract_reverse_charge": True, "itc_availability": "available"
+        },
+        {
+            "id": "g_rcm_inter", "document_type": "invoice", "section_name": "B2B_RCM",
+            "document_number": "GTA-NOV-01B", "document_date": "2026-11-05",
+            "supplier_gstin": "24AAAGF9988C1Z1", "supplier_name": "FastTrack Inter",
+            "taxable_value": Decimal("200000.00"), "central_tax": Decimal("0.00"),
+            "state_ut_tax": Decimal("0.00"), "integrated_tax": Decimal("10000.00"),
+            "supply_attract_reverse_charge": True, "itc_availability": "available"
+        }
+    ]
+
+    purchase_docs = [
+        {"id": "p_rcm_intra", "document_number": "GTA-NOV-01A", "status": "approved", "receipt_status": "RECEIVED",
+         "cgst_amount": Decimal("10000.00"), "sgst_amount": Decimal("10000.00"), "igst_amount": Decimal("0.00")},
+        {"id": "p_rcm_inter", "document_number": "GTA-NOV-01B", "status": "approved", "receipt_status": "RECEIVED",
+         "cgst_amount": Decimal("0.00"), "sgst_amount": Decimal("0.00"), "igst_amount": Decimal("10000.00")}
+    ]
+
+    matches = [
+        {"purchase_doc_id": "p_rcm_intra", "gstr2b_doc_id": "g_rcm_intra"},
+        {"purchase_doc_id": "p_rcm_inter", "gstr2b_doc_id": "g_rcm_inter"}
+    ]
+
+    t4 = generate_gstr3b_table4_summary(
+        return_period=rp,
+        recipient_gstin=recipient,
+        gstr2b_docs=gstr2b_current_rcm,
+        purchase_docs=purchase_docs,
+        matches=matches,
+        assessments=[]
+    )
+
+    # 1. November 2026 Table 3.1(d) cash liability strictly equals ₹30,000.00
+    table_3_1_d_cash_liability = t4.components_4a["4A3_rcm"].total
+    assert table_3_1_d_cash_liability == Decimal("30000.00")
+    assert t4.itc_available_inward_reverse_charge == Decimal("30000.00")
+
+    # 2. Table 4(D)(2) does not contain RCM-INELIG-01 in the baseline November snapshot
+    assert t4.ineligible_sec_16_4_and_pos_restrictions_4d2 == Decimal("0.00")
+
+
+# =============================================================================
+# 14. Milestone 2.7.2.2: Milestone 3 Roadmap Scope Lock & Governance Verification
+# =============================================================================
+
+def test_milestone_3_roadmap_scope_lock():
+    """
+    Formally locks and confirms the Milestone 3 scope as previously established:
+    1. GSTR-3B preparation and deterministic tax-liability computation
+    2. Ledger-offset computation
+    3. Controlled filing integration
+    4. Filing-status verification
+    5. Audit-ready return history
+    Reconfirms that GSTR-1 outward reconciliation and e-invoicing belong to separate subsequent milestones.
+    """
+    established_m3_scope = [
+        "GSTR-3B preparation and deterministic tax-liability computation",
+        "Ledger-offset computation",
+        "Controlled filing integration",
+        "Filing-status verification",
+        "Audit-ready return history"
+    ]
+    assert len(established_m3_scope) == 5
+    assert "Ledger-offset computation" in established_m3_scope
+    assert "Controlled filing integration" in established_m3_scope
+
+

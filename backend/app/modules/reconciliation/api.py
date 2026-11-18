@@ -1603,7 +1603,8 @@ def calculate_rule37_interest_endpoint(
         interest_rate_pct=payload.interest_rate_pct,
         tax_head=payload.tax_head or "TOTAL",
         ecl_head_balances=payload.ecl_head_balances,
-        ecl_transactions=payload.ecl_transactions
+        ecl_transactions=payload.ecl_transactions,
+        daily_ledger_chronology=payload.daily_ledger_chronology
     )
 
     return Rule37InterestCalculationResponse(
@@ -1622,7 +1623,10 @@ def calculate_rule37_interest_endpoint(
         is_utilised=calc["is_utilised"],
         statutory_basis=calc["statutory_basis"],
         explanation=calc["explanation"],
-        source_ecl_transactions=calc.get("source_ecl_transactions")
+        source_ecl_transactions=calc.get("source_ecl_transactions"),
+        daily_ledger_chronology=calc.get("daily_ledger_chronology"),
+        utilization_episodes=calc.get("utilization_episodes"),
+        recovery_episodes=calc.get("recovery_episodes")
     )
 
 

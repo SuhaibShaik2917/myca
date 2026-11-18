@@ -15,7 +15,8 @@ def calculate_rule_37_interest(
     interest_rate_pct: Decimal = Decimal("18.00"),
     tax_head: str = "TOTAL",
     ecl_head_balances: Optional[Dict[str, Decimal]] = None,
-    ecl_transactions: Optional[List[Dict[str, Any]]] = None
+    ecl_transactions: Optional[List[Dict[str, Any]]] = None,
+    daily_ledger_chronology: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
     Computes statutory interest liability under Section 50(3) read with Rule 88B(3) of CGST Rules
@@ -23,7 +24,7 @@ def calculate_rule_37_interest(
 
     1. Interest is payable ONLY if and to the extent that the wrongly availed credit was actually utilised.
     2. Under Rule 88B(3), credit is treated as utilised only when the balance in the Electronic Credit
-       Ledger (ECL) falls below the amount of wrongly availed credit.
+       Ledger falls below the amount of wrongly availed credit.
     3. Tax-Head Aggregation Rules (Circular 192/04/2023-GST & Section 49(5)):
        - IGST Wrong Availment: Total balance across IGST + CGST + SGST heads taken together is evaluated
          because IGST credit can be cross-utilized towards IGST, CGST, and SGST liabilities.
@@ -33,11 +34,13 @@ def calculate_rule_37_interest(
        - SGST Wrong Availment: Total balance across SGST + IGST heads is evaluated under Section 49(5)(c).
          (CGST and Cess are excluded).
        - Cess Wrong Availment: Only Compensation Cess ledger balance is evaluated (cross-utilization prohibited).
-    4. If relevant minimum ECL balance >= reversal_tax, the credit was NEVER utilised -> Utilised Amount = 0,
+    4. If relevant minimum Electronic Credit Ledger balance >= reversal_tax: NEVER utilised -> Utilised Amount = 0,
        and Interest is Nil (₹0.00).
-    5. If relevant minimum ECL balance < reversal_tax, Utilised Amount = reversal_tax - max(0, relevant_ecl).
+    5. If relevant minimum Electronic Credit Ledger balance < reversal_tax, Utilised Amount = reversal_tax - max(0, relevant_ecl).
        Interest runs at 18% p.a. on the utilised shortfall from the date of utilisation (debit) to the
        date of reversal in Form GSTR-3B.
+    6. If daily_ledger_chronology is provided, interest is calculated day-by-day or event-by-event on
+       the exact shortfall on each day, capturing dips, multi-dip episodes, recovery periods, and partial reversals.
     """
     rev_tax = Decimal(str(reversal_tax or 0)).quantize(Decimal("0.01"))
     rate = Decimal(str(interest_rate_pct or "18.00"))
@@ -48,7 +51,126 @@ def calculate_rule_37_interest(
     relevant_ecl: Optional[Decimal] = None
     cess_excluded = True
 
-    # 1. Evaluate from chronological ECL transaction ledger if provided
+    # Determine statutory basis string
+    if t_head == "IGST":
+        statutory_basis = "Section 50(3) read with Rule 88B(3) and CBIC Circular No. 192/04/2023-GST"
+    else:
+        statutory_basis = "Section 50(3) read with Rule 88B(3)"
+
+    # 1. Evaluate from daily ledger chronology if provided (Comprehensive Rule 88B(3) day-by-day sequence)
+    if daily_ledger_chronology:
+        chronology_audit_log = []
+        total_interest = Decimal("0.00")
+        current_disputed_itc = rev_tax
+        total_days_utilised = 0
+        max_shortfall = Decimal("0.00")
+        first_util_date: Optional[date] = None
+        in_dip = False
+        dip_episodes = 0
+        recovery_episodes = 0
+        min_chronology_balance: Optional[Decimal] = None
+
+        for entry in daily_ledger_chronology:
+            e_dt_raw = entry.get("date") or entry.get("transaction_date")
+            if isinstance(e_dt_raw, str):
+                e_dt = datetime.strptime(e_dt_raw[:10], "%Y-%m-%d").date()
+            elif isinstance(e_dt_raw, date):
+                e_dt = e_dt_raw
+            else:
+                e_dt = None
+
+            # Handle partial reversal on this date
+            partial_rev = Decimal(str(entry.get("partial_reversal") or 0))
+            if partial_rev > Decimal("0.00"):
+                current_disputed_itc = max(Decimal("0.00"), current_disputed_itc - partial_rev)
+
+            # Determine relevant closing balance for the tax head
+            if "closing_balance" in entry:
+                rel_bal = Decimal(str(entry["closing_balance"]))
+            else:
+                b_i = Decimal(str(entry.get("balance_igst") or 0))
+                b_c = Decimal(str(entry.get("balance_cgst") or 0))
+                b_s = Decimal(str(entry.get("balance_sgst") or 0))
+                b_cs = Decimal(str(entry.get("balance_cess") or 0))
+                if t_head == "IGST":
+                    rel_bal = b_i + b_c + b_s  # Circular 192: Cess excluded
+                elif t_head == "CGST":
+                    rel_bal = b_c + b_i
+                elif t_head == "SGST":
+                    rel_bal = b_s + b_i
+                elif t_head == "CESS":
+                    rel_bal = b_cs
+                else:
+                    rel_bal = b_i + b_c + b_s
+
+            if min_chronology_balance is None or rel_bal < min_chronology_balance:
+                min_chronology_balance = rel_bal
+
+            days = int(entry.get("days", 1))
+
+            # Statutory Rule 88B(3) utilization test:
+            # Shortfall occurs when balance in Electronic Credit Ledger falls below the disputed wrongly availed amount
+            shortfall = max(Decimal("0.00"), current_disputed_itc - rel_bal)
+
+            if shortfall > Decimal("0.00"):
+                if not in_dip:
+                    in_dip = True
+                    dip_episodes += 1
+                if first_util_date is None and e_dt is not None:
+                    first_util_date = e_dt
+                if shortfall > max_shortfall:
+                    max_shortfall = shortfall
+                total_days_utilised += days
+
+                # Daily interest: shortfall * rate / 100 * days / 365
+                day_interest = (shortfall * (rate / Decimal("100.00")) * Decimal(days) / Decimal("365")).quantize(Decimal("0.01"))
+                total_interest += day_interest
+            else:
+                if in_dip:
+                    in_dip = False
+                    recovery_episodes += 1
+                day_interest = Decimal("0.00")
+
+            chronology_audit_log.append({
+                "date": str(e_dt) if e_dt else None,
+                "description": entry.get("description", "Daily Electronic Credit Ledger State"),
+                "closing_balance": rel_bal,
+                "disputed_itc_balance": current_disputed_itc,
+                "utilized_shortfall": shortfall,
+                "days": days,
+                "interest_accrued": day_interest,
+                "cumulative_interest": total_interest
+            })
+
+        min_bal = min_chronology_balance if min_chronology_balance is not None else Decimal("0.00")
+        is_ut = total_interest > Decimal("0.00")
+
+        return {
+            "reversal_tax": rev_tax,
+            "ecl_minimum_balance": min_bal,
+            "relevant_ecl_balance": min_bal,
+            "tax_head": t_head,
+            "cess_excluded": cess_excluded,
+            "utilised_amount": max_shortfall,
+            "utilisation_date": first_util_date,
+            "reversal_date": rev_dt,
+            "days_utilised": total_days_utilised,
+            "interest_rate_pct": rate,
+            "interest_amount": total_interest,
+            "is_utilised": is_ut,
+            "statutory_basis": statutory_basis + " (Transaction-Level Electronic Credit Ledger Chronology)",
+            "explanation": (
+                f"Evaluated {len(daily_ledger_chronology)} ledger event(s) under Rule 88B(3). "
+                f"Identified {dip_episodes} utilization episode(s) and {recovery_episodes} recovery episode(s). "
+                f"Total days utilized: {total_days_utilised} days. Total interest accrued: ₹{total_interest:,.2f}."
+            ),
+            "source_ecl_transactions": ecl_transactions,
+            "daily_ledger_chronology": chronology_audit_log,
+            "utilization_episodes": dip_episodes,
+            "recovery_episodes": recovery_episodes
+        }
+
+    # 2. Evaluate from chronological ECL transaction ledger if provided (legacy interval walk)
     if ecl_transactions:
         min_txn_balance: Optional[Decimal] = None
         first_dip_date: Optional[date] = None
@@ -88,7 +210,7 @@ def calculate_rule_37_interest(
         if computed_u_date is None and first_dip_date is not None:
             computed_u_date = first_dip_date
 
-    # 2. Evaluate from head balances snapshot if transactions not provided
+    # 3. Evaluate from head balances snapshot if transactions not provided
     elif ecl_head_balances:
         b_igst = Decimal(str(ecl_head_balances.get("igst") or 0))
         b_cgst = Decimal(str(ecl_head_balances.get("cgst") or 0))
@@ -106,8 +228,9 @@ def calculate_rule_37_interest(
         else:
             relevant_ecl = b_igst + b_cgst + b_sgst
 
-    # 3. Direct minimum balance fallback
+    # 4. Direct minimum balance fallback
     elif ecl_minimum_balance is not None:
+        relevant_ecl = Decimal(str(ecl_minimum_balance))
         relevant_ecl = Decimal(str(ecl_minimum_balance))
 
     # Determine statutory basis string

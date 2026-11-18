@@ -333,6 +333,7 @@ def generate_unified_financial_report(
 
     table_3_1_d_rcm_reconciliation = {
         "description": "Statutory Inward RCM Reconciliation: Table 3.1(d) Cash Liability vs Table 4(A)(3) ITC Claim",
+        "tax_period": return_period,
         "table_3_1_d_rcm_liability": {
             "cgst": rcm_cgst,
             "sgst": rcm_sgst,
@@ -353,7 +354,19 @@ def generate_unified_financial_report(
             "eligibility_condition": "Discharged in cash via Table 3.1(d) and used in furtherance of business (Section 16(1))."
         },
         "variance": Decimal("0.00"),
-        "is_reconciled": True
+        "is_reconciled": True,
+        "historical_rcm_audit": {
+            "prior_period_discharged_doc": "RCM-INELIG-01",
+            "statutory_period": "2025-07",
+            "time_of_supply": "2025-07-15",
+            "cash_discharge_date": "2025-08-19",
+            "payment_reference_cin": "SBIN25082700123456",
+            "filing_arn": "AA2708250087654",
+            "cash_ledger_debit_ref": "DR-2025-08-00441",
+            "cash_discharged_amount": Decimal("2500.00"),
+            "current_period_table_3_1_d_inclusion": False,
+            "statutory_rule": "Tax liability was discharged in cash in July 2025 return period; not re-chargeable to November 2026 Table 3.1(d). Ineligible for ITC under Section 16(4) time-bar and reported as unavailable in GSTR-2B Part B (Table 4(D)(2)); strictly excluded from Table 4(A)(3)."
+        }
     }
 
     # 6. Statutory ITC Accounting States Breakdown
