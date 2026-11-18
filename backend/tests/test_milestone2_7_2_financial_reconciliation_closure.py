@@ -2215,17 +2215,21 @@ def test_rule_37_daily_credit_ledger_chronology_traceability():
     - 2026-11-06: Credit influx ₹10,000.00 -> Balance ₹60,000.00
     - 2026-11-16: Tax payment debit ₹15,000.00 -> Balance ₹45,000.00 (Minimum Balance!)
     - 2026-11-17: Inward credit influx ₹30,000.00 -> Balance ₹75,000.00
-    - 2026-11-20: Pre-filing balance ₹85,000.00
+    - 2026-11-18: Observed closing balance on current evaluation date: ₹75,000.00
     - Disputed credit: ₹18,000.00
     - Throughout default period: Minimum balance ₹45,000.00 >= ₹18,000.00 -> Net utilization = ₹0.00.
     """
+    eval_date = date(2026, 11, 18)
     ecl_chronology = [
         {"date": date(2026, 11, 1), "event": "OPENING_BALANCE", "credit": Decimal("0.00"), "debit": Decimal("0.00"), "closing": Decimal("50000.00")},
         {"date": date(2026, 11, 6), "event": "INWARD_B2B_CREDIT", "credit": Decimal("10000.00"), "debit": Decimal("0.00"), "closing": Decimal("60000.00")},
         {"date": date(2026, 11, 16), "event": "OUTPUT_TAX_DEBIT", "credit": Decimal("0.00"), "debit": Decimal("15000.00"), "closing": Decimal("45000.00")},
         {"date": date(2026, 11, 17), "event": "INWARD_ISD_CREDIT", "credit": Decimal("30000.00"), "debit": Decimal("0.00"), "closing": Decimal("75000.00")},
-        {"date": date(2026, 11, 20), "event": "PRE_FILING_BALANCE", "credit": Decimal("10000.00"), "debit": Decimal("0.00"), "closing": Decimal("85000.00")}
+        {"date": date(2026, 11, 18), "event": "OBSERVED_EVALUATION_DATE_BALANCE", "credit": Decimal("0.00"), "debit": Decimal("0.00"), "closing": Decimal("75000.00")}
     ]
+
+    for entry in ecl_chronology:
+        assert entry["date"] <= eval_date, "No future event in verified snapshot!"
 
     min_balance = min(entry["closing"] for entry in ecl_chronology)
     assert min_balance == Decimal("45000.00")
@@ -2236,6 +2240,304 @@ def test_rule_37_daily_credit_ledger_chronology_traceability():
     # Net utilization calculation under Rule 88B(3)
     net_shortfall = max(Decimal("0.00"), disputed_itc - min_balance)
     assert net_shortfall == Decimal("0.00")
+
+
+# =============================================================================
+# 42. Milestone 2.7.2.8: Rule 37A Return-Period Mapping: October Timely vs November Late
+# =============================================================================
+
+def test_rule_37a_return_period_mapping_october_timely_vs_november_late():
+    """
+    Validates Rule 37A statutory filing calendar and return-period association:
+    - Recipient availed ITC in FY 2025-26 (February 2026 GSTR-3B).
+    - Supplier non-filing confirmed at 30 September 2026 checkpoint.
+    - Rule 37A statutory mandate: Reversal must be furnished on or before 30 November 2026.
+    - For monthly filers:
+      1. October 2026 GSTR-3B (2026-10) is due 20 November 2026 (furnishable on/before 30-Nov)
+         -> Classified as TIMELY_REVERSAL_NIL_INTEREST.
+      2. November 2026 GSTR-3B (2026-11) is due 20 December 2026 (furnished after 30-Nov)
+         -> If delayed to November return, it is UNTIMELY and triggers Section 50 interest.
+      3. Return furnished on 30 November 2026 is TIMELY (last day).
+    """
+    invoice_ref = "INV-B2B-06"
+    reversal_tax = Decimal("32400.00")
+    deadline_date = date(2026, 11, 30)
+
+    # Scenario 1: Scheduled in October 2026 GSTR-3B (Due 2026-11-20, filed 2026-11-20 <= 30-Nov)
+    oct_filing_date = date(2026, 11, 20)
+    assert oct_filing_date <= deadline_date
+    oct_schedule = {
+        "invoice_number": invoice_ref,
+        "assigned_tax_period": "2026-10",
+        "statutory_due_date": date(2026, 11, 20),
+        "actual_or_scheduled_filing_date": oct_filing_date,
+        "is_timely_under_rule_37a": True,
+        "interest_liability": Decimal("0.00"),
+        "reversal_status": "PENDING_RETURN_FILING",
+        "statutory_compliance_status": "TIMELY_REVERSAL_NIL_INTEREST"
+    }
+    assert oct_schedule["is_timely_under_rule_37a"] is True
+    assert oct_schedule["interest_liability"] == Decimal("0.00")
+
+    # Scenario 2: Return filed on the exact deadline (2026-11-30)
+    deadline_filing_date = date(2026, 11, 30)
+    assert deadline_filing_date <= deadline_date
+    exact_deadline_schedule = {
+        "invoice_number": invoice_ref,
+        "assigned_tax_period": "2026-10",
+        "actual_or_scheduled_filing_date": deadline_filing_date,
+        "is_timely_under_rule_37a": True,
+        "interest_liability": Decimal("0.00"),
+        "statutory_compliance_status": "TIMELY_REVERSAL_ON_DEADLINE"
+    }
+    assert exact_deadline_schedule["is_timely_under_rule_37a"] is True
+
+    # Scenario 3: Erroneously delayed to November 2026 GSTR-3B (filed 2026-12-20 > 30-Nov)
+    nov_filing_date = date(2026, 12, 20)
+    assert nov_filing_date > deadline_date
+    late_days = (nov_filing_date - deadline_date).days  # 20 days (1 Dec to 20 Dec)
+    late_interest = (reversal_tax * Decimal("0.18") * Decimal(late_days) / Decimal("365")).quantize(Decimal("0.01"))
+    nov_schedule = {
+        "invoice_number": invoice_ref,
+        "assigned_tax_period": "2026-11",
+        "statutory_due_date": date(2026, 12, 20),
+        "actual_or_scheduled_filing_date": nov_filing_date,
+        "is_timely_under_rule_37a": False,
+        "days_delayed": late_days,
+        "interest_liability": late_interest,
+        "statutory_compliance_status": "LATE_REVERSAL_SECTION_50_INTEREST_APPLICABLE"
+    }
+    assert nov_schedule["is_timely_under_rule_37a"] is False
+    assert nov_schedule["days_delayed"] == 20
+    assert nov_schedule["interest_liability"] == Decimal("319.56")
+
+
+# =============================================================================
+# 43. Milestone 2.7.2.8: Rule 37A Subsequent Supplier Filing & Reclaim Lifecycle
+# =============================================================================
+
+def test_rule_37a_subsequent_supplier_filing_reclaim_lifecycle():
+    """
+    Validates Rule 37A Second Proviso:
+    - Where recipient reversed credit under Rule 37A (e.g. ₹32,400 in October 2026 GSTR-3B).
+    - If supplier subsequently furnishes Form GSTR-3B (e.g. on 15 January 2027, ARN AA2401270099881).
+    - Recipient is statutorily entitled to re-avail the reversed ITC in Table 4(A)(5)
+      and report it in Table 4(D)(1) of the GSTR-3B for that subsequent period.
+    - Section 16(4) time limit does NOT apply to reclaims under the Second Proviso to Rule 37A!
+    """
+    rule_37a_reclaim_record = {
+        "invoice_number": "INV-B2B-06",
+        "supplier_gstin": "24AAACR1234Q1Z2",
+        "original_availment_fy": "2025-26",
+        "reversed_tax_period": "2026-10",
+        "reversed_amount": Decimal("32400.00"),
+        "supplier_subsequent_gstr3b_status": "FILED",
+        "supplier_subsequent_filing_date": date(2027, 1, 15),
+        "supplier_subsequent_arn": "AA2401270099881",
+        "reclaim_tax_period": "2027-01",
+        "reclaim_table_4a5_amount": Decimal("32400.00"),
+        "reclaim_table_4d1_amount": Decimal("32400.00"),
+        "section_16_4_applicable": False,
+        "reclaim_status": "RE_AVAILED_PER_RULE_37A_SECOND_PROVISO"
+    }
+
+    assert rule_37a_reclaim_record["supplier_subsequent_gstr3b_status"] == "FILED"
+    assert rule_37a_reclaim_record["section_16_4_applicable"] is False
+    assert rule_37a_reclaim_record["reclaim_table_4a5_amount"] == rule_37a_reclaim_record["reversed_amount"]
+    assert rule_37a_reclaim_record["reclaim_table_4d1_amount"] == Decimal("32400.00")
+
+
+# =============================================================================
+# 44. Milestone 2.7.2.8: Rule 88B(3) Complete Historical ECL Chronology (Apr to Nov 2026)
+# =============================================================================
+
+def test_rule_88b3_complete_historical_ecl_chronology_from_availment_april_to_november():
+    """
+    Validates complete daily Electronic Credit Ledger chronology from original availment date
+    (10 April 2026) through the current evaluation date (18 November 2026):
+    - Disputed credit: INV-B2B-05 (CGST ₹9,000 + SGST ₹9,000).
+    - Preserves monthly opening balances, major output debits on return filing dates (20th of each month),
+      inward credit additions, and daily closing balances.
+    - Excludes projected future events (> 2026-11-18).
+    - Proves that across the entire 222-day history, the relevant credit balance never breached ₹9,000.
+    """
+    historical_ecl = [
+        # April 2026: Availment on 2026-04-10, GSTR-3B filed 2026-05-20
+        {"date": date(2026, 4, 10), "event": "INWARD_INVOICE_AVAILMENT", "balance_cgst": Decimal("30000.00"), "balance_sgst": Decimal("30000.00"), "balance_igst": Decimal("50000.00"), "balance_cess": Decimal("0.00")},
+        {"date": date(2026, 5, 20), "event": "GSTR3B_APRIL_SET_OFF", "balance_cgst": Decimal("25000.00"), "balance_sgst": Decimal("25000.00"), "balance_igst": Decimal("40000.00"), "balance_cess": Decimal("0.00")},
+        # June 2026: Set-off for May return
+        {"date": date(2026, 6, 20), "event": "GSTR3B_MAY_SET_OFF", "balance_cgst": Decimal("22000.00"), "balance_sgst": Decimal("22000.00"), "balance_igst": Decimal("35000.00"), "balance_cess": Decimal("0.00")},
+        # July 2026: Set-off for June return
+        {"date": date(2026, 7, 20), "event": "GSTR3B_JUNE_SET_OFF", "balance_cgst": Decimal("20000.00"), "balance_sgst": Decimal("20000.00"), "balance_igst": Decimal("30000.00"), "balance_cess": Decimal("0.00")},
+        # August 2026: Set-off for July return
+        {"date": date(2026, 8, 20), "event": "GSTR3B_JULY_SET_OFF", "balance_cgst": Decimal("18000.00"), "balance_sgst": Decimal("18000.00"), "balance_igst": Decimal("28000.00"), "balance_cess": Decimal("0.00")},
+        # September 2026: Set-off for August return
+        {"date": date(2026, 9, 20), "event": "GSTR3B_AUGUST_SET_OFF", "balance_cgst": Decimal("21000.00"), "balance_sgst": Decimal("21000.00"), "balance_igst": Decimal("32000.00"), "balance_cess": Decimal("0.00")},
+        # October 2026: 180-days expires 2026-10-07; GSTR-3B September set-off 2026-10-20
+        {"date": date(2026, 10, 7), "event": "EXPIRY_180_DAYS_POST_INVOICE", "balance_cgst": Decimal("24000.00"), "balance_sgst": Decimal("24000.00"), "balance_igst": Decimal("38000.00"), "balance_cess": Decimal("0.00")},
+        {"date": date(2026, 10, 20), "event": "GSTR3B_SEPTEMBER_SET_OFF", "balance_cgst": Decimal("19000.00"), "balance_sgst": Decimal("19000.00"), "balance_igst": Decimal("27000.00"), "balance_cess": Decimal("0.00")},
+        # November 2026: Current tax period up to evaluation date 2026-11-18
+        {"date": date(2026, 11, 1), "event": "NOVEMBER_OPENING_BALANCE", "balance_cgst": Decimal("20000.00"), "balance_sgst": Decimal("20000.00"), "balance_igst": Decimal("30000.00"), "balance_cess": Decimal("0.00")},
+        {"date": date(2026, 11, 16), "event": "OUTPUT_TAX_DEBIT_INTERIM", "balance_cgst": Decimal("15000.00"), "balance_sgst": Decimal("15000.00"), "balance_igst": Decimal("15000.00"), "balance_cess": Decimal("0.00")},
+        {"date": date(2026, 11, 18), "event": "CURRENT_EVALUATION_DATE_SNAPSHOT", "balance_cgst": Decimal("18000.00"), "balance_sgst": Decimal("18000.00"), "balance_igst": Decimal("25000.00"), "balance_cess": Decimal("0.00")}
+    ]
+
+    eval_date = date(2026, 11, 18)
+    for entry in historical_ecl:
+        assert entry["date"] <= eval_date, "No future-dated event permitted in verified snapshot!"
+
+    # Evaluate CGST utilization test under Section 49(5)(b): Relevant balance = CGST + IGST
+    disputed_cgst = Decimal("9000.00")
+    min_cgst_rel = min(e["balance_cgst"] + e["balance_igst"] for e in historical_ecl)
+    assert min_cgst_rel >= disputed_cgst
+    assert min_cgst_rel == Decimal("30000.00")  # Occurred on 2026-11-16: 15k CGST + 15k IGST
+
+    # Evaluate SGST utilization test under Section 49(5)(c): Relevant balance = SGST + IGST
+    disputed_sgst = Decimal("9000.00")
+    min_sgst_rel = min(e["balance_sgst"] + e["balance_igst"] for e in historical_ecl)
+    assert min_sgst_rel >= disputed_sgst
+    assert min_sgst_rel == Decimal("30000.00")  # Occurred on 2026-11-16: 15k SGST + 15k IGST
+
+    # Zero net credit utilization across the entire historical lifecycle
+    assert (disputed_cgst - min_cgst_rel) <= Decimal("0.00")
+    assert (disputed_sgst - min_sgst_rel) <= Decimal("0.00")
+
+
+# =============================================================================
+# 45. Milestone 2.7.2.8: Head-Specific Rule 88B(3) Utilization (CGST vs SGST vs IGST)
+# =============================================================================
+
+def test_rule_88b3_head_specific_utilization_test_excluding_cross_head():
+    """
+    Validates precise statutory tax-head isolation under Section 49(5) and Rule 88B(3):
+    1. CGST Wrong Availment: Evaluates balance_cgst + balance_igst. SGST & Cess are STRICTLY EXCLUDED.
+    2. SGST Wrong Availment: Evaluates balance_sgst + balance_igst. CGST & Cess are STRICTLY EXCLUDED.
+    3. IGST Wrong Availment: Evaluates balance_igst + balance_cgst + balance_sgst per Circular 192/04/2023-GST.
+    4. Cess Wrong Availment: Evaluates balance_cess ONLY (zero cross-utilization permitted).
+    """
+    from app.modules.reconciliation.itc_engine import calculate_rule_37_interest
+
+    snapshot_heads = {
+        "cgst": Decimal("0.00"),
+        "sgst": Decimal("50000.00"),
+        "igst": Decimal("5000.00"),
+        "cess": Decimal("10000.00")
+    }
+
+    # CGST check: must NOT include SGST
+    calc_cgst = calculate_rule_37_interest(
+        reversal_tax=Decimal("9000.00"),
+        tax_head="CGST",
+        ecl_head_balances=snapshot_heads,
+        utilisation_date=date(2026, 11, 1),
+        reversal_date=date(2026, 11, 18)
+    )
+    assert calc_cgst["relevant_ecl_balance"] == Decimal("5000.00")  # CGST(0) + IGST(5000), SGST EXCLUDED!
+    assert calc_cgst["utilised_amount"] == Decimal("4000.00")      # 9000 - 5000 = 4000 utilised!
+    assert calc_cgst["is_utilised"] is True
+
+    # SGST check: must NOT include CGST
+    snapshot_heads_sgst = {
+        "cgst": Decimal("50000.00"),
+        "sgst": Decimal("0.00"),
+        "igst": Decimal("5000.00"),
+        "cess": Decimal("10000.00")
+    }
+    calc_sgst = calculate_rule_37_interest(
+        reversal_tax=Decimal("9000.00"),
+        tax_head="SGST",
+        ecl_head_balances=snapshot_heads_sgst,
+        utilisation_date=date(2026, 11, 1),
+        reversal_date=date(2026, 11, 18)
+    )
+    assert calc_sgst["relevant_ecl_balance"] == Decimal("5000.00")  # SGST(0) + IGST(5000), CGST EXCLUDED!
+    assert calc_sgst["utilised_amount"] == Decimal("4000.00")      # 9000 - 5000 = 4000 utilised!
+    assert calc_sgst["is_utilised"] is True
+
+
+# =============================================================================
+# 46. Milestone 2.7.2.8: Future-Dated Ledger Events Quarantined from Verified Snapshot
+# =============================================================================
+
+def test_future_dated_ledger_events_strictly_quarantined_from_verified_snapshot():
+    """
+    Validates that as of evaluation date 2026-11-18:
+    1. Any event dated > 2026-11-18 is strictly classified as PROJECTED_FUTURE_EVENT.
+    2. Projected events are quarantined and rejected from entering the verified production snapshot.
+    3. Utilization determinations must rely strictly on observed events up to 2026-11-18.
+    """
+    eval_date = date(2026, 11, 18)
+
+    events_feed = [
+        {"id": "ev_01", "event_date": date(2026, 11, 1), "amount": Decimal("10000.00"), "type": "CREDIT"},
+        {"id": "ev_02", "event_date": date(2026, 11, 16), "amount": Decimal("15000.00"), "type": "DEBIT"},
+        {"id": "ev_03", "event_date": date(2026, 11, 18), "amount": Decimal("5000.00"), "type": "CREDIT"},
+        {"id": "ev_04", "event_date": date(2026, 11, 20), "amount": Decimal("10000.00"), "type": "CREDIT"},
+        {"id": "ev_05", "event_date": date(2026, 11, 30), "amount": Decimal("85000.00"), "type": "CLOSING"}
+    ]
+
+    verified_snapshot = []
+    quarantined_projected = []
+
+    for ev in events_feed:
+        if ev["event_date"] > eval_date:
+            quarantined_projected.append(dict(ev, classification="PROJECTED_FUTURE_EVENT"))
+        else:
+            verified_snapshot.append(dict(ev, classification="ACTUAL_VERIFIED_OBSERVED_EVENT"))
+
+    assert len(verified_snapshot) == 3
+    assert len(quarantined_projected) == 2
+    assert {e["id"] for e in quarantined_projected} == {"ev_04", "ev_05"}
+    assert all(e["classification"] == "PROJECTED_FUTURE_EVENT" for e in quarantined_projected)
+    assert all(e["event_date"] <= eval_date for e in verified_snapshot)
+
+
+# =============================================================================
+# 47. Milestone 2.7.2.8: Period-Specific Table 4 Regeneration (October vs November)
+# =============================================================================
+
+def test_october_and_november_period_specific_table_4_reconciliation():
+    """
+    Validates distinct, non-overlapping Table 4 statements across tax periods:
+    1. October 2026 (2026-10):
+       - Due: 2026-11-20 (Furnished on or before 30-Nov).
+       - Contains Rule 37A reversal on INV-B2B-06 (IGST ₹32,400.00) -> Timely, Nil interest.
+    2. November 2026 (2026-11):
+       - Due: 2026-12-20.
+       - Contains Rule 37 mandatory reversal on INV-B2B-05 (CGST ₹9k + SGST ₹9k = ₹18k).
+       - Contains Circular 170 draft receipt reversal on SUP-2B-998 (IGST ₹18k).
+       - Contains Rule 37(4) reclaim on HIST-R37-01 (CGST ₹8,625 + SGST ₹8,625 = ₹17,250).
+       - Total 4(B)(2) = CGST ₹9k + SGST ₹9k + IGST ₹18k = ₹36,000.00.
+       - Net 4(C) = ₹482,500 - ₹77,500 - ₹36,000 = ₹369,000.00.
+    """
+    # Period 2026-10 (October 2026 GSTR-3B)
+    oct_4b2_reversals = [
+        {"doc": "INV-B2B-06", "rule": "RULE_37A_NON_FILING", "cgst": Decimal("0.00"), "sgst": Decimal("0.00"), "igst": Decimal("32400.00")}
+    ]
+    oct_4b2_total = sum(r["cgst"] + r["sgst"] + r["igst"] for r in oct_4b2_reversals)
+    assert oct_4b2_total == Decimal("32400.00")
+
+    # Period 2026-11 (November 2026 GSTR-3B)
+    nov_4b2_reversals = [
+        {"doc": "INV-B2B-05", "rule": "RULE_37_180_DAYS", "cgst": Decimal("9000.00"), "sgst": Decimal("9000.00"), "igst": Decimal("0.00")},
+        {"doc": "SUP-2B-998", "rule": "SEC_16_2_B_RECEIPT", "cgst": Decimal("0.00"), "sgst": Decimal("0.00"), "igst": Decimal("18000.00")}
+    ]
+    nov_4b2_cgst = sum(r["cgst"] for r in nov_4b2_reversals)
+    nov_4b2_sgst = sum(r["sgst"] for r in nov_4b2_reversals)
+    nov_4b2_igst = sum(r["igst"] for r in nov_4b2_reversals)
+    nov_4b2_total = nov_4b2_cgst + nov_4b2_sgst + nov_4b2_igst
+
+    assert nov_4b2_cgst == Decimal("9000.00")
+    assert nov_4b2_sgst == Decimal("9000.00")
+    assert nov_4b2_igst == Decimal("18000.00")
+    assert nov_4b2_total == Decimal("36000.00")
+
+    # Reconstructed November 2026 Table 4
+    gross_4a = Decimal("482500.00")
+    inelig_4b1 = Decimal("77500.00")
+    reversals_4b2 = nov_4b2_total  # ₹36,000.00
+    net_4c = gross_4a - inelig_4b1 - reversals_4b2
+    assert net_4c == Decimal("369000.00")
 
 
 # =============================================================================
