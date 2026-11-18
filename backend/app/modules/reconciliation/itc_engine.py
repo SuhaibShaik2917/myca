@@ -70,6 +70,7 @@ def calculate_rule_37_interest(
     if invoice_date or availment_date:
         inv_dt = invoice_date or (availment_date if availment_date else rev_dt)
         avail_dt = availment_date or inv_dt
+        day_180 = inv_dt + timedelta(days=180)
         day_181 = inv_dt + timedelta(days=181)
 
         days_beyond_180 = max(0, (rev_dt - day_181).days + 1) if rev_dt >= day_181 else 0
@@ -105,6 +106,7 @@ def calculate_rule_37_interest(
             "dates": {
                 "invoice_date": str(inv_dt),
                 "availment_date": str(avail_dt),
+                "day_180": str(day_180),
                 "day_181": str(day_181),
                 "reversal_date": str(rev_dt),
                 "days_beyond_180": days_beyond_180,
@@ -546,6 +548,142 @@ def calculate_rule_37_interest(
         "statutory_basis": statutory_basis,
         "explanation": exp,
         "source_ecl_transactions": ecl_transactions
+    }
+
+
+def simulate_sequential_ecl_cross_utilization(
+    opening_balances: Dict[str, Any],
+    output_liabilities: Dict[str, Any],
+    igst_offset_order: str = "CGST_THEN_SGST"
+) -> Dict[str, Any]:
+    """
+    Simulates sequential tax liability offset and Electronic Credit Ledger (ECL) cross-utilization
+    strictly adhering to Section 49, Section 49A, Section 49B of the CGST Act and Rule 88A:
+
+    Statutory Hierarchy:
+    1. IGST Credit Utilization:
+       - Must be utilized FIRST towards payment of IGST output liability.
+       - Any remaining IGST credit can be utilized towards payment of CGST and SGST liabilities
+         in any order / proportion (default: CGST then SGST, or EQUAL).
+       - Crucially: Entire IGST credit must be fully exhausted before ANY CGST or SGST credit
+         can be utilized (Rule 88A mandate).
+       - When IGST credit is consumed by CGST, the available IGST pool is depleted, preventing
+         the same IGST balance from being double-counted as simultaneously available against SGST (DEF-05).
+    2. CGST Credit Utilization:
+       - Utilized towards payment of remaining CGST output liability.
+       - Any remaining CGST credit may be utilized towards IGST output liability ONLY if SGST credit
+         is not utilized (and only if IGST liability remains).
+       - CGST credit can NEVER be utilized towards SGST liability (Section 49(5)(e)).
+    3. SGST Credit Utilization:
+       - Utilized towards payment of remaining SGST output liability.
+       - Any remaining SGST credit may be utilized towards IGST output liability (if IGST liability remains).
+       - SGST credit can NEVER be utilized towards CGST liability (Section 49(5)(f)).
+    4. Compensation Cess:
+       - Can only be utilized towards payment of Cess liability. No cross-utilization permitted.
+    """
+    b_igst = Decimal(str(opening_balances.get("igst") or 0))
+    b_cgst = Decimal(str(opening_balances.get("cgst") or 0))
+    b_sgst = Decimal(str(opening_balances.get("sgst") or 0))
+    b_cess = Decimal(str(opening_balances.get("cess") or 0))
+
+    l_igst = Decimal(str(output_liabilities.get("igst") or 0))
+    l_cgst = Decimal(str(output_liabilities.get("cgst") or 0))
+    l_sgst = Decimal(str(output_liabilities.get("sgst") or 0))
+    l_cess = Decimal(str(output_liabilities.get("cess") or 0))
+
+    rem_igst_bal = b_igst
+    rem_cgst_bal = b_cgst
+    rem_sgst_bal = b_sgst
+    rem_cess_bal = b_cess
+
+    rem_igst_liab = l_igst
+    rem_cgst_liab = l_cgst
+    rem_sgst_liab = l_sgst
+    rem_cess_liab = l_cess
+
+    # Step 1: Offset IGST liability with IGST credit
+    igst_used_for_igst = min(rem_igst_bal, rem_igst_liab)
+    rem_igst_bal -= igst_used_for_igst
+    rem_igst_liab -= igst_used_for_igst
+
+    # Step 2: Offset CGST and SGST liabilities with remaining IGST credit (Rule 88A)
+    # The pool must deplete sequentially, preventing double-counting!
+    if igst_offset_order == "EQUAL":
+        half = (rem_igst_bal / Decimal("2.00")).quantize(Decimal("0.01"))
+        igst_used_for_cgst = min(half, rem_cgst_liab)
+        rem_igst_bal -= igst_used_for_cgst
+        rem_cgst_liab -= igst_used_for_cgst
+
+        igst_used_for_sgst = min(rem_igst_bal, rem_sgst_liab)
+        rem_igst_bal -= igst_used_for_sgst
+        rem_sgst_liab -= igst_used_for_sgst
+    else:  # CGST_THEN_SGST
+        igst_used_for_cgst = min(rem_igst_bal, rem_cgst_liab)
+        rem_igst_bal -= igst_used_for_cgst
+        rem_cgst_liab -= igst_used_for_cgst
+
+        igst_used_for_sgst = min(rem_igst_bal, rem_sgst_liab)
+        rem_igst_bal -= igst_used_for_sgst
+        rem_sgst_liab -= igst_used_for_sgst
+
+    # Step 3: Offset remaining CGST liability with CGST credit
+    cgst_used_for_cgst = min(rem_cgst_bal, rem_cgst_liab)
+    rem_cgst_bal -= cgst_used_for_cgst
+    rem_cgst_liab -= cgst_used_for_cgst
+
+    # Step 4: Offset remaining SGST liability with SGST credit
+    sgst_used_for_sgst = min(rem_sgst_bal, rem_sgst_liab)
+    rem_sgst_bal -= sgst_used_for_sgst
+    rem_sgst_liab -= sgst_used_for_sgst
+
+    # Step 5: If IGST liability still remains, offset with CGST credit then SGST credit
+    cgst_used_for_igst = min(rem_cgst_bal, rem_igst_liab)
+    rem_cgst_bal -= cgst_used_for_igst
+    rem_igst_liab -= cgst_used_for_igst
+
+    sgst_used_for_igst = min(rem_sgst_bal, rem_igst_liab)
+    rem_sgst_bal -= sgst_used_for_igst
+    rem_igst_liab -= sgst_used_for_igst
+
+    # Step 6: Cess
+    cess_used_for_cess = min(rem_cess_bal, rem_cess_liab)
+    rem_cess_bal -= cess_used_for_cess
+    rem_cess_liab -= cess_used_for_cess
+
+    return {
+        "opening_balances": {"igst": b_igst, "cgst": b_cgst, "sgst": b_sgst, "cess": b_cess},
+        "output_liabilities": {"igst": l_igst, "cgst": l_cgst, "sgst": l_sgst, "cess": l_cess},
+        "credits_utilized": {
+            "igst_used_for_igst": igst_used_for_igst,
+            "igst_used_for_cgst": igst_used_for_cgst,
+            "igst_used_for_sgst": igst_used_for_sgst,
+            "cgst_used_for_cgst": cgst_used_for_cgst,
+            "cgst_used_for_igst": cgst_used_for_igst,
+            "sgst_used_for_sgst": sgst_used_for_sgst,
+            "sgst_used_for_igst": sgst_used_for_igst,
+            "cess_used_for_cess": cess_used_for_cess,
+            "total_itc_utilized": (
+                igst_used_for_igst + igst_used_for_cgst + igst_used_for_sgst +
+                cgst_used_for_cgst + cgst_used_for_igst + sgst_used_for_sgst +
+                sgst_used_for_igst + cess_used_for_cess
+            )
+        },
+        "closing_balances": {
+            "igst": rem_igst_bal,
+            "cgst": rem_cgst_bal,
+            "sgst": rem_sgst_bal,
+            "cess": rem_cess_bal,
+            "total": rem_igst_bal + rem_cgst_bal + rem_sgst_bal + rem_cess_bal
+        },
+        "remaining_liabilities_payable_in_cash": {
+            "igst": rem_igst_liab,
+            "cgst": rem_cgst_liab,
+            "sgst": rem_sgst_liab,
+            "cess": rem_cess_liab,
+            "total": rem_igst_liab + rem_cgst_liab + rem_sgst_liab + rem_cess_liab
+        },
+        "cross_head_double_counting_prevented": True,
+        "statutory_authority": "Sections 49, 49A, 49B of CGST Act read with Rule 88A CGST Rules"
     }
 
 

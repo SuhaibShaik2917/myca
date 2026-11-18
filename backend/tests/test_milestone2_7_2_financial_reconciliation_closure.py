@@ -3123,13 +3123,13 @@ def test_rule_88b3_complete_223_day_daily_ecl_transaction_generator_and_head_iso
     # 4. Compensation Cess tracking
     assert all(row["cl_cess"] == Decimal("0.00") for row in daily_ledger)
 
-    # 5. Review Gate Enforced
+    # 5. Review Gate Enforced & Corrected Rule 88B(3) Arithmetic (DEF-03: 18000 * 18% * 42 / 365 = 372.82)
     ca_gate = {
         "certification_status": "REQUIRES_TAX_PROFESSIONAL_REVIEW",
         "prevent_automatic_certification": True,
         "tested_dataset": "SYNTHETIC_TEST_FIXTURE_REPRODUCIBLE",
         "net_utilization_theory_b": Decimal("0.00"),
-        "interest_theory_a_provisional": Decimal("209.42")
+        "interest_theory_a_provisional": Decimal("372.82")
     }
     assert ca_gate["certification_status"] == "REQUIRES_TAX_PROFESSIONAL_REVIEW"
     assert ca_gate["prevent_automatic_certification"] is True
