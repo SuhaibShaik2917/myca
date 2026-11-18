@@ -51,8 +51,9 @@ def setup_m2_7_1_tenant():
     reg_id_mh = str(uuid.uuid4())
     reg_id_gj = str(uuid.uuid4())
 
+    rand_prefix = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=3))
     rand_digits = "".join(random.choices("0123456789", k=4))
-    pan = f"AAACB{rand_digits}K"
+    pan = f"{rand_prefix}CB{rand_digits}K"
     gstin_mh = f"27{pan}1ZT"
     gstin_gj = f"24{pan}1ZR"
 

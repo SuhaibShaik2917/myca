@@ -51,8 +51,9 @@ def setup_m2_7_2_tenant():
     user_id = str(uuid.uuid4())
     reg_id_mh = str(uuid.uuid4())
 
+    rand_prefix = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=3))
     rand_digits = "".join(random.choices("0123456789", k=4))
-    pan = f"AAACB{rand_digits}K"
+    pan = f"{rand_prefix}CB{rand_digits}K"
     gstin_mh = f"27{pan}1ZT"
 
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
@@ -571,8 +572,9 @@ def test_cross_tenant_isolation_on_unified_financial_report(setup_m2_7_2_tenant)
     org_b = str(uuid.uuid4())
     user_b = str(uuid.uuid4())
     reg_b = str(uuid.uuid4())
+    rand_prefix_b = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=3))
     rand_digits_b = "".join(random.choices("0123456789", k=4))
-    pan_b = f"BBBCB{rand_digits_b}K"
+    pan_b = f"{rand_prefix_b}CB{rand_digits_b}K"
     gstin_b = f"27{pan_b}1ZT"
 
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
@@ -1033,7 +1035,10 @@ def test_table_4a5_source_to_return_atomic_reconciliation_no_variance():
     purchase_docs = [
         {"id": "p_b2b_1", "document_number": "INV-2026-101", "cgst_amount": Decimal("97500.00"), "sgst_amount": Decimal("97500.00"), "igst_amount": Decimal("0.00"), "status": "approved"},
         {"id": "p_b2b_2", "document_number": "INV-2026-105", "cgst_amount": Decimal("0.00"), "sgst_amount": Decimal("0.00"), "igst_amount": Decimal("119500.00"), "status": "approved"},
-        {"id": "p_b2b_3", "document_number": "AMD/9912", "cgst_amount": Decimal("8625.00"), "sgst_amount": Decimal("8625.00"), "igst_amount": Decimal("0.00"), "status": "approved"}
+        # Fresh current-period invoice AMD/9912 from Western Hardware Supplies
+        {"id": "p_b2b_3", "document_number": "AMD/9912", "cgst_amount": Decimal("8625.00"), "sgst_amount": Decimal("8625.00"), "igst_amount": Decimal("0.00"), "status": "approved"},
+        # Distinct historical invoice HIST-R37-01 from May 2026 being reclaimed under Rule 37(4)
+        {"id": "p_hist_r37", "document_number": "HIST-R37-01", "cgst_amount": Decimal("8625.00"), "sgst_amount": Decimal("8625.00"), "igst_amount": Decimal("0.00"), "status": "approved", "availed_period": "2026-05", "is_availed_in_3b": True}
     ]
 
     matches = [
@@ -1042,10 +1047,10 @@ def test_table_4a5_source_to_return_atomic_reconciliation_no_variance():
         {"purchase_doc_id": "p_b2b_3", "gstr2b_doc_id": "g_b2b_3"}
     ]
 
-    # Prior Reclaim: Originates from historical Rule 37 reversal on intra-state invoice AMD/9912
+    # Prior Reclaim: Originates strictly from historical invoice HIST-R37-01 (NEVER from fresh invoice AMD/9912)
     # Tax Heads: CGST ₹8,625 + SGST ₹8,625 + IGST ₹0.00 = ₹17,250
     reclaims = [
-        {"id": "rec_01", "purchase_doc_id": "p_b2b_3", "reversal_event_id": "rev_hist_01",
+        {"id": "rec_01", "purchase_doc_id": "p_hist_r37", "reversal_event_id": "rev_hist_01",
          "reavailed_cgst": Decimal("8625.00"), "reavailed_sgst": Decimal("8625.00"),
          "reavailed_igst": Decimal("0.00"), "reavailed_cess": Decimal("0.00")}
     ]
@@ -1060,14 +1065,72 @@ def test_table_4a5_source_to_return_atomic_reconciliation_no_variance():
         reclaims=reclaims
     )
 
+    # Strict Deduplication Assertions: Zero duplicate counting of AMD/9912
+    reclaimed_ids = {r["purchase_doc_id"] for r in reclaims}
+    matched_ids = {m["purchase_doc_id"] for m in matches}
+    assert "p_b2b_3" not in reclaimed_ids, "Fresh invoice AMD/9912 must NEVER be included in reclaims!"
+    assert "p_hist_r37" not in matched_ids, "Historical reclaim HIST-R37-01 must NEVER be matched to current GSTR-2B!"
+    assert len(reclaimed_ids.intersection(matched_ids)) == 0, "Matched and reclaimed sets must be strictly disjoint!"
+
     # 1. Matched Inward B2B component sum
     matched_cgst = Decimal("97500.00") + Decimal("8625.00")  # 1,06,125.00
     matched_sgst = Decimal("97500.00") + Decimal("8625.00")  # 1,06,125.00
     matched_igst = Decimal("119500.00")                      # 1,19,500.00
     matched_tot = matched_cgst + matched_sgst + matched_igst # 3,31,750.00
 
-    # 2. Prior Reclaim component sum
+    # 2. Prior Reclaim component sum (HIST-R37-01)
     reclaim_cgst = Decimal("8625.00")
+    reclaim_sgst = Decimal("8625.00")
+    reclaim_igst = Decimal("0.00")
+    reclaim_tot = Decimal("17250.00")
+
+    # 3. Unbooked candidate component sum (SUP-2B-998)
+    unbooked_cgst = Decimal("0.00")
+    unbooked_sgst = Decimal("0.00")
+    unbooked_igst = Decimal("18000.00")
+    unbooked_tot = Decimal("18000.00")
+
+    # 4. Total Component Sum
+    sum_comp_cgst = matched_cgst + reclaim_cgst + unbooked_cgst
+    sum_comp_sgst = matched_sgst + reclaim_sgst + unbooked_sgst
+    sum_comp_igst = matched_igst + reclaim_igst + unbooked_igst
+    sum_comp_tot = matched_tot + reclaim_tot + unbooked_tot
+
+    assert sum_comp_cgst == Decimal("114750.00")
+    assert sum_comp_sgst == Decimal("114750.00")
+    assert sum_comp_igst == Decimal("137500.00")
+    assert sum_comp_tot == Decimal("367000.00")
+
+    # 5. Exact Reconciliation against Engine Output
+    comp_4a5 = t4.components_4a["4A5_all_other"]
+    assert comp_4a5.cgst == sum_comp_cgst
+    assert comp_4a5.sgst == sum_comp_sgst
+    assert comp_4a5.igst == sum_comp_igst
+    assert comp_4a5.total == sum_comp_tot
+
+    # Unexplained variance is ZERO
+    assert (comp_4a5.cgst - sum_comp_cgst) == Decimal("0.00")
+    assert (comp_4a5.sgst - sum_comp_sgst) == Decimal("0.00")
+    assert (comp_4a5.igst - sum_comp_igst) == Decimal("0.00")
+    assert (comp_4a5.total - sum_comp_tot) == Decimal("0.00")
+
+    # Model 2 Variance Analysis: If AMD/9912 was exclusively the historical invoice and NOT fresh
+    gstr2b_model2 = [doc for doc in gstr2b_b2b_docs if doc["document_number"] != "AMD/9912"]
+    purchase_model2 = [p for p in purchase_docs if p["document_number"] != "AMD/9912"]
+    matches_model2 = [m for m in matches if m["purchase_doc_id"] != "p_b2b_3"]
+    t4_m2 = generate_gstr3b_table4_summary(
+        return_period=rp,
+        recipient_gstin=recipient,
+        gstr2b_docs=gstr2b_model2,
+        purchase_docs=purchase_model2,
+        matches=matches_model2,
+        assessments=[],
+        reclaims=reclaims
+    )
+    # Under Model 2: Matched B2B = ₹3,14,500, Unbooked = ₹18,000, Reclaim = ₹17,250 -> Total 4(A)(5) = ₹3,49,750.00
+    assert t4_m2.components_4a["4A5_all_other"].total == Decimal("349750.00")
+    assert t4_m2.subtotal_books_matched == Decimal("314500.00")
+    assert t4_m2.subtotal_gstr2b_portal_available == Decimal("332500.00")
     reclaim_sgst = Decimal("8625.00")
     reclaim_igst = Decimal("0.00")
     reclaim_tot = Decimal("17250.00")
@@ -1195,5 +1258,118 @@ def test_milestone_3_roadmap_scope_lock():
     assert len(established_m3_scope) == 5
     assert "Ledger-offset computation" in established_m3_scope
     assert "Controlled filing integration" in established_m3_scope
+
+
+# =============================================================================
+# 15. Milestone 2.7.2.3: Rule 37 vs Rule 88B(3) Interest Separation & Full Lifecycle
+# =============================================================================
+
+def test_rule_37_vs_rule_88b3_statutory_interest_separation_and_full_lifecycle():
+    """
+    Validates the statutory separation between Rule 37(1) liability and Section 50 interest:
+    1. Target Invoice: INV-B2B-05 (April 2026 invoice, availed May 2026, reversed Nov 2026: ₹18,000).
+    2. Primary Basis (Section 50(3) read with Rule 88B(3) & Finance Act 2022):
+       - Assesses entire 184-day lifecycle from availment date (2026-05-20) to reversal (2026-11-20).
+       - Because Electronic Credit Ledger balance stayed above ₹18,000 throughout, interest is Nil (₹0.00).
+    3. Departmental Assessment Alternative (Section 50(1) Time-Based):
+       - Basis B1 (From 181st day 2026-10-08 to 2026-11-20: 43 days): ₹381.70.
+       - Basis B2 (From availment date 2026-05-20 to 2026-11-20: 184 days): ₹1,633.32.
+    4. Proves dual assessment transparency for audit defense.
+    """
+    from app.modules.reconciliation.itc_engine import calculate_rule_37_interest
+
+    disputed_itc = Decimal("18000.00")
+    inv_date = date(2026, 4, 10)
+    avail_date = date(2026, 5, 20)
+    rev_date = date(2026, 11, 20)
+
+    # Full lifecycle daily chronology across 184 days (May to Nov 2026)
+    full_lifecycle_chronology = [
+        {"date": "2026-05-20", "closing_balance": Decimal("85000.00"), "days": 30, "description": "May GSTR-3B filed; credit availed"},
+        {"date": "2026-06-20", "closing_balance": Decimal("90000.00"), "days": 30, "description": "June GSTR-3B output tax discharge"},
+        {"date": "2026-07-20", "closing_balance": Decimal("88000.00"), "days": 31, "description": "July GSTR-3B output tax discharge"},
+        {"date": "2026-08-20", "closing_balance": Decimal("95000.00"), "days": 31, "description": "August GSTR-3B output tax discharge"},
+        {"date": "2026-09-20", "closing_balance": Decimal("85000.00"), "days": 30, "description": "September GSTR-3B output tax discharge"},
+        {"date": "2026-10-07", "closing_balance": Decimal("82000.00"), "days": 1,  "description": "180th day from invoice date 2026-04-10"},
+        {"date": "2026-10-08", "closing_balance": Decimal("82000.00"), "days": 12, "description": "181st day; non-payment condition triggered"},
+        {"date": "2026-10-20", "closing_balance": Decimal("80000.00"), "days": 19, "description": "October GSTR-3B output tax discharge"},
+        {"date": "2026-11-20", "closing_balance": Decimal("85000.00"), "days": 0,  "description": "November GSTR-3B reversal filed"}
+    ]
+
+    calc = calculate_rule_37_interest(
+        reversal_tax=disputed_itc,
+        invoice_date=inv_date,
+        availment_date=avail_date,
+        reversal_date=rev_date,
+        daily_ledger_chronology=full_lifecycle_chronology
+    )
+
+    # 1. Primary Basis: Rule 88B(3) utilization-dependent interest is Nil
+    assert calc["is_utilised"] is False
+    assert calc["utilised_amount"] == Decimal("0.00")
+    assert calc["interest_amount"] == Decimal("0.00")
+
+    # 2. Dual Assessment Structure Present
+    assert "dual_assessment" in calc
+    da = calc["dual_assessment"]
+    assert da["dates"]["invoice_date"] == "2026-04-10"
+    assert da["dates"]["availment_date"] == "2026-05-20"
+    assert da["dates"]["day_181"] == "2026-10-08"
+    assert da["dates"]["days_beyond_180"] == 44 or da["dates"]["days_beyond_180"] == 43
+    assert da["dates"]["days_from_availment"] == 184
+
+    # 3. Departmental Assessment Alternatives Computed
+    comps = da["computations"]
+    assert comps["basis_a_rule_88b_3_utilized"]["interest_amount"] == Decimal("0.00")
+    # Section 50(1) from 181st day: 43 or 44 days * 18% p.a.
+    assert comps["basis_b1_sec_50_1_from_181st_day"]["interest_amount"] > Decimal("380.00")
+    # Section 50(1) from availment date: 184 days * 18% p.a. = ₹1,633.32
+    assert comps["basis_b2_sec_50_1_from_availment"]["interest_amount"] == Decimal("1633.32")
+
+
+# =============================================================================
+# 16. Milestone 2.7.2.3: Electronic Credit Reversal & Reclaimed Statement
+# =============================================================================
+
+def test_electronic_credit_reversal_and_reclaimed_statement_portal_reconciliation(setup_m2_7_2_tenant):
+    """
+    Validates end-to-end reconciliation against the GST Portal's Electronic Credit
+    Reversal and Re-claimed Statement (Notification No. 38/2023-Central Tax):
+    - Opening Reversal Balance: ₹17,250.00 (historical Rule 37 reversals awaiting payment).
+    - Current Additions (Table 4(B)(2)): ₹68,400.00 (Rule 37 ₹18k + Rule 37A ₹32.4k + Unbooked ₹18k).
+    - Current Deductions / Re-claims (Table 4(D)(1) & 4(A)(5)): ₹17,250.00 (HIST-R37-01 paid).
+    - Closing Reversal Balance: ₹68,400.00.
+    - Statement is 100% balanced and reconciled.
+    """
+    ctx = setup_m2_7_2_tenant
+    headers = {"X-User-Id": ctx["user_id"], "X-Org-Id": ctx["org_id"]}
+    rp = "2026-11"
+
+    resp = client.get(
+        f"/api/v1/reconciliation/financial-reports/unified?registration_id={ctx['reg_mh']}&return_period={rp}",
+        headers=headers
+    )
+    assert resp.status_code == 200
+    report = resp.json()
+
+    # Verify presence of Electronic Credit Reversal and Re-claimed Statement
+    assert "electronic_credit_reversal_reclaimed_statement" in report
+    stmt = report["electronic_credit_reversal_reclaimed_statement"]
+    assert stmt["is_reconciled"] is True
+
+    # Verify statement arithmetic: Closing = Opening + 4(B)(2) - 4(D)(1)
+    open_bal = Decimal(str(stmt["opening_reversal_balance"]))
+    add_4b2 = Decimal(str(stmt["current_period_reversals_table_4b2"]))
+    sub_4d1 = Decimal(str(stmt["current_period_reclaims_table_4d1"]))
+    close_bal = Decimal(str(stmt["closing_reversal_balance"]))
+
+    assert close_bal == (open_bal + add_4b2 - sub_4d1)
+
+    # Verify Dual Assessment Object is delivered in unified financial report
+    assert "rule_37_interest_dual_assessment" in report
+    r37_dual = report["rule_37_interest_dual_assessment"]
+    assert r37_dual["primary_statutory_basis_rule_88b_3"]["status"] == "NIL_INTEREST"
+    assert Decimal(str(r37_dual["departmental_assessment_view_sec_50_1"]["basis_from_availment_date"]["interest_exposure"])) == Decimal("1633.32")
+
 
 

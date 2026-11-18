@@ -689,6 +689,8 @@ class UnifiedFinancialReportOut(BaseModel):
     reversals_lineage: Optional[List[Dict[str, Any]]] = []
     unbooked_gstr2b_documents: Optional[List[Dict[str, Any]]] = []
     itc_accounting_states: Optional[Dict[str, Any]] = None
+    electronic_credit_reversal_reclaimed_statement: Optional[Dict[str, Any]] = None
+    rule_37_interest_dual_assessment: Optional[Dict[str, Any]] = None
 
 
 
