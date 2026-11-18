@@ -82,20 +82,37 @@ def create_purchase_document(
         calc_total = calc_taxable + calc_cgst + calc_sgst + calc_igst + calc_cess
 
     # Statutory Section 16(2)(b) receipt verification gate check on creation:
-    # A purchase document cannot be created as RECEIVED without verifiable receipt proof
+    # A purchase document cannot be created as RECEIVED without complete verifiable receipt proof.
     initial_receipt_status = getattr(payload, "receipt_status", "UNKNOWN") or "UNKNOWN"
-    has_goods_proof = bool(payload.goods_receipt_note_ref or payload.delivery_challan_ref or payload.goods_receipt_date)
-    has_service_proof = bool(payload.service_completion_date or getattr(payload, "service_acceptance_cert_ref", None))
-    has_deemed_proof = bool(payload.deemed_receipt_reason)
-
-    if initial_receipt_status == "RECEIVED" and not (has_goods_proof or has_service_proof or has_deemed_proof):
-        initial_receipt_status = "UNKNOWN"
-
-    # Last-lot proviso: if supply is in lots and final lot is not confirmed, cannot be RECEIVED
+    gst_type = (payload.goods_services_type or "goods").lower()
     total_lots = getattr(payload, "total_lots_expected", 1) or 1
-    is_last_lot = getattr(payload, "is_last_lot_received", False)
-    if total_lots > 1 and not is_last_lot and initial_receipt_status == "RECEIVED":
-        initial_receipt_status = "PARTIALLY_RECEIVED"
+
+    if initial_receipt_status in ("RECEIVED", "DEEMED_RECEIVED"):
+        if gst_type == "services":
+            has_service_proof = bool(payload.service_completion_date and getattr(payload, "service_acceptance_cert_ref", None))
+            if not has_service_proof:
+                initial_receipt_status = "UNKNOWN"
+        elif payload.deemed_receipt_reason:
+            has_deemed_proof = bool(payload.deemed_receipt_reason and getattr(payload, "deemed_receipt_category", None))
+            if not has_deemed_proof:
+                initial_receipt_status = "UNKNOWN"
+        else:  # goods
+            has_goods_proof = bool(
+                (payload.goods_receipt_note_ref or payload.delivery_challan_ref) and
+                payload.goods_receipt_date and
+                (payload.quantity_received is not None and payload.quantity_received > Decimal("0.00"))
+            )
+            if not has_goods_proof:
+                initial_receipt_status = "UNKNOWN"
+
+    # Last-lot proviso: if supply is in lots, it cannot be fully RECEIVED at initial document creation.
+    # Full receipt must be derived sequentially from verified lot ledger entries.
+    is_last_lot = False
+    if total_lots > 1:
+        if initial_receipt_status == "RECEIVED":
+            initial_receipt_status = "PARTIALLY_RECEIVED"
+        elif initial_receipt_status != "PARTIALLY_RECEIVED":
+            initial_receipt_status = "UNKNOWN"
 
     doc_id = str(uuid.uuid4())
     insert_doc = session.execute(

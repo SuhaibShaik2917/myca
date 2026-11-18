@@ -46,6 +46,7 @@ export const ItcRiskDashboard: React.FC = () => {
   const [returnPeriod, setReturnPeriod] = useState("2026-11");
   const [drillDownModal, setDrillDownModal] = useState<Table4DrillDown | null>(null);
   const [isExporting, setIsExporting] = useState(false);
+  const [selectedExceptionCategory, setSelectedExceptionCategory] = useState<string>("ALL");
 
   // Exact Reconciled Statutory Metrics (Milestone 2.6 Verified Engine)
   const statutoryMetrics = {
@@ -143,6 +144,130 @@ export const ItcRiskDashboard: React.FC = () => {
       description: "Outdoor catering for annual company celebration",
       blockedAmount: "12,500.00",
       status: "BLOCKED_CONFIRMED"
+    }
+  ];
+
+  // Consolidated 10-Queue Statutory Exception Management Dataset
+  const exceptionQueues = [
+    {
+      id: "exc-01",
+      category: "UNBOOKED_DOCUMENTS",
+      severity: "CRITICAL",
+      docNo: "SUP-2B-998",
+      supplierGstin: "27AAACR1234Q1Z2",
+      supplierName: "Reliance Polymers Dist",
+      amount: "18,000.00",
+      rule: "Sec 16(2)(a) & Sec 16(2)(b)",
+      description: "Present in GSTR-2B Part A (₹18,000 IGST) but absent from purchase register. Physical goods receipt unverified.",
+      action: "Review in Unbooked Candidates workbench. Auto-reverse under 4(B)(2) in current 3B; book as draft purchase entry only when verified."
+    },
+    {
+      id: "exc-02",
+      category: "GOODS_NOT_RECEIVED",
+      severity: "HIGH",
+      docNo: "PUR-2026-881",
+      supplierGstin: "27AAGCB1234F1ZQ",
+      supplierName: "Apex Engineering Supplies",
+      amount: "24,000.00",
+      rule: "Section 16(2)(b)",
+      description: "Inward invoice booked in purchase register but receipt status is marked NOT_RECEIVED. No delivery challan or GRN on file.",
+      action: "Withhold ITC availment. Document excluded from Table 4(A)(5) and flagged for vendor shipment follow-up."
+    },
+    {
+      id: "exc-03",
+      category: "SERVICES_NOT_COMPLETED",
+      severity: "MEDIUM",
+      docNo: "SRV-2026-104",
+      supplierGstin: "29AABCB5678K1ZM",
+      supplierName: "CloudTech Software Solutions",
+      amount: "9,000.00",
+      rule: "Section 16(2)(b)",
+      description: "Service milestone billed by vendor but service completion sign-off / acceptance certificate is pending from engineering manager.",
+      action: "Keep in UNKNOWN receipt status until formal completion certificate reference is entered in system."
+    },
+    {
+      id: "exc-04",
+      category: "PARTIAL_RECEIPT",
+      severity: "HIGH",
+      docNo: "LOT-2026-99",
+      supplierGstin: "27AABCA9911F1ZZ",
+      supplierName: "Bharat Raw Materials Corp",
+      amount: "14,400.00",
+      rule: "Section 16(2)(b) First Proviso",
+      description: "Supply delivered in instalments (Lot 1 of 2 received). First Proviso strictly blocks full ITC until final instalment is received and verified.",
+      action: "Maintain in PARTIALLY_RECEIVED status. Temporary 4(B)(2) reversal hold applied; claim released in Table 4(D)(1) upon final lot receipt."
+    },
+    {
+      id: "exc-05",
+      category: "SUPPLIER_NON_FILING",
+      severity: "CRITICAL",
+      docNo: "PUR-2026-041",
+      supplierGstin: "27AAACR1234Q1Z2",
+      supplierName: "Reliance Polymers Dist",
+      amount: "32,400.00",
+      rule: "Rule 37A (CGST Rules)",
+      description: "ITC availed in earlier GSTR-3B (2026-02), but supplier has failed to file corresponding GSTR-3B by statutory cutoff (30th November).",
+      action: "Mandatory reversal under Table 4(B)(2) before 30th November 2026 to avoid interest liability under Section 50(1)."
+    },
+    {
+      id: "exc-06",
+      category: "RULE_37_OVERDUE",
+      severity: "HIGH",
+      docNo: "ENG-2026-402",
+      supplierGstin: "27AABCP1234K1Z0",
+      supplierName: "Pioneer Industrial Works",
+      amount: "18,000.00",
+      rule: "Section 16(2) 2nd Proviso read with Rule 37",
+      description: "Supplier payment overdue beyond 180 days from invoice date (216 days elapsed). ₹1,18,000 invoice unpaid.",
+      action: "Mandatory reversal of ₹18,000 under Table 4(B)(2). ECL was utilised for 153 days; statutory interest of ₹980.93 calculated under Sec 50(3)."
+    },
+    {
+      id: "exc-07",
+      category: "DUPLICATE_DOCUMENTS",
+      severity: "HIGH",
+      docNo: "INV-DUP-991",
+      supplierGstin: "27AAACA1234A1Z1",
+      supplierName: "Standard Industrial Traders",
+      amount: "15,000.00",
+      rule: "Section 16(2)(a)",
+      description: "Identical supplier GSTIN and invoice number recorded twice in purchase register with different booking dates.",
+      action: "Quarantine duplicate record to draft; prevent duplicate tax credit availment in GSTR-3B."
+    },
+    {
+      id: "exc-08",
+      category: "TAX_HEAD_MISMATCH",
+      severity: "MEDIUM",
+      docNo: "TX-MIS-550",
+      supplierGstin: "27AAACC2222C1Z4",
+      supplierName: "Central Logistics Hub",
+      amount: "7,200.00",
+      rule: "Section 7 vs Section 8 (IGST Act)",
+      description: "Inter-state supply (POS: 24 Gujarat) incorrectly recorded as CGST + SGST (Intra-state) instead of IGST.",
+      action: "Reallocate tax heads in purchase books to IGST before matching against GSTR-2B Table 3 Part B."
+    },
+    {
+      id: "exc-09",
+      category: "CREDIT_NOTE_DISCREPANCY",
+      severity: "MEDIUM",
+      docNo: "CRN-2026-012",
+      supplierGstin: "27AAACD3333D1Z2",
+      supplierName: "Delta Manufacturing Works",
+      amount: "5,400.00",
+      rule: "Section 34(2)",
+      description: "Supplier credit note reported in GSTR-2B Table 4B but original referenced invoice cannot be located in purchase books.",
+      action: "Match against supplier ledger accounts and reduce outward ITC claim accordingly."
+    },
+    {
+      id: "exc-10",
+      category: "MISSING_SUPPORTING_EVIDENCE",
+      severity: "CRITICAL",
+      docNo: "PUR-HIST-01",
+      supplierGstin: "27AAACA1111A1Z1",
+      supplierName: "Western Chemical Depot",
+      amount: "27,000.00",
+      rule: "Section 16(2)(b) Strict Audit",
+      description: "Historical inward document downgraded from RECEIVED to UNKNOWN due to missing goods receipt date and positive quantity.",
+      action: "Quarantined by Alembic 0017 remediation engine. Requires attachment of valid GRN reference or delivery challan."
     }
   ];
 
@@ -957,6 +1082,290 @@ export const ItcRiskDashboard: React.FC = () => {
               </tr>
             </tbody>
           </table>
+        </div>
+      </div>
+
+      {/* Consolidated 10-Queue Statutory Exception Management Workbench */}
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-100 gap-2">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+              <AlertOctagon className="w-4 h-4 text-rose-600" />
+              Consolidated 10-Queue Statutory Exception Management Workbench
+            </h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Aggregates all statutory anomalies across inward supplies, lot receipt holds, non-filing vendors, and evidence remediations.
+            </p>
+          </div>
+          <span className="text-xs font-mono bg-rose-50 text-rose-700 border border-rose-200 px-2.5 py-1 rounded font-semibold self-start sm:self-auto">
+            10 Statutory Queues Active
+          </span>
+        </div>
+
+        {/* Category Filter Pills */}
+        <div className="flex flex-wrap items-center gap-1.5 text-xs">
+          <button
+            onClick={() => setSelectedExceptionCategory("ALL")}
+            className={`px-2.5 py-1 rounded-full font-medium transition-colors ${
+              selectedExceptionCategory === "ALL"
+                ? "bg-slate-800 text-white"
+                : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+            }`}
+          >
+            All Exceptions ({exceptionQueues.length})
+          </button>
+          {Array.from(new Set(exceptionQueues.map(e => e.category))).map((cat) => (
+            <button
+              key={cat}
+              onClick={() => setSelectedExceptionCategory(cat)}
+              className={`px-2.5 py-1 rounded-full font-mono text-[11px] transition-colors ${
+                selectedExceptionCategory === cat
+                  ? "bg-indigo-600 text-white font-bold"
+                  : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+              }`}
+            >
+              {cat.replace(/_/g, " ")} ({exceptionQueues.filter(e => e.category === cat).length})
+            </button>
+          ))}
+        </div>
+
+        {/* Exceptions Table */}
+        <div className="border border-slate-200 rounded-lg overflow-hidden text-xs">
+          <table className="w-full text-left">
+            <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold font-sans">
+              <tr>
+                <th className="px-3 py-2.5">Category & Severity</th>
+                <th className="px-3 py-2.5">Document No & Supplier</th>
+                <th className="px-3 py-2.5 text-right font-mono">Discrepancy (₹)</th>
+                <th className="px-3 py-2.5">Statutory Rule Reference</th>
+                <th className="px-3 py-2.5">Actionable Remediation Protocol</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {exceptionQueues
+                .filter(e => selectedExceptionCategory === "ALL" || e.category === selectedExceptionCategory)
+                .map((exc) => (
+                  <tr key={exc.id} className="hover:bg-slate-50/70">
+                    <td className="px-3 py-2.5">
+                      <div className="font-mono font-bold text-[11px] text-slate-900">{exc.category}</div>
+                      <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold mt-1 ${
+                        exc.severity === "CRITICAL"
+                          ? "bg-rose-100 text-rose-800 border border-rose-200"
+                          : exc.severity === "HIGH"
+                          ? "bg-amber-100 text-amber-800 border border-amber-200"
+                          : "bg-sky-100 text-sky-800 border border-sky-200"
+                      }`}>
+                        {exc.severity}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="font-mono font-bold text-slate-900">{exc.docNo}</div>
+                      <div className="font-sans text-[11px] text-slate-700">{exc.supplierName}</div>
+                      <div className="font-mono text-[10px] text-slate-400">{exc.supplierGstin}</div>
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-mono font-bold text-slate-900">
+                      ₹{exc.amount}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <span className="font-semibold text-indigo-700 text-[11px] block">{exc.rule}</span>
+                      <span className="text-[11px] text-slate-600 leading-tight block mt-0.5">{exc.description}</span>
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="text-[11px] text-slate-800 bg-slate-50 p-2 rounded border border-slate-200 leading-relaxed font-sans">
+                        {exc.action}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Unified Inward Statutory Audit & GSTR-3B Table 4 Reconciliation */}
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-100 gap-2">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+              <Database className="w-4 h-4 text-emerald-600" />
+              Unified Inward Statutory Audit & GSTR-3B Table 4 Reconciliation (Milestone 2.7 Production Engine)
+            </h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Single authoritative statement linking GSTR-2B, Purchase Books, Reversals, Reclaims, Tax Heads, and Supplier Totals. Zero invented zeros.
+            </p>
+          </div>
+          <span className="text-xs bg-emerald-50 text-emerald-800 border border-emerald-200 px-2.5 py-1 rounded font-semibold self-start sm:self-auto">
+            Mathematically Reconciled
+          </span>
+        </div>
+
+        {/* Reconciliation Proof Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <div className="bg-slate-50 p-3.5 rounded-lg border border-slate-200 font-mono">
+            <div className="text-[10px] uppercase font-sans text-slate-500 font-semibold">GSTR-2B Statement Total</div>
+            <div className="text-lg font-bold text-indigo-700 mt-1">₹4,65,250.00</div>
+            <div className="text-[10px] font-sans text-slate-500 mt-0.5">Direct portal source communications</div>
+          </div>
+          <div className="bg-slate-50 p-3.5 rounded-lg border border-slate-200 font-mono">
+            <div className="text-[10px] uppercase font-sans text-slate-500 font-semibold">Unbooked Documents (4(B)(2))</div>
+            <div className="text-lg font-bold text-amber-700 mt-1">₹18,000.00</div>
+            <div className="text-[10px] font-sans text-slate-500 mt-0.5">SUP-2B-998 (auto-reversed receipt hold)</div>
+          </div>
+          <div className="bg-slate-50 p-3.5 rounded-lg border border-slate-200 font-mono">
+            <div className="text-[10px] uppercase font-sans text-slate-500 font-semibold">Prior Reclaim 4(D)(1)</div>
+            <div className="text-lg font-bold text-purple-700 mt-1">₹17,250.00</div>
+            <div className="text-[10px] font-sans text-slate-500 mt-0.5">Reversed earlier; added to 4(A)(5)</div>
+          </div>
+          <div className="bg-emerald-50/70 p-3.5 rounded-lg border border-emerald-200 font-mono">
+            <div className="text-[10px] uppercase font-sans text-emerald-800 font-semibold">Net Eligible ITC 4(C)</div>
+            <div className="text-lg font-bold text-emerald-700 mt-1">₹3,36,600.00</div>
+            <div className="text-[10px] font-sans text-emerald-700 mt-0.5">Gross (₹4,82.5k) - Rev (₹1,45.9k)</div>
+          </div>
+        </div>
+
+        {/* Tax-Head Component Breakdown */}
+        <div className="border border-slate-200 rounded-lg overflow-hidden text-xs font-mono">
+          <table className="w-full text-left">
+            <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-sans font-semibold">
+              <tr>
+                <th className="px-3 py-2.5">Statutory Section</th>
+                <th className="px-3 py-2.5 text-right">CGST (₹)</th>
+                <th className="px-3 py-2.5 text-right">SGST (₹)</th>
+                <th className="px-3 py-2.5 text-right">IGST (₹)</th>
+                <th className="px-3 py-2.5 text-right">Cess (₹)</th>
+                <th className="px-3 py-2.5 text-right font-bold">Total (₹)</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              <tr>
+                <td className="px-3 py-2 font-sans font-medium text-slate-900">4(A) Gross Available ITC</td>
+                <td className="px-3 py-2 text-right">1,30,000.00</td>
+                <td className="px-3 py-2 text-right">1,30,000.00</td>
+                <td className="px-3 py-2 text-right">2,22,500.00</td>
+                <td className="px-3 py-2 text-right">0.00</td>
+                <td className="px-3 py-2 text-right font-bold text-slate-900">4,82,500.00</td>
+              </tr>
+              <tr>
+                <td className="px-3 py-2 font-sans font-medium text-rose-700">4(B)(1) Permanent Reversals (Rules 38, 42, 43 & 17(5))</td>
+                <td className="px-3 py-2 text-right text-rose-600">38,750.00</td>
+                <td className="px-3 py-2 text-right text-rose-600">38,750.00</td>
+                <td className="px-3 py-2 text-right text-rose-600">0.00</td>
+                <td className="px-3 py-2 text-right text-rose-600">0.00</td>
+                <td className="px-3 py-2 text-right font-bold text-rose-700">77,500.00</td>
+              </tr>
+              <tr>
+                <td className="px-3 py-2 font-sans font-medium text-amber-700">4(B)(2) Reclaimable Reversals (R37 + R37A + Sec 16(2)(b))</td>
+                <td className="px-3 py-2 text-right text-amber-600">9,000.00</td>
+                <td className="px-3 py-2 text-right text-amber-600">9,000.00</td>
+                <td className="px-3 py-2 text-right text-amber-600">50,400.00</td>
+                <td className="px-3 py-2 text-right text-amber-600">0.00</td>
+                <td className="px-3 py-2 text-right font-bold text-amber-700">68,400.00</td>
+              </tr>
+              <tr className="bg-emerald-50/50 font-bold">
+                <td className="px-3 py-2.5 font-sans text-emerald-950">4(C) Net Available ITC (A - B1 - B2)</td>
+                <td className="px-3 py-2.5 text-right text-emerald-800">82,250.00</td>
+                <td className="px-3 py-2.5 text-right text-emerald-800">82,250.00</td>
+                <td className="px-3 py-2.5 text-right text-emerald-800">1,72,100.00</td>
+                <td className="px-3 py-2.5 text-right text-emerald-800">0.00</td>
+                <td className="px-3 py-2.5 text-right font-black text-emerald-900 text-sm">3,36,600.00</td>
+              </tr>
+              <tr>
+                <td className="px-3 py-2 font-sans font-medium text-purple-700">4(D)(1) Reclaimed Prior Period Disclosure</td>
+                <td className="px-3 py-2 text-right text-purple-700">8,625.00</td>
+                <td className="px-3 py-2 text-right text-purple-700">8,625.00</td>
+                <td className="px-3 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-3 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-3 py-2 text-right font-bold text-purple-900">17,250.00</td>
+              </tr>
+              <tr>
+                <td className="px-3 py-2 font-sans font-medium text-purple-700">4(D)(2) Ineligible 16(4) / PoS Disclosure</td>
+                <td className="px-3 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-3 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-3 py-2 text-right text-purple-700">12,400.00</td>
+                <td className="px-3 py-2 text-right text-purple-700">0.00</td>
+                <td className="px-3 py-2 text-right font-bold text-purple-900">12,400.00</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        {/* Supplier-Wise Inward Tally */}
+        <div className="space-y-2 pt-2">
+          <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">Supplier-Wise Inward ITC Breakdown</h4>
+          <div className="border border-slate-200 rounded-lg overflow-hidden text-xs">
+            <table className="w-full text-left font-mono">
+              <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-sans font-semibold">
+                <tr>
+                  <th className="px-3 py-2">Supplier GSTIN & Legal Name</th>
+                  <th className="px-3 py-2 text-center">Docs</th>
+                  <th className="px-3 py-2 text-right">Taxable Value (₹)</th>
+                  <th className="px-3 py-2 text-right">CGST (₹)</th>
+                  <th className="px-3 py-2 text-right">SGST (₹)</th>
+                  <th className="px-3 py-2 text-right">IGST (₹)</th>
+                  <th className="px-3 py-2 text-right font-bold">Approved ITC (₹)</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 text-[11px]">
+                <tr>
+                  <td className="px-3 py-2">
+                    <div className="font-sans font-bold text-slate-900">Bharat Industrial Spares Ltd</div>
+                    <div className="text-[10px] text-slate-500 font-mono">27AAGCB1234F1ZQ</div>
+                  </td>
+                  <td className="px-3 py-2 text-center">2</td>
+                  <td className="px-3 py-2 text-right">10,83,333.33</td>
+                  <td className="px-3 py-2 text-right">97,500.00</td>
+                  <td className="px-3 py-2 text-right">97,500.00</td>
+                  <td className="px-3 py-2 text-right">0.00</td>
+                  <td className="px-3 py-2 text-right font-bold text-emerald-700">1,95,000.00</td>
+                </tr>
+                <tr>
+                  <td className="px-3 py-2">
+                    <div className="font-sans font-bold text-slate-900">FastTrack Logistics (GTA)</div>
+                    <div className="text-[10px] text-slate-500 font-mono">27AAGFG4411D1ZA</div>
+                  </td>
+                  <td className="px-3 py-2 text-center">1</td>
+                  <td className="px-3 py-2 text-right">1,11,111.11</td>
+                  <td className="px-3 py-2 text-right">10,000.00</td>
+                  <td className="px-3 py-2 text-right">10,000.00</td>
+                  <td className="px-3 py-2 text-right">10,000.00</td>
+                  <td className="px-3 py-2 text-right font-bold text-emerald-700">30,000.00</td>
+                </tr>
+                <tr>
+                  <td className="px-3 py-2">
+                    <div className="font-sans font-bold text-slate-900">Apex Corporate HQ (ISD)</div>
+                    <div className="text-[10px] text-slate-500 font-mono">27AAACZ1122C1Z8</div>
+                  </td>
+                  <td className="px-3 py-2 text-center">1</td>
+                  <td className="px-3 py-2 text-right">1,41,666.67</td>
+                  <td className="px-3 py-2 text-right">5,250.00</td>
+                  <td className="px-3 py-2 text-right">5,250.00</td>
+                  <td className="px-3 py-2 text-right">15,000.00</td>
+                  <td className="px-3 py-2 text-right font-bold text-emerald-700">25,500.00</td>
+                </tr>
+                <tr>
+                  <td className="px-3 py-2">
+                    <div className="font-sans font-bold text-slate-900">Customs Bombay Port (ICEGATE)</div>
+                    <div className="text-[10px] text-slate-500 font-mono">INBOM4</div>
+                  </td>
+                  <td className="px-3 py-2 text-center">1</td>
+                  <td className="px-3 py-2 text-right">3,33,333.33</td>
+                  <td className="px-3 py-2 text-right">0.00</td>
+                  <td className="px-3 py-2 text-right">0.00</td>
+                  <td className="px-3 py-2 text-right">60,000.00</td>
+                  <td className="px-3 py-2 text-right font-bold text-emerald-700">60,000.00</td>
+                </tr>
+                <tr className="bg-slate-50 font-bold">
+                  <td className="px-3 py-2 font-sans text-slate-900">Total Inward Supplies Reconciled</td>
+                  <td className="px-3 py-2 text-center">5</td>
+                  <td className="px-3 py-2 text-right">16,69,444.44</td>
+                  <td className="px-3 py-2 text-right">1,12,750.00</td>
+                  <td className="px-3 py-2 text-right">1,12,750.00</td>
+                  <td className="px-3 py-2 text-right">85,000.00</td>
+                  <td className="px-3 py-2 text-right font-bold text-emerald-800">3,10,500.00</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
 

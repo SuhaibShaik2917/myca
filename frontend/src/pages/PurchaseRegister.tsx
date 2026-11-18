@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { BookOpen, PlusCircle, CheckCircle, Clock, ShieldCheck, DollarSign, Filter, ChevronRight } from "lucide-react";
+import { BookOpen, PlusCircle, CheckCircle, Clock, ShieldCheck, DollarSign, Filter, ChevronRight, Layers, AlertTriangle, CheckCircle2, History } from "lucide-react";
 
 interface PurchaseDoc {
   id: string;
@@ -17,6 +17,11 @@ interface PurchaseDoc {
   receipt_status: "UNKNOWN" | "NOT_RECEIVED" | "PARTIALLY_RECEIVED" | "RECEIVED" | "DEEMED_RECEIVED";
   delivery_proof_ref?: string;
   lot_info?: string;
+  remediation_status?: string;
+  remediation_notes?: string;
+  total_lots_expected?: number;
+  quantity_expected?: string;
+  remaining_quantity?: string;
 }
 
 export const PurchaseRegister: React.FC = () => {
@@ -83,16 +88,46 @@ export const PurchaseRegister: React.FC = () => {
       goods_services_type: "goods",
       receipt_status: "PARTIALLY_RECEIVED",
       lot_info: "Lot 1 of 2 (Proviso Hold)",
-      delivery_proof_ref: "DC-LOT-01"
+      delivery_proof_ref: "DC-LOT-01",
+      total_lots_expected: 2,
+      quantity_expected: "500.00",
+      remaining_quantity: "250.00"
+    },
+    {
+      id: "doc-pur-005",
+      document_number: "PUR-HIST-01",
+      document_date: "2026-10-10",
+      supplier_gstin: "27AAACA1111A1Z1",
+      supplier_legal_name: "Western Chemical Depot",
+      place_of_supply: "27",
+      total_taxable_amount: "1,50,000.00",
+      tax_amount: "27,000.00",
+      total_invoice_value: "1,77,000.00",
+      status: "draft",
+      is_reverse_charge: false,
+      goods_services_type: "goods",
+      receipt_status: "UNKNOWN",
+      remediation_status: "REMEDIATED_INCOMPLETE_EVIDENCE",
+      remediation_notes: "Downgraded from RECEIVED: missing verified receipt date and positive quantity received."
     }
   ]);
 
   const [showAddForm, setShowAddForm] = useState(false);
   const [showPaymentModal, setShowPaymentModal] = useState<string | null>(null);
   const [showReceiptModal, setShowReceiptModal] = useState<string | null>(null);
+  const [showLotModal, setShowLotModal] = useState<PurchaseDoc | null>(null);
   const [receiptProofRef, setReceiptProofRef] = useState("GRN-2026-");
   const [receiptDate, setReceiptDate] = useState("2026-11-18");
   const [selectedReceiptStatus, setSelectedReceiptStatus] = useState<"RECEIVED" | "PARTIALLY_RECEIVED">("RECEIVED");
+
+  // Lot Modal State
+  const [lotNum, setLotNum] = useState(2);
+  const [lotQty, setLotQty] = useState("250.00");
+  const [lotRef, setLotRef] = useState("DC-LOT-02");
+  const [lotGrn, setLotGrn] = useState("GRN-2026-9902");
+  const [lotCarrier, setLotCarrier] = useState("Direct Express Cargo");
+  const [lotVehicle, setLotVehicle] = useState("MH-12-AB-9922");
+  const [lotEway, setLotEway] = useState("912384719283");
 
   // Form State
   const [docNum, setDocNum] = useState("");
@@ -187,6 +222,29 @@ export const PurchaseRegister: React.FC = () => {
           <PlusCircle className="w-4 h-4" />
           {showAddForm ? "Cancel Entry" : "Record Inward Invoice"}
         </button>
+      </div>
+
+      {/* Historical Remediation Alert Banner */}
+      <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+        <div className="flex items-start gap-3">
+          <History className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+          <div>
+            <h4 className="font-bold text-amber-900 flex items-center gap-2">
+              Statutory Receipt Evidence Remediation Active (Alembic 0017)
+              <span className="text-[10px] bg-amber-200/80 text-amber-900 px-1.5 py-0.5 rounded font-mono font-semibold">
+                Sec 16(2)(b) Strict Audit
+              </span>
+            </h4>
+            <p className="text-amber-800 text-[11px] mt-0.5 leading-relaxed">
+              Inward records missing verified delivery evidence (GRN/challan date, positive received quantity, service completion certificate, or deemed sign-off) are quarantined to <strong>UNKNOWN</strong>. Full ITC is blocked until statutory verification is attached.
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="bg-white px-2.5 py-1 rounded border border-amber-300 font-mono text-[11px] font-bold text-amber-900">
+            4 Records Remediated
+          </span>
+        </div>
       </div>
 
       {/* Add Document Drawer / Form */}
@@ -392,6 +450,11 @@ export const PurchaseRegister: React.FC = () => {
                     {doc.lot_info && (
                       <div className="text-[9px] text-purple-700 font-sans mt-0.5">{doc.lot_info}</div>
                     )}
+                    {doc.remediation_status && (
+                      <div className="text-[9px] bg-rose-50 text-rose-700 px-1 py-0.5 rounded font-mono border border-rose-200 mt-1">
+                        Remediated: Missing Evidence
+                      </div>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-center">
                     <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-semibold ${
@@ -422,6 +485,14 @@ export const PurchaseRegister: React.FC = () => {
                     >
                       Receipt Gate
                     </button>
+                    {doc.goods_services_type === "goods" && (
+                      <button
+                        onClick={() => setShowLotModal(doc)}
+                        className="px-2 py-1 bg-purple-50 hover:bg-purple-100 text-purple-700 rounded text-[10px] font-medium border border-purple-200"
+                      >
+                        Lots / Ledger
+                      </button>
+                    )}
                     <button
                       onClick={() => setShowPaymentModal(doc.id)}
                       className="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded text-[10px] font-medium border border-indigo-200"
@@ -578,6 +649,189 @@ export const PurchaseRegister: React.FC = () => {
                   className="px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white rounded text-xs font-medium"
                 >
                   Save Receipt Verification
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Section 16(2)(b) Lot Delivery Ledger Modal */}
+      {showLotModal && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-xl border border-slate-200 max-w-lg w-full p-6 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                <Layers className="w-4 h-4 text-purple-600" />
+                Goods Receipt Lot Ledger — {showLotModal.document_number}
+              </h3>
+              <span className="text-[10px] bg-purple-100 text-purple-800 font-mono font-semibold px-2 py-0.5 rounded">
+                Sec 16(2)(b) Proviso
+              </span>
+            </div>
+
+            <div className="bg-purple-50/70 border border-purple-200 rounded-lg p-3 text-xs space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-600 font-medium">Statutory Provision:</span>
+                <span className="font-bold text-purple-900">First Proviso to Section 16(2)(b)</span>
+              </div>
+              <p className="text-purple-800 text-[11px] leading-relaxed">
+                Where goods against an invoice are received in lots or instalments, ITC is statutorily available <strong>only upon receipt of the final lot</strong>. Client override flags are strictly ignored; final status is computed exclusively from the immutable lot ledger.
+              </p>
+              <div className="grid grid-cols-3 gap-2 pt-1 font-mono text-[11px]">
+                <div className="bg-white p-2 rounded border border-purple-100">
+                  <div className="text-[10px] text-slate-500 font-sans">Total Lots</div>
+                  <div className="font-bold text-purple-900">{showLotModal.total_lots_expected || 2} Expected</div>
+                </div>
+                <div className="bg-white p-2 rounded border border-purple-100">
+                  <div className="text-[10px] text-slate-500 font-sans">Total Expected Qty</div>
+                  <div className="font-bold text-slate-800">{showLotModal.quantity_expected || "500.00"} units</div>
+                </div>
+                <div className="bg-white p-2 rounded border border-purple-100">
+                  <div className="text-[10px] text-slate-500 font-sans">Remaining Qty</div>
+                  <div className="font-bold text-amber-700">{showLotModal.remaining_quantity || "250.00"} units</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Existing Lot History */}
+            <div className="space-y-2">
+              <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider">Persisted Ledger Entries</h4>
+              <div className="border border-slate-200 rounded-lg overflow-hidden text-xs">
+                <table className="w-full text-left font-mono">
+                  <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 text-[11px] font-sans">
+                    <tr>
+                      <th className="px-3 py-1.5">Lot #</th>
+                      <th className="px-3 py-1.5">Ref / GRN</th>
+                      <th className="px-3 py-1.5 text-right">Received Qty</th>
+                      <th className="px-3 py-1.5 text-center font-sans">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 text-[11px]">
+                    <tr>
+                      <td className="px-3 py-1.5 font-bold">Lot 1</td>
+                      <td className="px-3 py-1.5">
+                        <div>DC-LOT-01</div>
+                        <div className="text-[9px] text-slate-500 font-sans">2026-11-05</div>
+                      </td>
+                      <td className="px-3 py-1.5 text-right">250.00</td>
+                      <td className="px-3 py-1.5 text-center font-sans">
+                        <span className="bg-purple-100 text-purple-800 px-1.5 py-0.5 rounded text-[10px]">
+                          Partially Received
+                        </span>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Record New Lot Form */}
+            <form onSubmit={(e) => {
+              e.preventDefault();
+              const isFinal = lotNum >= (showLotModal.total_lots_expected || 2);
+              setDocuments(prev => prev.map(doc => {
+                if (doc.id === showLotModal.id) {
+                  return {
+                    ...doc,
+                    receipt_status: isFinal ? "RECEIVED" : "PARTIALLY_RECEIVED",
+                    lot_info: isFinal ? `Final Lot ${lotNum} of ${lotNum} (Verified)` : `Lot ${lotNum} of ${showLotModal.total_lots_expected || 2} (Proviso Hold)`,
+                    remaining_quantity: isFinal ? "0.00" : "0.00"
+                  };
+                }
+                return doc;
+              }));
+              setShowLotModal(null);
+            }} className="space-y-3 text-xs border-t border-slate-100 pt-3">
+              <h4 className="font-bold text-slate-800">Record Next Delivery Lot</h4>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Lot Number</label>
+                  <input
+                    type="number"
+                    value={lotNum}
+                    onChange={e => setLotNum(parseInt(e.target.value) || 1)}
+                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Received Quantity</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={lotQty}
+                    onChange={e => setLotQty(e.target.value)}
+                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+                    required
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Delivery Challan / Lot Ref</label>
+                  <input
+                    type="text"
+                    value={lotRef}
+                    onChange={e => setLotRef(e.target.value)}
+                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">GRN Reference</label>
+                  <input
+                    type="text"
+                    value={lotGrn}
+                    onChange={e => setLotGrn(e.target.value)}
+                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+                    required
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Carrier Name</label>
+                  <input
+                    type="text"
+                    value={lotCarrier}
+                    onChange={e => setLotCarrier(e.target.value)}
+                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Vehicle No</label>
+                  <input
+                    type="text"
+                    value={lotVehicle}
+                    onChange={e => setLotVehicle(e.target.value)}
+                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">E-Way Bill No</label>
+                  <input
+                    type="text"
+                    value={lotEway}
+                    onChange={e => setLotEway(e.target.value)}
+                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowLotModal(null)}
+                  className="px-3 py-1.5 border border-slate-300 rounded text-slate-700 text-xs"
+                >
+                  Close
+                </button>
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium"
+                >
+                  Record Lot in Immutable Ledger
                 </button>
               </div>
             </form>

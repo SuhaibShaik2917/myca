@@ -21,9 +21,14 @@ from app.modules.reconciliation.schemas import (
     ITCLedgerEventCreate, ITCLedgerEntryOut, ITCLedgerSummaryOut, IMSActionHistoryOut, ComponentTaxAmount,
     Rule37InterestCalculationRequest, Rule37InterestCalculationResponse,
     ReceiptVerificationRequest, RecordLotDeliveryRequest, UnbookedCandidateOut,
-    BookUnbookedCandidateRequest, RCMValidationRequest, RCMValidationResponse
+    BookUnbookedCandidateRequest, RCMValidationRequest, RCMValidationResponse,
+    LotLedgerEntryCreate, LotLedgerEntryOut, ReceiptRemediationAuditOut,
+    ReconciliationExceptionOut, UnifiedFinancialReportOut
 )
 from app.modules.reconciliation.rcm_service import validate_rcm_and_gta_eligibility, RCMValidationResult
+from app.modules.reconciliation.lot_service import record_lot_to_ledger, list_document_lots
+from app.modules.reconciliation.exception_service import get_consolidated_exceptions
+from app.modules.reconciliation.unified_report_service import generate_unified_financial_report
 from app.modules.reconciliation.gstr2b_parser import parse_gstr2b_json, parse_gstr2b_excel
 from app.modules.reconciliation.purchase_service import (
     create_purchase_document, approve_purchase_document, record_purchase_payment,
@@ -998,60 +1003,50 @@ def update_receipt_evidence(
 @router.post("/purchase/{id}/record-lot")
 def record_purchase_lot_delivery(
     id: str,
-    payload: RecordLotDeliveryRequest,
+    payload: Dict[str, Any],
     x_user_id: str = Header(..., alias="X-User-Id"),
     x_org_id: str = Header(..., alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Records receipt of a delivery lot or instalment under Section 16(2)(b) First Proviso.
-    If is_last_lot is True (or remaining_quantity is 0), transitions to RECEIVED.
-    Otherwise sets status to PARTIALLY_RECEIVED (withholding full ITC availment).
+    Delegates to record_lot_to_ledger which calculates final-lot status strictly from
+    persisted database records and verified quantities. No client boolean is trusted.
     """
-    doc = db.execute(
-        text("SELECT id, total_lots_expected, lots_received_count FROM public.purchase_documents WHERE id = :id AND org_id = :org;"),
-        {"id": id, "org": x_org_id}
-    ).fetchone()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Purchase document not found")
-
-    new_count = (doc.lots_received_count or 0) + 1
-    is_last = payload.is_last_lot or (payload.remaining_quantity <= Decimal("0.00")) or (new_count >= (doc.total_lots_expected or 1))
-    target_status = "RECEIVED" if is_last else "PARTIALLY_RECEIVED"
-
-    now_ts = datetime.utcnow()
-    row = db.execute(
-        text("""
-        UPDATE public.purchase_documents
-        SET receipt_status = :st,
-            delivery_challan_ref = :dc_ref,
-            goods_receipt_date = :dt,
-            quantity_received = COALESCE(quantity_received, 0) + :qty,
-            remaining_quantity = :rem_qty,
-            lots_received_count = :cnt,
-            is_last_lot_received = :is_last,
-            receipt_verified_by = :uid,
-            receipt_verified_at = :ts,
-            updated_at = :ts
-        WHERE id = :id AND org_id = :org
-        RETURNING id, receipt_status, lots_received_count, is_last_lot_received, remaining_quantity;
-        """),
-        {
-            "st": target_status,
-            "dc_ref": payload.delivery_challan_ref,
-            "dt": payload.receipt_date,
-            "qty": payload.quantity_received,
-            "rem_qty": payload.remaining_quantity,
-            "cnt": new_count,
-            "is_last": is_last,
-            "uid": x_user_id,
-            "ts": now_ts,
-            "id": id,
-            "org": x_org_id
-        }
-    ).fetchone()
+    lot_req = LotLedgerEntryCreate(
+        lot_number=int(payload.get("lot_number", 1)),
+        expected_lots_count=payload.get("expected_lots_count") or payload.get("total_lots_expected"),
+        received_quantity=Decimal(str(payload.get("received_quantity") or payload.get("quantity_received") or 0)),
+        lot_reference=payload.get("lot_reference") or payload.get("delivery_challan_ref", f"LOT-{payload.get('lot_number', 1)}"),
+        receipt_date=str(payload.get("receipt_date") or datetime.utcnow().strftime("%Y-%m-%d")),
+        goods_receipt_note_ref=payload.get("goods_receipt_note_ref") or payload.get("delivery_challan_ref", f"GRN-LOT-{payload.get('lot_number', 1)}"),
+        carrier_name=payload.get("carrier_name"),
+        vehicle_number=payload.get("vehicle_number"),
+        eway_bill_number=payload.get("eway_bill_number"),
+        evidence_location=payload.get("evidence_location"),
+        notes=payload.get("notes")
+    )
+    res = record_lot_to_ledger(
+        session=db,
+        org_id=x_org_id,
+        purchase_doc_id=id,
+        payload=lot_req,
+        user_id=x_user_id
+    )
     db.commit()
-    return dict(row._mapping)
+    return res
+
+
+@router.get("/purchase/{id}/lots", response_model=List[LotLedgerEntryOut])
+def get_purchase_document_lots(
+    id: str,
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Returns all immutable verified goods receipt lots for a purchase document.
+    """
+    return list_document_lots(session=db, org_id=x_org_id, purchase_doc_id=id)
 
 
 @router.post("/purchase/{id}/approve")
@@ -2208,15 +2203,23 @@ def book_unbooked_candidate_entry(
     db: Session = Depends(get_tenant_db)
 ):
     """
-    Converts an unbooked candidate into an approved/pending purchase document in the purchase register.
+    Converts an unbooked candidate into a draft/pending-approval purchase document in the purchase register.
     Preserves MISSING_IN_BOOKS history on the candidate for audit trail.
+    Acquires row lock to prevent race conditions and rejects duplicate booking with HTTP 409 Conflict.
+    Enforces that approval remains an explicit, separate authenticated human action.
     """
     cand = db.execute(
-        text("SELECT * FROM public.gstr2b_unbooked_candidates WHERE id = :id AND org_id = :org;"),
+        text("SELECT * FROM public.gstr2b_unbooked_candidates WHERE id = :id AND org_id = :org FOR UPDATE;"),
         {"id": id, "org": x_org_id}
     ).fetchone()
     if not cand:
         raise HTTPException(status_code=404, detail="Unbooked candidate not found")
+
+    if cand.linked_purchase_doc_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Candidate {id} ({cand.document_number}) has already been booked into purchase document {cand.linked_purchase_doc_id}."
+        )
 
     reg = db.execute(
         text("SELECT gstin FROM public.gst_registrations WHERE id = :rid AND org_id = :org;"),
@@ -2225,7 +2228,7 @@ def book_unbooked_candidate_entry(
     if not reg:
         raise HTTPException(status_code=404, detail="GST Registration not found")
 
-    # Create new purchase document
+    # Create new purchase document in draft/pending_approval status
     p_id = str(uuid.uuid4())
     now_ts = datetime.utcnow()
     db.execute(
@@ -2295,6 +2298,8 @@ def book_unbooked_candidate_entry(
         "candidate_id": id,
         "purchase_doc_id": p_id,
         "status": "BOOKED_FROM_GSTR2B",
+        "purchase_document_status": "draft",
+        "approval_required": True,
         "reconciliation_status": cand.reconciliation_status,
         "receipt_status": cand.receipt_status,
         "created_at": now_ts.isoformat()
@@ -2340,3 +2345,111 @@ def validate_rcm_service_endpoint(
         statutory_basis=res.statutory_basis,
         explanation=res.explanation
     )
+
+
+# -----------------------------------------------------------------------------
+# 12. Milestone 2.7: Exception Management & Unified Financial Reports
+# -----------------------------------------------------------------------------
+
+@router.get("/exceptions", response_model=List[ReconciliationExceptionOut])
+def list_reconciliation_exceptions(
+    registration_id: Optional[str] = None,
+    return_period: Optional[str] = None,
+    category: Optional[str] = None,
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Consolidated Inward Compliance & GSTR-2B Exception Queue.
+    Scans and aggregates across all 10 statutory exception queues:
+    UNBOOKED_DOCUMENTS, GOODS_NOT_RECEIVED, SERVICES_NOT_COMPLETED,
+    PARTIAL_RECEIPT, SUPPLIER_NON_FILING, RULE_37_OVERDUE,
+    DUPLICATE_DOCUMENTS, TAX_HEAD_MISMATCH, CREDIT_NOTE_DISCREPANCY,
+    MISSING_SUPPORTING_EVIDENCE.
+    """
+    items = get_consolidated_exceptions(
+        session=db,
+        org_id=x_org_id,
+        registration_id=registration_id,
+        return_period=return_period,
+        category_filter=category
+    )
+    return [
+        ReconciliationExceptionOut(
+            exception_id=i["exception_id"],
+            category=i["category"],
+            document_number=i["document_number"],
+            document_date=i["document_date"],
+            supplier_gstin=i["supplier_gstin"],
+            supplier_name=i["supplier_name"],
+            taxable_value=i["taxable_value"],
+            cgst_amount=i["cgst_amount"],
+            sgst_amount=i["sgst_amount"],
+            igst_amount=i["igst_amount"],
+            cess_amount=i["cess_amount"],
+            total_tax=i["total_tax"],
+            actionable_explanation=i["actionable_explanation"],
+            statutory_citation=i["statutory_citation"],
+            suggested_action=i["suggested_action"],
+            statutory_deadline=i["statutory_deadline"],
+            resolution_status=i["resolution_status"],
+            source_reference_id=i["source_reference_id"],
+            created_at=i["created_at"]
+        )
+        for i in items
+    ]
+
+
+@router.get("/financial-reports/unified", response_model=UnifiedFinancialReportOut)
+def get_unified_financial_report(
+    registration_id: str = Query(...),
+    return_period: str = Query(...),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Generates unified statutory report linking GSTR-2B vs. Books, Form GSTR-3B Table 4,
+    reversal/reclaim ledger, supplier breakdown, and exception queues.
+    Zero invented numbers; every total derives from atomic database records.
+    """
+    res = generate_unified_financial_report(
+        session=db,
+        org_id=x_org_id,
+        registration_id=registration_id,
+        return_period=return_period
+    )
+    return UnifiedFinancialReportOut(**res)
+
+
+@router.get("/remediation-audit", response_model=List[ReceiptRemediationAuditOut])
+def get_receipt_remediation_audit(
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Returns audit records for all purchase documents remediated or downgraded
+    due to incomplete statutory receipt evidence.
+    """
+    rows = db.execute(
+        text("""
+        SELECT * FROM public.receipt_remediation_audit
+        WHERE org_id = :org
+        ORDER BY remediated_at DESC;
+        """),
+        {"org": x_org_id}
+    ).fetchall()
+
+    return [
+        ReceiptRemediationAuditOut(
+            id=str(r.id),
+            purchase_doc_id=str(r.purchase_doc_id),
+            document_number=r.document_number,
+            goods_services_type=r.goods_services_type,
+            previous_status=r.previous_status,
+            new_status=r.new_status,
+            remediation_reason=r.remediation_reason,
+            evidence_snapshot=r.evidence_snapshot if isinstance(r.evidence_snapshot, dict) else {},
+            remediated_at=r.remediated_at.isoformat()
+        )
+        for r in rows
+    ]

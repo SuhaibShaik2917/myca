@@ -590,4 +590,97 @@ class RCMValidationResponse(BaseModel):
     explanation: str
 
 
+# --- Milestone 2.7: Goods Receipt Lot Ledger & Exception Workflows ---
+
+class LotLedgerEntryCreate(BaseModel):
+    lot_number: int = Field(..., ge=1, description="Sequential 1-based lot number")
+    expected_lots_count: Optional[int] = Field(None, ge=1, description="Total lots expected for this order")
+    received_quantity: Decimal = Field(..., gt=0, description="Quantity verified and received in this lot")
+    lot_reference: str = Field(..., description="Unique lot code or packing slip reference")
+    receipt_date: str = Field(..., description="Date lot was physically received (YYYY-MM-DD)")
+    goods_receipt_note_ref: str = Field(..., description="GRN reference issued by store/warehouse")
+    carrier_name: Optional[str] = None
+    vehicle_number: Optional[str] = None
+    eway_bill_number: Optional[str] = None
+    evidence_location: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class LotLedgerEntryOut(BaseModel):
+    id: str
+    purchase_doc_id: str
+    lot_number: int
+    expected_lots_count: int
+    expected_quantity: Decimal
+    received_quantity: Decimal
+    cumulative_received_quantity: Decimal
+    lot_reference: str
+    receipt_date: str
+    goods_receipt_note_ref: str
+    carrier_name: Optional[str] = None
+    vehicle_number: Optional[str] = None
+    eway_bill_number: Optional[str] = None
+    verifier_id: str
+    verification_status: str
+    is_final_lot: bool
+    created_at: str
+
+
+class ReceiptRemediationAuditOut(BaseModel):
+    id: str
+    purchase_doc_id: str
+    document_number: str
+    goods_services_type: Optional[str] = None
+    previous_status: str
+    new_status: str
+    remediation_reason: str
+    evidence_snapshot: Dict[str, Any]
+    remediated_at: str
+
+
+class ReconciliationExceptionOut(BaseModel):
+    exception_id: str
+    category: str
+    document_number: str
+    document_date: Optional[str] = None
+    supplier_gstin: Optional[str] = None
+    supplier_name: Optional[str] = None
+    taxable_value: Decimal = Decimal("0.00")
+    cgst_amount: Decimal = Decimal("0.00")
+    sgst_amount: Decimal = Decimal("0.00")
+    igst_amount: Decimal = Decimal("0.00")
+    cess_amount: Decimal = Decimal("0.00")
+    total_tax: Decimal = Decimal("0.00")
+    actionable_explanation: str
+    statutory_citation: str
+    suggested_action: str
+    statutory_deadline: Optional[str] = None
+    resolution_status: str = "OPEN"
+    source_reference_id: Optional[str] = None
+    created_at: str
+
+
+class UnifiedFinancialReportOut(BaseModel):
+    registration_id: str
+    return_period: str
+    generated_at: str
+    gstr2b_total: Decimal
+    purchase_books_matched: Decimal
+    unbooked_2b_variance: Decimal
+    prior_period_reclaims: Decimal
+    table_4a_gross: Decimal
+    table_4b1_permanent_reversals: Decimal
+    table_4b2_reclaimable_reversals: Decimal
+    table_4b2_receipt_reversals: Decimal
+    table_4c_net_eligible_itc: Decimal
+    table_4d1_reclaimed_disclosure: Decimal
+    table_4d2_ineligible_disclosure: Decimal
+    human_approved_itc: Decimal
+    outstanding_exceptions_count: int
+    exceptions_by_category: Dict[str, int]
+    tax_head_summary: Dict[str, Dict[str, Decimal]]
+    supplier_wise_itc: List[Dict[str, Any]] = []
+
+
+
 
