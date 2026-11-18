@@ -91,7 +91,8 @@ def create_purchase_document(
             total_taxable_amount, cgst_amount, sgst_amount, igst_amount, cess_amount,
             total_invoice_value, goods_services_type, goods_receipt_date,
             goods_receipt_note_ref, purchase_ledger_code, status,
-            is_availed_in_3b, availed_period
+            is_availed_in_3b, availed_period, receipt_status,
+            delivery_challan_ref, service_completion_date, deemed_receipt_reason
         ) VALUES (
             :id, :org_id, :registration_id, :document_type, :document_number,
             :document_date, :financial_period, :supplier_gstin, :supplier_legal_name,
@@ -99,7 +100,8 @@ def create_purchase_document(
             :total_taxable_amount, :cgst_amount, :sgst_amount, :igst_amount, :cess_amount,
             :total_invoice_value, :goods_services_type, :goods_receipt_date,
             :goods_receipt_note_ref, :purchase_ledger_code, 'draft',
-            :is_availed_in_3b, :availed_period
+            :is_availed_in_3b, :availed_period, :receipt_status,
+            :delivery_challan_ref, :service_completion_date, :deemed_receipt_reason
         ) RETURNING id, status, created_at;
         """),
         {
@@ -127,7 +129,11 @@ def create_purchase_document(
             "goods_receipt_note_ref": payload.goods_receipt_note_ref,
             "purchase_ledger_code": payload.purchase_ledger_code,
             "is_availed_in_3b": getattr(payload, "is_availed_in_3b", False),
-            "availed_period": getattr(payload, "availed_period", None)
+            "availed_period": getattr(payload, "availed_period", None),
+            "receipt_status": getattr(payload, "receipt_status", "UNKNOWN") or "UNKNOWN",
+            "delivery_challan_ref": getattr(payload, "delivery_challan_ref", None),
+            "service_completion_date": getattr(payload, "service_completion_date", None),
+            "deemed_receipt_reason": getattr(payload, "deemed_receipt_reason", None)
         }
     ).fetchone()
 

@@ -857,6 +857,58 @@ def list_purchase_documents(
     ]
 
 
+@router.post("/purchase/{id}/verify-receipt")
+def update_receipt_evidence(
+    id: str,
+    payload: Dict[str, Any],
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """Updates Section 16(2)(b) receipt verification status and proof."""
+    status_val = (payload.get("receipt_status") or "RECEIVED").upper()
+    valid_statuses = ("RECEIVED", "PARTIALLY_RECEIVED", "NOT_RECEIVED", "DEEMED_RECEIVED", "UNKNOWN")
+    if status_val not in valid_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid receipt_status '{status_val}'. Must be one of {valid_statuses}."
+        )
+
+    now_ts = datetime.utcnow()
+    row = db.execute(
+        text("""
+        UPDATE public.purchase_documents
+        SET receipt_status = :st,
+            goods_receipt_date = :grn_dt,
+            goods_receipt_note_ref = :grn_ref,
+            delivery_challan_ref = :dc_ref,
+            service_completion_date = :sc_dt,
+            deemed_receipt_reason = :d_reason,
+            receipt_verified_by = :uid,
+            receipt_verified_at = :ts,
+            updated_at = :ts
+        WHERE id = :id AND org_id = :org
+        RETURNING id, receipt_status, goods_receipt_date, goods_receipt_note_ref;
+        """),
+        {
+            "st": status_val,
+            "grn_dt": payload.get("goods_receipt_date"),
+            "grn_ref": payload.get("goods_receipt_note_ref"),
+            "dc_ref": payload.get("delivery_challan_ref"),
+            "sc_dt": payload.get("service_completion_date"),
+            "d_reason": payload.get("deemed_receipt_reason"),
+            "uid": x_user_id,
+            "ts": now_ts,
+            "id": id,
+            "org": x_org_id
+        }
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Purchase document not found")
+    db.commit()
+    return dict(row._mapping)
+
+
 @router.post("/purchase/{id}/approve")
 def approve_purchase(
     id: str,

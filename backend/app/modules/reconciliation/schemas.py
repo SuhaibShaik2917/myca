@@ -28,6 +28,14 @@ class MatchCategoryEnum(str, Enum):
     RCM_MISMATCH = "RCM_MISMATCH"
 
 
+class ReceiptStatusEnum(str, Enum):
+    RECEIVED = "RECEIVED"
+    PARTIALLY_RECEIVED = "PARTIALLY_RECEIVED"
+    NOT_RECEIVED = "NOT_RECEIVED"
+    DEEMED_RECEIVED = "DEEMED_RECEIVED"
+    UNKNOWN = "UNKNOWN"
+
+
 class ITCEligibilityEnum(str, Enum):
     ELIGIBLE_EVIDENCE_COMPLETE = "ELIGIBLE_EVIDENCE_COMPLETE"
     POTENTIALLY_ELIGIBLE = "POTENTIALLY_ELIGIBLE"
@@ -140,6 +148,10 @@ class PurchaseDocumentCreate(BaseModel):
     cess_amount: Optional[Decimal] = Decimal("0.00")
     total_invoice_value: Optional[Decimal] = None
     goods_services_type: Optional[str] = "goods"  # goods, services, both, capital_goods
+    receipt_status: Optional[str] = "UNKNOWN"  # RECEIVED, PARTIALLY_RECEIVED, NOT_RECEIVED, DEEMED_RECEIVED, UNKNOWN
+    delivery_challan_ref: Optional[str] = None
+    service_completion_date: Optional[str] = None
+    deemed_receipt_reason: Optional[str] = None
     goods_receipt_date: Optional[str] = None
     goods_receipt_note_ref: Optional[str] = None
     purchase_ledger_code: Optional[str] = None

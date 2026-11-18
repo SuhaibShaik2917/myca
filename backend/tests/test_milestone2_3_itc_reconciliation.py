@@ -184,7 +184,7 @@ def test_gstr2b_vs_table4_exact_source_reconciliation():
     # 1. Permanent Section 17(5) Reversals: Motor Vehicle (65,000 IGST) + Catering (6,250 CGST + 6,250 SGST = 12,500) -> Total ₹77,500
     # 2. Reclaimable Rule 37 & 37A Reversals: Rule 37 (9,000 CGST + 9,000 SGST = 18,000) + Rule 37A (32,400 IGST) -> Total ₹50,400
     reversals_ledger = [
-        {"id": "rev_veh", "purchase_doc_id": "p_b2b_1", "rule_code": "SEC_17_5_MOTOR", "reversed_cgst": Decimal("0.00"), "reversed_sgst": Decimal("0.00"), "reversed_igst": Decimal("65000.00"), "reversed_cess": Decimal("0.00")},
+        {"id": "rev_veh", "purchase_doc_id": "p_b2b_1", "rule_code": "SEC_17_5_MOTOR", "reversed_cgst": Decimal("32500.00"), "reversed_sgst": Decimal("32500.00"), "reversed_igst": Decimal("0.00"), "reversed_cess": Decimal("0.00")},
         {"id": "rev_food", "purchase_doc_id": "p_b2b_1", "rule_code": "SEC_17_5_FOOD", "reversed_cgst": Decimal("6250.00"), "reversed_sgst": Decimal("6250.00"), "reversed_igst": Decimal("0.00"), "reversed_cess": Decimal("0.00")},
         {"id": "rev_r37", "purchase_doc_id": "p_b2b_1", "rule_code": "RULE_37_180_DAYS", "reversed_cgst": Decimal("9000.00"), "reversed_sgst": Decimal("9000.00"), "reversed_igst": Decimal("0.00"), "reversed_cess": Decimal("0.00")},
         {"id": "rev_r37a", "purchase_doc_id": "p_b2b_2", "rule_code": "RULE_37A_NON_FILING", "reversed_cgst": Decimal("0.00"), "reversed_sgst": Decimal("0.00"), "reversed_igst": Decimal("32400.00"), "reversed_cess": Decimal("0.00")}
@@ -245,9 +245,29 @@ def test_gstr2b_vs_table4_exact_source_reconciliation():
     assert summary.ineligible_sec_16_4_and_pos_restrictions_4d2 == Decimal("12400.00")
 
     # 10. Component-Level Arithmetic Balance Proof across CGST, SGST, IGST
-    assert summary.components_4c_net.cgst == Decimal("114750.00")
-    assert summary.components_4c_net.sgst == Decimal("114750.00")
-    assert summary.components_4c_net.igst == Decimal("125100.00")
+    assert summary.components_4a["4A_total"].cgst == Decimal("130000.00")
+    assert summary.components_4a["4A_total"].sgst == Decimal("130000.00")
+    assert summary.components_4a["4A_total"].igst == Decimal("222500.00")
+    assert summary.components_4a["4A_total"].total == Decimal("482500.00")
+
+    assert summary.components_4a["4A5_all_other"].cgst == Decimal("114750.00")
+    assert summary.components_4a["4A5_all_other"].sgst == Decimal("114750.00")
+    assert summary.components_4a["4A5_all_other"].igst == Decimal("137500.00")
+    assert summary.components_4a["4A5_all_other"].total == Decimal("367000.00")
+
+    assert summary.components_4b["4B1_permanent"].cgst == Decimal("38750.00")
+    assert summary.components_4b["4B1_permanent"].sgst == Decimal("38750.00")
+    assert summary.components_4b["4B1_permanent"].igst == Decimal("0.00")
+    assert summary.components_4b["4B1_permanent"].total == Decimal("77500.00")
+
+    assert summary.components_4b["4B2_total"].cgst == Decimal("9000.00")
+    assert summary.components_4b["4B2_total"].sgst == Decimal("9000.00")
+    assert summary.components_4b["4B2_total"].igst == Decimal("32400.00")
+    assert summary.components_4b["4B2_total"].total == Decimal("50400.00")
+
+    assert summary.components_4c_net.cgst == Decimal("82250.00")
+    assert summary.components_4c_net.sgst == Decimal("82250.00")
+    assert summary.components_4c_net.igst == Decimal("190100.00")
     assert summary.components_4c_net.cess == Decimal("0.00")
     assert summary.components_4c_net.total == Decimal("354600.00")
 

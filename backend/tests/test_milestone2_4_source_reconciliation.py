@@ -191,7 +191,7 @@ def test_exact_november_2026_atomic_reconciliation():
 
     # Reversal Events (Historical availed documents):
     reversals_ledger = [
-        {"id": "rev_veh", "purchase_doc_id": "p_b2b_1", "rule_code": "SEC_17_5_MOTOR", "reversed_cgst": Decimal("0.00"), "reversed_sgst": Decimal("0.00"), "reversed_igst": Decimal("65000.00"), "reversed_cess": Decimal("0.00")},
+        {"id": "rev_veh", "purchase_doc_id": "p_b2b_1", "rule_code": "SEC_17_5_MOTOR", "reversed_cgst": Decimal("32500.00"), "reversed_sgst": Decimal("32500.00"), "reversed_igst": Decimal("0.00"), "reversed_cess": Decimal("0.00")},
         {"id": "rev_food", "purchase_doc_id": "p_b2b_1", "rule_code": "SEC_17_5_FOOD", "reversed_cgst": Decimal("6250.00"), "reversed_sgst": Decimal("6250.00"), "reversed_igst": Decimal("0.00"), "reversed_cess": Decimal("0.00")},
         {"id": "rev_r37", "purchase_doc_id": "p_b2b_1", "rule_code": "RULE_37_180_DAYS", "reversed_cgst": Decimal("9000.00"), "reversed_sgst": Decimal("9000.00"), "reversed_igst": Decimal("0.00"), "reversed_cess": Decimal("0.00")},
         {"id": "rev_r37a", "purchase_doc_id": "p_b2b_2", "rule_code": "RULE_37A_NON_FILING", "reversed_cgst": Decimal("0.00"), "reversed_sgst": Decimal("0.00"), "reversed_igst": Decimal("32400.00"), "reversed_cess": Decimal("0.00")}
@@ -248,6 +248,38 @@ def test_exact_november_2026_atomic_reconciliation():
     # 9. Table 4(D) Disclosures:
     assert summary.itc_reclaimed_earlier_reversal_4d1 == Decimal("17250.00")
     assert summary.ineligible_sec_16_4_and_pos_restrictions_4d2 == Decimal("12400.00")
+
+    # 10. Component-Level Statutory Tax-Head Verification:
+    # 4(A) Total: CGST ₹1,30,000 | SGST ₹1,30,000 | IGST ₹2,22,500
+    assert summary.components_4a["4A_total"].cgst == Decimal("130000.00")
+    assert summary.components_4a["4A_total"].sgst == Decimal("130000.00")
+    assert summary.components_4a["4A_total"].igst == Decimal("222500.00")
+    assert summary.components_4a["4A_total"].total == Decimal("482500.00")
+
+    # 4(A)(5) All Other ITC: CGST ₹1,14,750 | SGST ₹1,14,750 | IGST ₹1,37,500
+    assert summary.components_4a["4A5_all_other"].cgst == Decimal("114750.00")
+    assert summary.components_4a["4A5_all_other"].sgst == Decimal("114750.00")
+    assert summary.components_4a["4A5_all_other"].igst == Decimal("137500.00")
+    assert summary.components_4a["4A5_all_other"].total == Decimal("367000.00")
+
+    # 4(B)(1) Permanent: CGST ₹38,750 | SGST ₹38,750 | IGST ₹0
+    assert summary.components_4b["4B1_permanent"].cgst == Decimal("38750.00")
+    assert summary.components_4b["4B1_permanent"].sgst == Decimal("38750.00")
+    assert summary.components_4b["4B1_permanent"].igst == Decimal("0.00")
+    assert summary.components_4b["4B1_permanent"].total == Decimal("77500.00")
+
+    # 4(B)(2) Reclaimable: CGST ₹9,000 | SGST ₹9,000 | IGST ₹32,400
+    assert summary.components_4b["4B2_total"].cgst == Decimal("9000.00")
+    assert summary.components_4b["4B2_total"].sgst == Decimal("9000.00")
+    assert summary.components_4b["4B2_total"].igst == Decimal("32400.00")
+    assert summary.components_4b["4B2_total"].total == Decimal("50400.00")
+
+    # 4(C) Net ITC: CGST ₹82,250 | SGST ₹82,250 | IGST ₹1,90,100
+    assert summary.components_4c_net.cgst == Decimal("82250.00")
+    assert summary.components_4c_net.sgst == Decimal("82250.00")
+    assert summary.components_4c_net.igst == Decimal("190100.00")
+    assert summary.components_4c_net.cess == Decimal("0.00")
+    assert summary.components_4c_net.total == Decimal("354600.00")
 
 
 # =============================================================================
