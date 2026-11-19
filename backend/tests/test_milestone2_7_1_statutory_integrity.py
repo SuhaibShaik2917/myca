@@ -765,7 +765,7 @@ def test_cross_tenant_lot_ledger_rls_isolation(setup_m2_7_1_tenant):
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO public.organizations (id, legal_name, trade_name, pan) VALUES (%s, 'Tenant B', 'TB', %s);", (org_b, pan_b))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'User B');", (user_b, f"user_b_{rand_digits_b}@tb.test"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'User B');", (user_b, f"user_b_{rand_digits_b}_{uuid.uuid4().hex[:8]}@tb.test"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_b, user_b))
             cur.execute("INSERT INTO public.gst_registrations (id, org_id, gstin, legal_name, state_code, is_primary) VALUES (%s, %s, %s, 'Tenant B', '27', true);", (reg_b, org_b, gstin_b))
 

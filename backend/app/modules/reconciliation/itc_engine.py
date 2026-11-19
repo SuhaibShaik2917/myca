@@ -1194,7 +1194,46 @@ class StatutoryITCRiskEngine:
                 break
 
         # -------------------------------------------------------------
-        # 7. Default to Complete Eligibility if all tests pass
+        # 7. Anti-Conflation Control: Rule 37 vs Rule 37A Duplicate Reversal Check
+        # -------------------------------------------------------------
+        rule_37_assessments = [a for a in assessments if a.rule_code == "RULE_37_180_DAYS"]
+        rule_37a_assessments = [a for a in assessments if a.rule_code == "RULE_37A_NON_FILING"]
+        # Check for assessments that actually require reversal (not just UNKNOWN status)
+        rule_37_reversal = [a for a in rule_37_assessments if a.risk_reversal_amount > Decimal("0.00")]
+        rule_37a_reversal = [a for a in rule_37a_assessments
+                             if a.risk_reversal_amount > Decimal("0.00")
+                             and a.eligibility_status == ITCEligibilityEnum.RULE_37A_RISK]
+
+        if rule_37_reversal and rule_37a_reversal:
+            r37_amt = rule_37_reversal[0].risk_reversal_amount
+            r37a_amt = rule_37a_reversal[0].risk_reversal_amount
+            assessments.append(ITCAssessmentOut(
+                purchase_doc_id=p_id,
+                gstr2b_doc_id=g_id,
+                rule_code="DUPLICATE_REVERSAL_RISK",
+                statutory_section="Rule 37 / Rule 37A Anti-Conflation",
+                eligibility_status=ITCEligibilityEnum.REVIEW_REQUIRED,
+                potential_itc=total_tax,
+                risk_reversal_amount=max(r37_amt, r37a_amt),
+                findings_explanation=(
+                    f"DUPLICATE REVERSAL RISK: Both Rule 37 (180-day non-payment, reversal ₹{r37_amt}) "
+                    f"and Rule 37A (supplier GSTR-3B non-filing, reversal ₹{r37a_amt}) are triggered "
+                    f"for the same purchase document {p_id}. These are INDEPENDENT statutory tests with "
+                    f"DIFFERENT triggers — 180-day non-payment does NOT imply supplier GSTR-3B non-filing "
+                    f"and vice versa. However, the SAME ITC credit must NOT be reversed twice. "
+                    f"The maximum single reversal amount is ₹{max(r37_amt, r37a_amt)}. "
+                    f"Manual review required to determine which rule governs and to prevent double reversal."
+                ),
+                missing_evidence_required=(
+                    "Tax professional must determine: (1) which rule triggered first chronologically, "
+                    "(2) whether the same ITC has already been reversed under either rule, and "
+                    "(3) the correct single reversal amount to post in Table 4(B)(2)."
+                ),
+                evaluation_date=str(eval_dt)
+            ))
+
+        # -------------------------------------------------------------
+        # 8. Default to Complete Eligibility if all tests pass
         # -------------------------------------------------------------
         if not assessments:
             assessments.append(ITCAssessmentOut(
@@ -1300,3 +1339,179 @@ class StatutoryITCRiskEngine:
             reavailment_eligible=reavailment_eligible,
             risk_status=risk_status
         )
+
+
+def classify_reversal_trigger(
+    invoice_date: date,
+    availment_period: Optional[str] = None,
+    payment_records: Optional[List[Dict[str, Any]]] = None,
+    total_invoice_value: Decimal = Decimal("0.00"),
+    total_tax_amount: Decimal = Decimal("0.00"),
+    supplier_gstr3b_status: str = "UNKNOWN",
+    supplier_gstr1_filed: bool = False,
+    is_availed_in_3b: bool = True,
+    evaluation_date: Optional[date] = None,
+    audit_date: Optional[date] = None
+) -> Dict[str, Any]:
+    """
+    Classifies whether an ITC reversal is triggered under Rule 37, Rule 37A, or both.
+    
+    Statutory Framework:
+    1. Rule 37 (180-Day Non-Payment of Consideration):
+       - Trigger: Recipient availed ITC but failed to pay supplier within 180 days from invoice date.
+       - Reversal is proportionate to unpaid consideration.
+       - Due period: Return period immediately following the 180-day expiry.
+       - Applicable section: Second Proviso to Section 16(2) read with Rule 37 and Section 50(1).
+       - Requires payment ledger / bank evidence.
+       
+    2. Rule 37A (Supplier GSTR-3B Non-Filing):
+       - Trigger: Supplier reported invoice in GSTR-1/IFF but failed to furnish GSTR-3B by 30th Sept
+         following the FY in which recipient availed ITC.
+       - Recipient reversal is mandatory on or before 30th November following that FY.
+       - Due period: Any return on or before 30th November (no interest under Rule 37A proviso if reversed timely).
+       - Requires GSTN portal filing status evidence.
+       
+    3. Independence & Anti-Conflation:
+       - 180-day non-payment does NOT trigger or imply Rule 37A.
+       - Supplier GSTR-3B non-filing does NOT trigger or imply Rule 37.
+       - Missing trigger evidence results in REVIEW_REQUIRED, not an assumed statutory conclusion.
+       - If both rules apply independently to the same invoice, DUPLICATE_REVERSAL_RISK is flagged
+         to prevent reversing the same ITC twice.
+    """
+    from datetime import timedelta
+    eval_dt = evaluation_date or audit_date or date.today()
+    tot_val = Decimal(str(total_invoice_value or 0))
+    tot_tax = Decimal(str(total_tax_amount or 0))
+
+    # --- Rule 37 Calculation ---
+    day_180 = invoice_date + timedelta(days=180)
+    day_181 = invoice_date + timedelta(days=181)
+    days_elapsed = (eval_dt - invoice_date).days
+
+    # Return period immediately following 180-day expiry:
+    # If 180-day expires on day_180, the return for the tax period in which day_181 falls
+    rule_37_reversal_period = day_180.strftime("%Y-%m")
+
+    rule_37_applicable: Optional[bool] = None
+    rule_37_reversal_amount = Decimal("0.00")
+    rule_37_trigger_evidence: Dict[str, Any] = {
+        "invoice_date": invoice_date,
+        "day_180": day_180,
+        "day_181": day_181,
+        "days_elapsed": days_elapsed,
+        "is_past_180_days": eval_dt >= day_181,
+        "reversal_due_period": rule_37_reversal_period,
+    }
+
+    if not is_availed_in_3b:
+        rule_37_applicable = False
+        rule_37_trigger_evidence["reason"] = "ITC was never availed in GSTR-3B; Rule 37 does not apply."
+    elif payment_records is None:
+        rule_37_applicable = None
+        rule_37_trigger_evidence["reason"] = "Payment records are unverified/missing; cannot determine payment status."
+    else:
+        total_paid = Decimal("0.00")
+        for p in payment_records:
+            total_paid += Decimal(str(p.get("allocated_total_amount") or 0))
+        unpaid = max(Decimal("0.00"), tot_val - total_paid)
+        rule_37_trigger_evidence["total_paid"] = total_paid
+        rule_37_trigger_evidence["unpaid_amount"] = unpaid
+
+        if eval_dt >= day_181 and unpaid > Decimal("0.00"):
+            rule_37_applicable = True
+            prop_ratio = (unpaid / tot_val) if tot_val > Decimal("0.00") else Decimal("1.00")
+            rule_37_reversal_amount = (tot_tax * prop_ratio).quantize(Decimal("0.01"))
+            rule_37_trigger_evidence["reversal_amount"] = rule_37_reversal_amount
+            rule_37_trigger_evidence["reason"] = f"Unpaid amount ₹{unpaid} past 180 days ({days_elapsed} days elapsed)."
+        else:
+            rule_37_applicable = False
+            if unpaid <= Decimal("0.00"):
+                rule_37_trigger_evidence["reason"] = "Invoice fully paid; no Rule 37 reversal required."
+            else:
+                rule_37_trigger_evidence["reason"] = f"Invoice within 180 days ({days_elapsed} days elapsed; day 180 is {day_180})."
+
+    # --- Rule 37A Calculation ---
+    if availment_period and len(str(availment_period)) >= 7:
+        try:
+            av_year = int(str(availment_period)[:4])
+            av_month = int(str(availment_period)[5:7])
+        except (ValueError, IndexError):
+            av_year, av_month = invoice_date.year, invoice_date.month
+    else:
+        av_year, av_month = invoice_date.year, invoice_date.month
+
+    fy_end_year = av_year if av_month <= 3 else av_year + 1
+    supplier_filing_deadline = date(fy_end_year, 9, 30)
+    recipient_reversal_deadline = date(fy_end_year, 11, 30)
+
+    gstr3b_status_norm = str(supplier_gstr3b_status or "UNKNOWN").upper()
+    rule_37a_applicable: Optional[bool] = None
+    rule_37a_reversal_amount = Decimal("0.00")
+    rule_37a_trigger_evidence: Dict[str, Any] = {
+        "availment_period": availment_period,
+        "fy_end_year": fy_end_year,
+        "supplier_30_sept_deadline": supplier_filing_deadline,
+        "recipient_30_nov_deadline": recipient_reversal_deadline,
+        "supplier_gstr3b_status": gstr3b_status_norm,
+        "supplier_gstr1_filed": supplier_gstr1_filed,
+    }
+
+    if not is_availed_in_3b:
+        rule_37a_applicable = False
+        rule_37a_trigger_evidence["reason"] = "ITC was never availed in GSTR-3B; Rule 37A does not apply."
+    elif gstr3b_status_norm == "UNKNOWN":
+        rule_37a_applicable = None
+        rule_37a_trigger_evidence["reason"] = "Authoritative supplier GSTR-3B filing status is unknown; cannot determine Rule 37A liability."
+    elif gstr3b_status_norm == "FILED":
+        rule_37a_applicable = False
+        rule_37a_trigger_evidence["reason"] = "Supplier furnished GSTR-3B return; no Rule 37A reversal required."
+    elif gstr3b_status_norm == "NOT_FILED":
+        if eval_dt <= supplier_filing_deadline:
+            rule_37a_applicable = False
+            rule_37a_trigger_evidence["reason"] = f"Supplier has until 30th September {fy_end_year} to furnish GSTR-3B return."
+        else:
+            rule_37a_applicable = True
+            rule_37a_reversal_amount = tot_tax
+            rule_37a_trigger_evidence["reversal_amount"] = rule_37a_reversal_amount
+            rule_37a_trigger_evidence["reason"] = (
+                f"Supplier failed to furnish GSTR-3B by statutory cut-off 30th September {fy_end_year}. "
+                f"Recipient reversal mandatory on or before 30th November {fy_end_year}."
+            )
+
+    # --- Conflict Detection & Classification ---
+    review_required = (rule_37_applicable is None) or (rule_37a_applicable is None)
+    both_applicable = (rule_37_applicable is True) and (rule_37a_applicable is True)
+    duplicate_reversal_risk = both_applicable
+
+    if both_applicable:
+        classification_status = "BOTH_APPLICABLE_DUPLICATE_RISK"
+        single_reversal_limit = max(rule_37_reversal_amount, rule_37a_reversal_amount)
+    elif rule_37_applicable is True:
+        classification_status = "RULE_37_ONLY"
+        single_reversal_limit = rule_37_reversal_amount
+    elif rule_37a_applicable is True:
+        classification_status = "RULE_37A_ONLY"
+        single_reversal_limit = rule_37a_reversal_amount
+    elif review_required:
+        classification_status = "REVIEW_REQUIRED_FACTS_PENDING"
+        single_reversal_limit = Decimal("0.00")
+    else:
+        classification_status = "NO_REVERSAL_REQUIRED"
+        single_reversal_limit = Decimal("0.00")
+
+    return {
+        "classification_status": classification_status,
+        "rule_37_applicable": rule_37_applicable,
+        "rule_37_reversal_amount": rule_37_reversal_amount,
+        "rule_37_reversal_period": rule_37_reversal_period,
+        "rule_37_trigger_evidence": rule_37_trigger_evidence,
+        "rule_37a_applicable": rule_37a_applicable,
+        "rule_37a_reversal_amount": rule_37a_reversal_amount,
+        "rule_37a_reversal_deadline": recipient_reversal_deadline,
+        "rule_37a_trigger_evidence": rule_37a_trigger_evidence,
+        "both_applicable": both_applicable,
+        "duplicate_reversal_risk": duplicate_reversal_risk,
+        "single_reversal_limit": single_reversal_limit,
+        "review_required": review_required
+    }
+
