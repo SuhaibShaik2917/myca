@@ -104,13 +104,13 @@ def downgrade() -> None:
     DROP POLICY IF EXISTS financial_transactions_service ON public.financial_transactions;
     DROP POLICY IF EXISTS business_profiles_service ON public.business_profiles;
 
-    -- 2. Revoke grants given to app_service_user in 0020
-    REVOKE ALL ON public.business_profiles FROM app_service_user;
-    REVOKE ALL ON public.financial_transactions FROM app_service_user;
-    REVOKE ALL ON public.financial_summaries FROM app_service_user;
-    REVOKE ALL ON public.summary_transactions FROM app_service_user;
-    REVOKE ALL ON public.government_schemes FROM app_service_user;
-    REVOKE ALL ON public.scheme_eligibility_rules FROM app_service_user;
-    REVOKE ALL ON public.scheme_matches FROM app_service_user;
-    REVOKE ALL ON public.gst_records FROM app_service_user;
+    -- 2. Revoke specific grants given to app_service_user in 0020 (avoid broad REVOKE ALL)
+    REVOKE SELECT, INSERT, UPDATE, DELETE ON public.business_profiles FROM app_service_user;
+    REVOKE SELECT, INSERT, UPDATE, DELETE ON public.financial_transactions FROM app_service_user;
+    REVOKE SELECT, INSERT, UPDATE, DELETE ON public.financial_summaries FROM app_service_user;
+    REVOKE SELECT, INSERT, UPDATE, DELETE ON public.summary_transactions FROM app_service_user;
+    REVOKE SELECT ON public.government_schemes FROM app_service_user;
+    REVOKE SELECT ON public.scheme_eligibility_rules FROM app_service_user;
+    REVOKE SELECT, INSERT, UPDATE, DELETE ON public.scheme_matches FROM app_service_user;
+    REVOKE SELECT, INSERT, UPDATE, DELETE ON public.gst_records FROM app_service_user;
     """)

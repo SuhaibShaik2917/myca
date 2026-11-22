@@ -26,7 +26,7 @@ curl -s http://localhost:8001/health
 
 ---
 
-## 2. DATABASE MIGRATION INTEGRITY
+## 2. DATABASE MIGRATION INTEGRITY & ROLLBACK PROOF
 
 Alembic migration history was verified against PostgreSQL 16 `alembic_version`:
 ```sql
@@ -37,11 +37,11 @@ SELECT version_num FROM alembic_version;
   - `0001` to `0005`: Core architecture, tenant schema, business financial tables
   - `0006` to `0018`: Statutory ledger, ITC reconciliation, Rule 37/37A tables, IMS actions
   - `0019_m3_gstr3b_filings`: Milestone 3 GSTR-3B filings table, unique constraints, and maker-checker schema
-  - `0020_m4_m5_grants_and_policies`: Milestone 4 & 5 table grants and tenant RLS policies for `app_service_user` (with fully implemented downgrade)
+  - `0020_m4_m5_grants_and_policies`: Milestone 4 & 5 table grants and tenant RLS policies for `app_service_user` with granular, non-destructive downgrade
   - `0021_enforce_tenant_force_rls`: Least privilege write revocation on reference catalogues and `FORCE ROW LEVEL SECURITY` across 100% of tenant-scoped tables
 
 ### Migration Upgrade & Downgrade Cycle Tested
-A two-step downgrade from `0021` to `0019` and full re-upgrade to `0021` was executed without error, proving clean schema reversibility.
+Script `backend/scripts/verify_migration_rollback_state.py` verified the two-step rollback from `0021` to `0020` (restoring `FORCE RLS = False`), from `0020` to `0019` (safely dropping policies without side effects), and re-upgrading to `0021` (restoring `FORCE RLS = True` across all 21 tables).
 
 ---
 

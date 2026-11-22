@@ -2,8 +2,8 @@
 
 **Audit Date:** November 23, 2026  
 **Environment:** WSL2 Ubuntu Linux / Python 3.12.3 / PostgreSQL 16.4 / Node.js v20.x  
-**Branch:** `remediation/final-audit-fixes` (Merged to `master`)  
-**Git Checkpoints:** Baseline `9f97516`, Audit `d421f0e`, Remediation Head  
+**Branch:** `remediation/audit-findings-phase2` (Merging to `master`)  
+**Git Checkpoints:** Baseline `9f97516`, Audit `d421f0e`, Remediation Head `118ccd7`  
 
 ---
 
@@ -50,76 +50,77 @@ tests/test_milestone4_credit_builder.py ................................ [ 5 pas
 tests/test_milestone5_scheme_navigator.py .............................. [ 5 passed]
 tests/test_statutory_section_17_5_boundaries_and_reference_grants.py ... [ 4 passed]
 
-============================= 257 passed in 39.18s =============================
+============================= 257 passed in 37.40s =============================
 ```
 
 - **Total Test Items:** 257
 - **Passed:** 257
 - **Failed:** 0
 - **Errors:** 0
-- **Duration:** 39.18 seconds
+- **Duration:** 37.40 seconds
 - **Pass Rate:** 100.0%
 
 ---
 
-## 2. NEW REGRESSION & BOUNDARY TESTS ADDED
+## 2. STATUTORY SECTION 17(5) & DATABASE LEAST-PRIVILEGE REGRESSION SUITE
 
 File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
 1. `test_app_service_user_cannot_write_to_reference_catalogues`:
+   - Asserts `SELECT current_user` is `'app_service_user'`.
    - Confirms `SELECT` succeeds on `government_schemes` and `scheme_eligibility_rules`.
-   - Confirms `INSERT`, `UPDATE`, and `DELETE` raise `InsufficientPrivilege` / `ProgrammingError`.
+   - Confirms `INSERT`, `UPDATE`, and `DELETE` attempts on **BOTH** tables raise `InsufficientPrivilege` / `ProgrammingError`.
 2. `test_section_17_5_exact_13_seats_vs_14_seats_boundary`:
    - Confirms 13 seats = `BLOCKED_CREDIT_CONFIRMED` under Section 17(5)(a).
    - Confirms 14 seats = `ELIGIBLE_STATUTORY_EXCEPTION` under Section 17(5)(a) exception ($> 13$ persons).
 3. `test_section_17_5_goods_transport_and_statutory_facts`:
    - Confirms goods transport vehicles (HSN 8704 / trucks) are eligible.
-   - Confirms passenger transport business with verified permit is eligible.
-   - Confirms business category label alone without permit routes to `REVIEW_REQUIRED_FACTS_PENDING`.
-   - Confirms unverified RC context routes to `REVIEW_REQUIRED_FACTS_PENDING`.
+   - Dual evidence requirement for Section 17(5)(a)(B):
+     - Commercial permit alone &rarr; `REVIEW_REQUIRED_FACTS_PENDING` (actual passenger transport use unverified).
+     - Commercial permit + actual taxable passenger transport use &rarr; `ELIGIBLE_STATUTORY_EXCEPTION`.
+   - Business category label alone without permit routes to `REVIEW_REQUIRED_FACTS_PENDING`.
+   - Missing seating capacity on verified RC &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
+   - Bare invoice with no facts provided &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
 4. `test_section_17_5_ab_vehicle_repair_lineage`:
    - Confirms repair of 14-seater vehicle (SAC 998729) is eligible.
-   - Confirms repair of 13-seater vehicle is blocked.
-   - Confirms repair of driving school vehicle is eligible.
+   - Confirms repair of 13-seater vehicle without exception is blocked.
+   - Confirms repair of driving school vehicle requires both license and actual training use.
+   - Proviso (ii): Confirms repair received by vehicle manufacturer is eligible.
+   - Proviso (ii): Confirms repair received by general insurer for insured vehicle is eligible.
 
 ---
 
 ## 3. DATABASE MIGRATION ROLLBACK & UPGRADE EVIDENCE
 
-### Two-Step Migration Downgrade & Upgrade Cycle
-Executed via Alembic:
+### Verification Script: `backend/scripts/verify_migration_rollback_state.py`
+Executed:
 ```bash
-alembic downgrade -1   # 0021 -> 0020
-alembic downgrade -1   # 0020 -> 0019
-alembic upgrade head   # 0019 -> 0020 -> 0021
+PYTHONPATH=. python scripts/verify_migration_rollback_state.py
 ```
 
 **Log Output:**
 ```text
-INFO  [alembic.runtime.migration] Running downgrade 0021_enforce_tenant_force_rls -> 0020_m4_m5_grants_and_policies
-INFO  [alembic.runtime.migration] Running downgrade 0020_m4_m5_grants_and_policies -> 0019_m3_gstr3b_filings
-INFO  [alembic.runtime.migration] Running upgrade 0019_m3_gstr3b_filings -> 0020_m4_m5_grants_and_policies
-INFO  [alembic.runtime.migration] Running upgrade 0020_m4_m5_grants_and_policies -> 0021_enforce_tenant_force_rls
+=== Step 1: Verify current head (0021) ===
+PASS: All 21 tables have relforcerowsecurity=True at 0021.
+
+=== Step 2: Test rollback to 0020_m4_m5_grants_and_policies ===
+PASS: All 21 tables successfully reverted to relforcerowsecurity=False at 0020.
+
+=== Step 3: Test rollback to 0019_m3_gstr3b_filings ===
+PASS: Policies from 0020 were cleanly removed at 0019.
+
+=== Step 4: Upgrade back to head (0021) ===
+PASS: All 21 tables successfully re-upgraded with relforcerowsecurity=True.
+
+ALL MIGRATION ROLLBACK & UPGRADE INVARIANTS VERIFIED!
 ```
-- **Downgrade Integrity:** Safely dropped added policies and revoked added grants without disturbing prior tables or data.
-- **Upgrade Integrity:** Re-applied policies, enforced least privilege, and applied `FORCE ROW LEVEL SECURITY` across all tenant-scoped tables.
 
 ---
 
-## 4. ROOT CAUSE INVESTIGATION & REMEDIATION OF EMAIL UNIQUE COLLISIONS
-
-- **Symptom:** Setup of `test_missing_ocr_fields_not_fabricated_and_block_approval` failed with:
-  `Key (email)=(user_a_6f96c7@example.com) already exists.`
-- **Root Cause:** Truncating random UUIDs to 6 hex characters (`[:6]`) artificially reduced entropy to 24 bits ($16.7\text{ million}$ space). Across thousands of accumulated test users, birthday collisions occurred.
-- **Fix Implemented:** Replaced all occurrences of `uuid.uuid4().hex[:6]` in user email creation across `tests/` with full 128-bit `uuid.uuid4().hex`. All 257 tests now execute with zero unique key collisions.
-
----
-
-## 5. FRONTEND PRODUCTION BUILD
+## 4. FRONTEND PRODUCTION BUILD
 
 ### Exact Command
 ```bash
-cd /mnt/c/Users/notyo/.gemini/antigravity/scratch/myca/frontend
-npm run build
+cd frontend && npm run build
 ```
 
 ### Build Output Log
@@ -135,7 +136,7 @@ computing gzip size...
 dist/index.html                   0.48 kB │ gzip:   0.33 kB
 dist/assets/index-CXHqnTlf.css   29.39 kB │ gzip:   5.62 kB
 dist/assets/index-DBkuh5Fw.js   420.23 kB │ gzip: 107.43 kB
-✓ built in 2.65s
+✓ built in 3.94s
 ```
 - TypeScript: 0 errors
-- Vite: 1,583 modules transformed in 2.65s
+- Vite: 1,583 modules transformed in 3.94s
