@@ -14,6 +14,7 @@ from app.modules.gstr3b.service import (
 DB_ADMIN = "postgresql:///myca?user=postgres"
 
 import random
+import string
 
 @pytest.fixture
 def m3_tenant():
@@ -21,8 +22,9 @@ def m3_tenant():
         with conn.cursor() as cur:
             org_id = str(uuid.uuid4())
             user_id = str(uuid.uuid4())
+            rand_prefix = "".join(random.choices(string.ascii_uppercase, k=5))
             rand_digits = f"{random.randint(1000, 9999)}"
-            pan = f"ABCDE{rand_digits}Z"
+            pan = f"{rand_prefix}{rand_digits}Z"
             gstin = f"27{pan}1ZT"
             reg_id = str(uuid.uuid4())
 

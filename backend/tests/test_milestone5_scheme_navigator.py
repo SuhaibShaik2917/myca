@@ -24,8 +24,10 @@ def m5_tenant():
         with conn.cursor() as cur:
             org_id = str(uuid.uuid4())
             user_id = str(uuid.uuid4())
-            rand_digits = f"{random.randint(1000, 9999)}"
-            pan = f"SCHEM{rand_digits}P"
+            letters = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=5))
+            digits = f"{random.randint(1000, 9999)}"
+            last = random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            pan = f"{letters}{digits}{last}"
             gstin = f"27{pan}1ZT"
             reg_id = str(uuid.uuid4())
             profile_id = str(uuid.uuid4())

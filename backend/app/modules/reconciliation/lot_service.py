@@ -9,7 +9,7 @@ Enforces Section 16(2)(b) First Proviso statutory last-lot condition:
 import uuid
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -155,7 +155,7 @@ def record_lot_to_ledger(
 
     # 7. Insert immutable entry into public.goods_receipt_lot_ledger
     lot_id = str(uuid.uuid4())
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
 
     session.execute(
         text("""

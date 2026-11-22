@@ -7,7 +7,7 @@ Zero invented zeros; every figure traces directly to underlying database rows.
 import uuid
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -488,7 +488,7 @@ def generate_unified_financial_report(
     return {
         "registration_id": registration_id,
         "return_period": return_period,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "gstr2b_total": t4.subtotal_gstr2b_portal_available,
         "purchase_books_matched": t4.subtotal_books_matched,
         "unbooked_2b_variance": t4.unbooked_variance_amount,

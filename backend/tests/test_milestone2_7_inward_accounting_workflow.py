@@ -13,7 +13,7 @@ Validates:
 """
 import uuid
 import random
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import pytest
 import psycopg
@@ -674,8 +674,10 @@ def test_cross_tenant_isolation_and_performance(setup_m2_7_tenant):
     # Provision Tenant B
     org_b = str(uuid.uuid4())
     user_b = str(uuid.uuid4())
+    rand_p = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=5))
     rand_d = "".join(random.choices("0123456789", k=4))
-    pan_b = f"BBBBB{rand_d}B"
+    rand_s = random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    pan_b = f"{rand_p}{rand_d}{rand_s}"
     gstin_b = f"27{pan_b}1ZE"
     reg_b = str(uuid.uuid4())
 
@@ -749,9 +751,9 @@ def test_cross_tenant_isolation_and_performance(setup_m2_7_tenant):
                               'draft', 1000.00, 90.00, 90.00, 1180.00);
                 """, (doc_uuid, ctx_a["org_id"], ctx_a["reg_mh"], f"BULK-INV-{i:03d}", ctx_a["gstin_mh"]))
 
-    start_t = datetime.utcnow()
+    start_t = datetime.now(timezone.utc)
     resp_exc_perf = client.get(f"/api/v1/reconciliation/exceptions?registration_id={ctx_a['reg_mh']}", headers=headers_a)
-    elapsed = (datetime.utcnow() - start_t).total_seconds()
+    elapsed = (datetime.now(timezone.utc) - start_t).total_seconds()
 
     assert resp_exc_perf.status_code == 200
     assert len(resp_exc_perf.json()) >= 100

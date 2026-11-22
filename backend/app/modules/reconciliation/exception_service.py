@@ -19,7 +19,7 @@ or reversed under Table 4(B)(2).
 import uuid
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -92,7 +92,7 @@ def get_consolidated_exceptions(
                 "statutory_deadline": f"30th November following FY or Form GSTR-3B due date",
                 "resolution_status": "OPEN",
                 "source_reference_id": str(r.id),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
 
     # -------------------------------------------------------------------------
@@ -142,7 +142,7 @@ def get_consolidated_exceptions(
                 "statutory_deadline": "Before filing monthly Form GSTR-3B",
                 "resolution_status": "OPEN",
                 "source_reference_id": str(r.id),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
 
     # -------------------------------------------------------------------------
@@ -192,7 +192,7 @@ def get_consolidated_exceptions(
                 "statutory_deadline": "Before filing monthly Form GSTR-3B",
                 "resolution_status": "OPEN",
                 "source_reference_id": str(r.id),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
 
     # -------------------------------------------------------------------------
@@ -242,7 +242,7 @@ def get_consolidated_exceptions(
                 "statutory_deadline": "Deferred until final lot delivery",
                 "resolution_status": "OPEN",
                 "source_reference_id": str(r.id),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
 
     # -------------------------------------------------------------------------
@@ -288,7 +288,7 @@ def get_consolidated_exceptions(
                 "statutory_deadline": "30th November (Strict Interest Cut-off)",
                 "resolution_status": "OPEN",
                 "source_reference_id": str(r.purchase_doc_id),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
 
     # -------------------------------------------------------------------------
@@ -343,7 +343,7 @@ def get_consolidated_exceptions(
                     "statutory_deadline": "Immediately upon crossing 180 days",
                     "resolution_status": "OPEN",
                     "source_reference_id": str(r.id),
-                    "created_at": datetime.utcnow().isoformat()
+                    "created_at": datetime.now(timezone.utc).isoformat()
                 })
 
     # -------------------------------------------------------------------------
@@ -380,7 +380,7 @@ def get_consolidated_exceptions(
                 "statutory_deadline": "Before monthly filing",
                 "resolution_status": "OPEN",
                 "source_reference_id": str(r.rep_id),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
 
     # -------------------------------------------------------------------------
@@ -422,7 +422,7 @@ def get_consolidated_exceptions(
                 "statutory_deadline": "Supplier amendment in subsequent GSTR-1",
                 "resolution_status": "OPEN",
                 "source_reference_id": str(r.id),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
 
     # -------------------------------------------------------------------------
@@ -463,7 +463,7 @@ def get_consolidated_exceptions(
                 "statutory_deadline": "Prior to GSTR-3B filing freeze",
                 "resolution_status": "OPEN",
                 "source_reference_id": str(r.id),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
 
     # -------------------------------------------------------------------------
@@ -502,7 +502,7 @@ def get_consolidated_exceptions(
                 "statutory_deadline": "Immediate remediation required for credit release",
                 "resolution_status": "OPEN",
                 "source_reference_id": str(r.purchase_doc_id),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
 
     return exceptions

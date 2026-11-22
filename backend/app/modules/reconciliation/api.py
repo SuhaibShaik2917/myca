@@ -3,7 +3,7 @@ import json
 import uuid
 from decimal import Decimal
 from typing import Optional, List, Dict, Any
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Header, Query
 from sqlalchemy.orm import Session
@@ -92,7 +92,7 @@ def create_gst_registration(
         raise HTTPException(status_code=409, detail=f"GSTIN {gstin_clean} is already registered for this organization.")
 
     reg_id = str(uuid.uuid4())
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
 
     db.execute(
         text("""
@@ -530,7 +530,7 @@ def set_ims_action(
                 )
 
     prev_action = ims_row.current_action
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
 
     db.execute(
         text("""
@@ -676,7 +676,7 @@ def recompute_gstr2b(
     # 5. Insert new Snapshot Version N+1
     new_version = curr_snapshot.version_number + 1
     new_snap_id = str(uuid.uuid4())
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
 
     db.execute(
         text("""
@@ -751,7 +751,7 @@ def freeze_ims_on_gstr3b_filing(
             detail="Freeze rejected: IMS actions can only be frozen upon confirmed filing (filing_status 'FILED'). Draft or pending submission status does not freeze IMS actions."
         )
 
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
     res = db.execute(
         text("""
         UPDATE public.ims_document_actions
@@ -992,7 +992,7 @@ def update_receipt_evidence(
                 detail="Statutory Violation: Deemed receipt requires statutory legal basis under Section 16(2)(b) Explanation."
             )
 
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
     is_last_flag = bool(payload.get("is_last_lot") or payload.get("is_last_lot_received") or (status_val == "RECEIVED"))
 
     # Derive statutory ITC accounting state
@@ -1065,7 +1065,7 @@ def record_purchase_lot_delivery(
         expected_lots_count=payload.get("expected_lots_count") or payload.get("total_lots_expected"),
         received_quantity=Decimal(str(payload.get("received_quantity") or payload.get("quantity_received") or 0)),
         lot_reference=payload.get("lot_reference") or payload.get("delivery_challan_ref", f"LOT-{payload.get('lot_number', 1)}"),
-        receipt_date=str(payload.get("receipt_date") or datetime.utcnow().strftime("%Y-%m-%d")),
+        receipt_date=str(payload.get("receipt_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")),
         goods_receipt_note_ref=payload.get("goods_receipt_note_ref") or payload.get("delivery_challan_ref", f"GRN-LOT-{payload.get('lot_number', 1)}"),
         carrier_name=payload.get("carrier_name"),
         vehicle_number=payload.get("vehicle_number"),
@@ -1405,7 +1405,7 @@ def resolve_variance(
     Records an auditor/CA human resolution event for reconciliation variances or blocked credit states.
     """
     res_id = str(uuid.uuid4())
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
 
     db.execute(
         text("""
@@ -1668,7 +1668,7 @@ def record_itc_ledger_event(
     p_doc = dict(p_row._mapping)
 
     total_event_tax = payload.cgst_amount + payload.sgst_amount + payload.igst_amount + payload.cess_amount
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
     rev_event_id = payload.reversal_event_id
     itc_state = p_doc.get("itc_accounting_state") or "NOT_YET_ELIGIBLE"
 
@@ -2100,7 +2100,7 @@ def export_reconciliation_audit_report(
         "report_type": "ITC_RECONCILIATION_AUDIT_REPORT",
         "return_period": return_period,
         "registration_id": registration_id,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "summary": t4.model_dump(),
         "unbooked_invoices_count": len(t4.unbooked_gstr2b_documents),
         "unbooked_invoices": t4.unbooked_gstr2b_documents,
@@ -2255,7 +2255,7 @@ def verify_unbooked_candidate_receipt(
                 detail="Statutory Violation: Unbooked candidate receipt confirmation requires GRN/Challan reference and date."
             )
 
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
     row = db.execute(
         text("""
         UPDATE public.gstr2b_unbooked_candidates
@@ -2328,7 +2328,7 @@ def book_unbooked_candidate_entry(
 
     # Create new purchase document in draft/pending_approval status
     p_id = str(uuid.uuid4())
-    now_ts = datetime.utcnow()
+    now_ts = datetime.now(timezone.utc)
     db.execute(
         text("""
         INSERT INTO public.purchase_documents (
