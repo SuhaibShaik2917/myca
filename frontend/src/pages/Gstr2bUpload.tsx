@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { UploadCloud, CheckCircle2, AlertTriangle, FileSpreadsheet, ShieldCheck, Layers, FileCode } from "lucide-react";
+import { API_BASE_URL, authHeaders, getStoredSession, saveSession } from "../api";
 
 interface Gstr2bUploadProps {
   onUploadSuccess?: (data: Gstr2bUploadResponse) => void;
@@ -33,17 +34,14 @@ interface Gstr2bRecomputeResponse {
   recomputed_at: string;
 }
 
-const env = (import.meta as any).env ?? {};
-const API_BASE_URL: string = (env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const storedSession = getStoredSession();
 
 export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) => {
   const [returnPeriod, setReturnPeriod] = useState("2026-11");
   const [registrationGstin, setRegistrationGstin] = useState("27AABCB1234M1ZT");
-  const [registrationId, setRegistrationId] = useState<string>(
-    env.VITE_REGISTRATION_ID ?? ""
-  );
-  const [userId, setUserId] = useState<string>(env.VITE_USER_ID ?? "");
-  const [orgId, setOrgId] = useState<string>(env.VITE_ORG_ID ?? "");
+  const [registrationId, setRegistrationId] = useState<string>(storedSession.registrationId);
+  const [userId, setUserId] = useState<string>(storedSession.userId);
+  const [orgId, setOrgId] = useState<string>(storedSession.orgId);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileHash, setFileHash] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
@@ -51,14 +49,12 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
   const [uploadResult, setUploadResult] = useState<Gstr2bUploadResponse | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const authHeaders = (): Record<string, string> => {
+  const buildAuthHeaders = (): Record<string, string> => {
     if (!userId.trim() || !orgId.trim()) {
       throw new Error("Enter User ID and Organization ID for the development identity headers.");
     }
-    return {
-      "X-User-Id": userId.trim(),
-      "X-Org-Id": orgId.trim(),
-    };
+    saveSession({ userId: userId.trim(), orgId: orgId.trim(), registrationId: registrationId.trim(), returnPeriod: returnPeriod.trim() });
+    return authHeaders();
   };
 
   const parseError = async (response: Response): Promise<string> => {
@@ -116,7 +112,7 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
 
       const response = await fetch(`${API_BASE_URL}/api/v1/reconciliation/gstr2b/upload`, {
         method: "POST",
-        headers: authHeaders(),
+        headers: buildAuthHeaders(),
         body: formData,
       });
 
@@ -125,6 +121,7 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
       }
 
       const data = (await response.json()) as Gstr2bUploadResponse;
+      saveSession({ snapshotId: data.snapshot_id, returnPeriod: data.return_period });
       setUploadResult(data);
       if (onUploadSuccess) onUploadSuccess(data);
     } catch (err: any) {
@@ -142,7 +139,7 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
       const response = await fetch(`${API_BASE_URL}/api/v1/reconciliation/gstr2b/recompute`, {
         method: "POST",
         headers: {
-          ...authHeaders(),
+          ...buildAuthHeaders(),
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -157,6 +154,7 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
       }
 
       const data = (await response.json()) as Gstr2bRecomputeResponse;
+      saveSession({ snapshotId: data.new_snapshot_id, returnPeriod: data.return_period });
       setUploadResult((prev) =>
         prev
           ? {

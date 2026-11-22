@@ -16,6 +16,7 @@ import {
   HelpCircle,
   Database
 } from "lucide-react";
+import { getStoredSession, getTable4Summary, saveSession, type Table4Summary } from "../api";
 
 interface ProvenanceItem {
   docNo: string;
@@ -49,7 +50,11 @@ interface Table4DrillDown {
 }
 
 export const ItcRiskDashboard: React.FC = () => {
-  const [returnPeriod, setReturnPeriod] = useState("2026-11");
+  const stored = getStoredSession();
+  const [returnPeriod, setReturnPeriod] = useState(stored.returnPeriod || "2026-11");
+  const [liveSummary, setLiveSummary] = useState<Table4Summary | null>(null);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const [isLoadingLive, setIsLoadingLive] = useState(false);
   const [drillDownModal, setDrillDownModal] = useState<Table4DrillDown | null>(null);
   const [isExporting, setIsExporting] = useState(false);
   const [selectedExceptionCategory, setSelectedExceptionCategory] = useState<string>("ALL");
@@ -588,12 +593,30 @@ export const ItcRiskDashboard: React.FC = () => {
     }
   };
 
+  const handleLoadLiveSummary = async () => {
+    setIsLoadingLive(true);
+    setLiveError(null);
+    try {
+      if (!stored.registrationId || !stored.snapshotId) {
+        throw new Error("Set Registration ID and Snapshot ID (upload a GSTR-2B file first) to load the live Table 4 summary.");
+      }
+      saveSession({ returnPeriod });
+      const summary = await getTable4Summary(stored.registrationId, returnPeriod, stored.snapshotId);
+      setLiveSummary(summary);
+    } catch (err: any) {
+      setLiveSummary(null);
+      setLiveError(err?.message || "Live Table 4 summary failed. Sample metrics below remain visible for demo purposes.");
+    } finally {
+      setIsLoadingLive(false);
+    }
+  };
+
   const handleExportAuditReport = () => {
     setIsExporting(true);
     setTimeout(() => {
       setIsExporting(false);
       const auditPayload = {
-        organization_id: "demo-tenant-id",
+        organization_id: stored.orgId || "demo",
         return_period: returnPeriod,
         generated_at: new Date().toISOString(),
         engine_version: "v2.3_immutable_event_ledger",
@@ -615,6 +638,27 @@ export const ItcRiskDashboard: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-bold text-slate-900">Live GSTR-3B Table 4 Summary</h2>
+            <p className="text-xs text-slate-500">Loads the working summary from the backend for the selected period and stored snapshot.</p>
+          </div>
+          <button onClick={handleLoadLiveSummary} disabled={isLoadingLive} className="px-4 py-2 bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white rounded-lg text-xs font-semibold">
+            {isLoadingLive ? "Loading..." : "Load live summary"}
+          </button>
+        </div>
+        {liveError && <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-3">{liveError}</p>}
+        {liveSummary && (
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+            <div className="bg-slate-50 p-3 rounded-lg border border-slate-100"><p className="text-slate-500">GSTIN</p><p className="font-mono font-bold">{liveSummary.recipient_gstin}</p></div>
+            <div className="bg-emerald-50 p-3 rounded-lg border border-emerald-100"><p className="text-emerald-700">Total ITC Available</p><p className="font-mono font-bold">₹{liveSummary.total_itc_available}</p></div>
+            <div className="bg-rose-50 p-3 rounded-lg border border-rose-100"><p className="text-rose-700">Total ITC Reversed</p><p className="font-mono font-bold">₹{liveSummary.total_itc_reversed}</p></div>
+            <div className="bg-indigo-50 p-3 rounded-lg border border-indigo-100"><p className="text-indigo-700">Net ITC Available</p><p className="font-mono font-bold">₹{liveSummary.net_itc_available}</p></div>
+          </div>
+        )}
+      </div>
+
       {/* Top Header with Period & Export Audit Report Button */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
         <div>

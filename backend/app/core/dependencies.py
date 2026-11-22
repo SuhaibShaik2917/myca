@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 from typing import Optional, Generator
 import uuid
 
+from app.config import settings
+from app.core.security import decode_access_token
 from app.database import SessionLocal, set_tenant_context, verify_and_resolve_tenant_membership
 
 class TenantContext:
@@ -12,6 +14,7 @@ class TenantContext:
         self.role = role
 
 def get_tenant_db(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
 ) -> Generator[Session, None, None]:
@@ -22,6 +25,18 @@ def get_tenant_db(
     3. Sets app.current_org and app.current_user in the database session.
     4. Enforces least-privilege PostgreSQL Row Level Security.
     """
+    # Preferred path: verified Bearer token. Development/test fallback: identity headers.
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        try:
+            claims = decode_access_token(token)
+            x_user_id = claims["sub"]
+            x_org_id = claims["org_id"]
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Invalid or expired access token")
+    elif settings.ENVIRONMENT == "production":
+        raise HTTPException(status_code=401, detail="Bearer access token required")
+
     if not x_user_id:
         raise HTTPException(status_code=401, detail="Missing required X-User-Id authentication header")
     if not x_org_id:

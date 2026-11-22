@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { GitCompare, CheckCircle2, AlertCircle, ArrowRightLeft, ShieldAlert, Sparkles, Filter, ExternalLink } from "lucide-react";
+import { getStoredSession, runReconciliation, saveSession, type ReconciliationSummary } from "../api";
 
 export const ReconciliationWorkbench: React.FC = () => {
   const [selectedFilter, setSelectedFilter] = useState<string>("ALL");
@@ -11,6 +12,12 @@ export const ReconciliationWorkbench: React.FC = () => {
   const [toleranceTaxable, setToleranceTaxable] = useState("1.00");
   const [toleranceTax, setToleranceTax] = useState("1.00");
   const [toleranceTotal, setToleranceTotal] = useState("2.00");
+  const stored = getStoredSession();
+  const [registrationId, setRegistrationId] = useState(stored.registrationId);
+  const [returnPeriod, setReturnPeriod] = useState(stored.returnPeriod);
+  const [snapshotId, setSnapshotId] = useState(stored.snapshotId);
+  const [liveSummary, setLiveSummary] = useState<ReconciliationSummary | null>(null);
+  const [liveError, setLiveError] = useState<string | null>(null);
   const [toleranceCgst, setToleranceCgst] = useState("1.00");
   const [toleranceSgst, setToleranceSgst] = useState("1.00");
   const [toleranceIgst, setToleranceIgst] = useState("1.00");
@@ -118,11 +125,29 @@ export const ReconciliationWorkbench: React.FC = () => {
     { code: "IMPORT_OR_ISD_MISMATCH", label: "Import/ISD", count: 0 }
   ];
 
-  const handleRunRecon = () => {
+  const handleRunRecon = async () => {
     setIsReconciling(true);
-    setTimeout(() => {
+    setLiveError(null);
+    try {
+      if (!registrationId.trim() || !snapshotId.trim()) {
+        throw new Error("Set Registration ID and Snapshot ID (upload a GSTR-2B file first) to run live reconciliation.");
+      }
+      saveSession({ registrationId: registrationId.trim(), returnPeriod: returnPeriod.trim(), snapshotId: snapshotId.trim() });
+      const summary = await runReconciliation({
+        registration_id: registrationId.trim(),
+        return_period: returnPeriod.trim(),
+        snapshot_id: snapshotId.trim(),
+        taxable_tolerance: toleranceTaxable,
+        tax_tolerance: toleranceTax,
+        total_tolerance: toleranceTotal,
+      });
+      setLiveSummary(summary);
+    } catch (err: any) {
+      setLiveSummary(null);
+      setLiveError(err?.message || "Live reconciliation failed. The sample table below remains visible for demo purposes.");
+    } finally {
       setIsReconciling(false);
-    }, 800);
+    }
   };
 
   const handleSaveResolution = (e: React.FormEvent) => {
@@ -214,6 +239,38 @@ export const ReconciliationWorkbench: React.FC = () => {
             Pass 1 (Exact) → Pass 2 (Amendments) → Pass 3 (Tolerances) → Pass 4 (Controlled Near-Match)
           </span>
         </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+          <label className="text-slate-600 font-semibold">Registration ID
+            <input value={registrationId} onChange={(e) => setRegistrationId(e.target.value)} className="mt-1 w-full px-2.5 py-1.5 border border-slate-300 rounded-lg font-mono" placeholder="GST registration UUID" />
+          </label>
+          <label className="text-slate-600 font-semibold">Return Period
+            <input value={returnPeriod} onChange={(e) => setReturnPeriod(e.target.value)} className="mt-1 w-full px-2.5 py-1.5 border border-slate-300 rounded-lg font-mono" placeholder="YYYY-MM" />
+          </label>
+          <label className="text-slate-600 font-semibold">Snapshot ID
+            <input value={snapshotId} onChange={(e) => setSnapshotId(e.target.value)} className="mt-1 w-full px-2.5 py-1.5 border border-slate-300 rounded-lg font-mono" placeholder="GSTR-2B snapshot UUID" />
+          </label>
+        </div>
+
+        {liveError && (
+          <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span>{liveError}</span>
+          </div>
+        )}
+
+        {liveSummary && (
+          <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-900">
+            <div className="font-bold">Live reconciliation completed</div>
+            <div className="mt-1 font-mono">Run {liveSummary.run_id} • Period {liveSummary.return_period}</div>
+            <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2">
+              <span>Matched: <strong>{liveSummary.matched_count}</strong></span>
+              <span>Variances: <strong>{liveSummary.variance_count}</strong></span>
+              <span>Missing in 2B: <strong>{liveSummary.missing_in_gstr2b_count}</strong></span>
+              <span>Missing in books: <strong>{liveSummary.missing_in_books_count}</strong></span>
+            </div>
+          </div>
+        )}
 
         {/* Category Pills */}
         <div className="flex flex-wrap gap-2 pt-2">

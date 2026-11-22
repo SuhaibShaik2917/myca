@@ -1,4 +1,5 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
+import { getStoredSession, listPurchaseDocuments, type PurchaseDocumentApi } from "../api";
 import { BookOpen, PlusCircle, CheckCircle, Clock, ShieldCheck, DollarSign, Filter, ChevronRight, Layers, AlertTriangle, CheckCircle2, History } from "lucide-react";
 
 interface PurchaseDoc {
@@ -25,6 +26,8 @@ interface PurchaseDoc {
 }
 
 export const PurchaseRegister: React.FC = () => {
+  const [isLiveData, setIsLiveData] = useState(false);
+  const [dataNotice, setDataNotice] = useState<string | null>(null);
   const [documents, setDocuments] = useState<PurchaseDoc[]>([
     {
       id: "doc-pur-001",
@@ -111,6 +114,47 @@ export const PurchaseRegister: React.FC = () => {
       remediation_notes: "Downgraded from RECEIVED: missing verified receipt date and positive quantity received."
     }
   ]);
+
+  useEffect(() => {
+    const registrationId = getStoredSession().registrationId;
+    if (!registrationId) {
+      setDataNotice("Showing sample purchase documents. Set a Registration ID in the demo session bar to load live data.");
+      return;
+    }
+
+    const toNumber = (value?: string | null) => Number(value ?? 0);
+    const mapDocument = (doc: PurchaseDocumentApi): PurchaseDoc => {
+      const taxAmount =
+        toNumber(doc.cgst_amount) + toNumber(doc.sgst_amount) + toNumber(doc.igst_amount) + toNumber(doc.cess_amount) ||
+        toNumber(doc.total_invoice_value) - toNumber(doc.total_taxable_amount);
+      return {
+        id: doc.id,
+        document_number: doc.document_number,
+        document_date: doc.document_date,
+        supplier_gstin: doc.supplier_gstin,
+        supplier_legal_name: doc.supplier_legal_name,
+        place_of_supply: doc.place_of_supply,
+        total_taxable_amount: toNumber(doc.total_taxable_amount).toLocaleString("en-IN", { minimumFractionDigits: 2 }),
+        tax_amount: taxAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 }),
+        total_invoice_value: toNumber(doc.total_invoice_value).toLocaleString("en-IN", { minimumFractionDigits: 2 }),
+        status: (doc.status === "approved" || doc.status === "pending_approval" ? doc.status : "draft") as PurchaseDoc["status"],
+        is_reverse_charge: doc.is_reverse_charge,
+        goods_services_type: doc.goods_services_type,
+        receipt_status: "UNKNOWN",
+      };
+    };
+
+    listPurchaseDocuments(registrationId)
+      .then((rows) => {
+        setDocuments(rows.map(mapDocument));
+        setIsLiveData(true);
+        setDataNotice(null);
+      })
+      .catch((err: any) => {
+        setIsLiveData(false);
+        setDataNotice(`Showing sample purchase documents because live data could not be loaded: ${err?.message || "request failed"}`);
+      });
+  }, []);
 
   const [showAddForm, setShowAddForm] = useState(false);
   const [showPaymentModal, setShowPaymentModal] = useState<string | null>(null);
@@ -223,6 +267,17 @@ export const PurchaseRegister: React.FC = () => {
           {showAddForm ? "Cancel Entry" : "Record Inward Invoice"}
         </button>
       </div>
+
+      {dataNotice && (
+        <div className="bg-sky-50 border border-sky-200 rounded-xl p-3 text-xs text-sky-800">
+          {dataNotice}
+        </div>
+      )}
+      {isLiveData && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-xs text-emerald-800">
+          Live purchase documents loaded from the backend.
+        </div>
+      )}
 
       {/* Historical Remediation Alert Banner */}
       <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">

@@ -20,6 +20,7 @@ import { Gstr2bUpload } from "./pages/Gstr2bUpload";
 import { PurchaseRegister } from "./pages/PurchaseRegister";
 import { ReconciliationWorkbench } from "./pages/ReconciliationWorkbench";
 import { ItcRiskDashboard } from "./pages/ItcRiskDashboard";
+import { clearSession, getStoredSession, requestDemoToken, saveSession } from "./api";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<
@@ -33,6 +34,9 @@ export default function App() {
   ]);
   const [inputText, setInputText] = useState("");
   const [uploadNotification, setUploadNotification] = useState<string | null>(null);
+  const [session, setSession] = useState(() => getStoredSession());
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [isGettingToken, setIsGettingToken] = useState(false);
 
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
@@ -58,12 +62,41 @@ export default function App() {
     setTimeout(() => setUploadNotification(null), 4000);
   };
 
+  const handleSaveSession = () => {
+    saveSession(session);
+    setSessionError(null);
+    setUploadNotification("Demo session saved. API calls will use these IDs.");
+    setTimeout(() => setUploadNotification(null), 4000);
+  };
+
+  const handleGetDemoToken = async () => {
+    setIsGettingToken(true);
+    setSessionError(null);
+    try {
+      const token = await requestDemoToken(session.userId, session.orgId);
+      const next = { ...session, token: token.access_token };
+      saveSession(next);
+      setSession(next);
+      setUploadNotification("Demo token issued and saved.");
+      setTimeout(() => setUploadNotification(null), 4000);
+    } catch (err: any) {
+      setSessionError(err?.message || "Could not issue demo token.");
+    } finally {
+      setIsGettingToken(false);
+    }
+  };
+
+  const handleLogout = () => {
+    clearSession();
+    setSession(getStoredSession());
+  };
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 font-sans">
       {/* Demo Mode Notification Banner */}
       <div className="bg-amber-500 text-white text-xs py-1.5 px-4 text-center font-medium flex items-center justify-center space-x-2">
         <AlertCircle className="w-4 h-4" />
-        <span>Demo preview — GSTR-2B upload can call the backend; other screens still use sample data.</span>
+        <span>Hackathon demo — GSTR-2B, Purchase Register, Reconciliation, and ITC screens can call the backend when a demo session is set.</span>
       </div>
 
       {/* Header */}
@@ -86,6 +119,37 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* Demo session bar */}
+      <div className="bg-white border-b border-slate-200 px-4 md:px-8 py-3">
+        <div className="flex flex-col lg:flex-row lg:items-end gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 flex-1">
+            <label className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
+              User ID
+              <input value={session.userId} onChange={(e) => setSession((s) => ({ ...s, userId: e.target.value }))} className="mt-1 w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-mono normal-case" placeholder="User UUID" />
+            </label>
+            <label className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
+              Organization ID
+              <input value={session.orgId} onChange={(e) => setSession((s) => ({ ...s, orgId: e.target.value }))} className="mt-1 w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-mono normal-case" placeholder="Organization UUID" />
+            </label>
+            <label className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
+              Registration ID
+              <input value={session.registrationId} onChange={(e) => setSession((s) => ({ ...s, registrationId: e.target.value }))} className="mt-1 w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-mono normal-case" placeholder="GST registration UUID" />
+            </label>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={`text-[11px] font-semibold px-2 py-1 rounded-full ${session.token ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-600"}`}>
+              {session.token ? "Demo token active" : "Dev headers"}
+            </span>
+            <button onClick={handleSaveSession} className="px-3 py-1.5 bg-slate-900 text-white rounded-lg text-xs font-semibold">Save session</button>
+            <button onClick={handleGetDemoToken} disabled={isGettingToken || !session.userId || !session.orgId} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-semibold">
+              {isGettingToken ? "Issuing..." : "Get demo token"}
+            </button>
+            <button onClick={handleLogout} className="px-3 py-1.5 bg-white border border-slate-300 text-slate-700 rounded-lg text-xs font-semibold">Logout</button>
+          </div>
+        </div>
+        {sessionError && <p className="mt-2 text-xs text-rose-700">{sessionError}</p>}
+      </div>
 
       {/* Responsive Navigation */}
       <nav className="bg-white border-b border-slate-200 px-4 md:px-8 flex space-x-4 md:space-x-6 overflow-x-auto scrollbar-none">
