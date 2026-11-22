@@ -37,7 +37,7 @@ def audit_database_roles_and_rls_enforcement():
             assert rolbypassrls is False, "CRITICAL VIOLATION: app_service_user has BYPASSRLS privilege!"
             print("  --> Role Security PASS: app_service_user has NO superuser and NO bypassrls privileges.")
 
-            # 2. Check RLS on all tenant-scoped tables
+            # 2. Check RLS and FORCE RLS on all tenant-scoped tables
             tenant_tables = [
                 "gst_registrations", "invoices", "invoice_line_items", "documents",
                 "itc_ledger_entries", "itc_assessments",
@@ -55,7 +55,20 @@ def audit_database_roles_and_rls_enforcement():
                 assert tbl in rows, f"CRITICAL: Table {tbl} missing from database!"
                 r_sec, r_force = rows[tbl]
                 assert r_sec is True, f"CRITICAL: RLS not enabled on {tbl}!"
+                assert r_force is True, f"CRITICAL: FORCE RLS not enabled on {tbl}!"
                 print(f"  Table '{tbl:28}': RLS={r_sec}, FORCE_RLS={r_force} [PASS]")
+
+            # 3. Check reference catalogue least-privilege grants
+            cur.execute("""
+                SELECT table_name, privilege_type 
+                FROM information_schema.role_table_grants 
+                WHERE grantee = 'app_service_user' 
+                  AND table_name IN ('government_schemes', 'scheme_eligibility_rules');
+            """)
+            grants = cur.fetchall()
+            for g_tbl, g_priv in grants:
+                assert g_priv == "SELECT", f"CRITICAL LEAST-PRIVILEGE VIOLATION: {g_priv} granted on reference table {g_tbl}!"
+            print("  Reference Catalogues: app_service_user has strictly SELECT privilege [PASS]")
 
     print("=== [1] Role and Table RLS Configuration: 100% VERIFIED SECURE ===\n")
 

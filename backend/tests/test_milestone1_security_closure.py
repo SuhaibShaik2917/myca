@@ -70,7 +70,7 @@ def test_tenants():
             pan_a = gstin_a[2:12]
 
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'Milestone Tenant A', %s);", (org_a, pan_a))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner A');", (user_a, f"user_a_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner A');", (user_a, f"user_a_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_a, user_a))
             cur.execute("INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector) VALUES (%s, %s, %s, 'Services', 'IT');", (profile_a, org_a, gstin_a))
             cur.execute("INSERT INTO public.worker_service_authorizations (worker_role_name, org_id, is_active) VALUES ('worker_service_user', %s, true);", (org_a,))
@@ -82,7 +82,7 @@ def test_tenants():
             pan_b = gstin_b[2:12]
 
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'Milestone Tenant B', %s);", (org_b, pan_b))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner B');", (user_b, f"user_b_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner B');", (user_b, f"user_b_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_b, user_b))
             cur.execute("INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector) VALUES (%s, %s, %s, 'Services', 'IT');", (profile_b, org_b, gstin_b))
             cur.execute("INSERT INTO public.worker_service_authorizations (worker_role_name, org_id, is_active) VALUES ('worker_service_user', %s, true);", (org_b,))
@@ -1465,7 +1465,7 @@ def test_gstr1_table_12_b2c_advisory_warning_when_hsn_empty(test_tenants):
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'Tenant B2C Warn', %s);", (org_id, pan))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner B2C');", (user_id, f"b2c_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner B2C');", (user_id, f"b2c_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_id, user_id))
             cur.execute("INSERT INTO public.business_profiles (id, org_id, gstin, business_type, industry_sector, preceding_fy_aato) VALUES (%s, %s, %s, 'Services', 'Retail', 40000000.00);", (profile_id, org_id, gstin))
 

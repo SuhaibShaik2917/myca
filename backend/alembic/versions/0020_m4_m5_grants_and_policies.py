@@ -16,13 +16,13 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     op.execute("""
-    -- 1. Grants to app_service_user
+    -- 1. Grants to app_service_user (Least privilege: SELECT-only on public reference catalogues)
     GRANT SELECT, INSERT, UPDATE, DELETE ON public.business_profiles TO app_service_user;
     GRANT SELECT, INSERT, UPDATE, DELETE ON public.financial_transactions TO app_service_user;
     GRANT SELECT, INSERT, UPDATE, DELETE ON public.financial_summaries TO app_service_user;
     GRANT SELECT, INSERT, UPDATE, DELETE ON public.summary_transactions TO app_service_user;
-    GRANT SELECT, INSERT, UPDATE, DELETE ON public.government_schemes TO app_service_user;
-    GRANT SELECT, INSERT, UPDATE, DELETE ON public.scheme_eligibility_rules TO app_service_user;
+    GRANT SELECT ON public.government_schemes TO app_service_user;
+    GRANT SELECT ON public.scheme_eligibility_rules TO app_service_user;
     GRANT SELECT, INSERT, UPDATE, DELETE ON public.scheme_matches TO app_service_user;
     GRANT SELECT, INSERT, UPDATE, DELETE ON public.gst_records TO app_service_user;
 
@@ -93,4 +93,24 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    pass
+    op.execute("""
+    -- 1. Drop policies added in 0020
+    DROP POLICY IF EXISTS gov_schemes_read_all ON public.government_schemes;
+    DROP POLICY IF EXISTS scheme_rules_read_all ON public.scheme_eligibility_rules;
+    DROP POLICY IF EXISTS gst_records_service ON public.gst_records;
+    DROP POLICY IF EXISTS scheme_matches_service ON public.scheme_matches;
+    DROP POLICY IF EXISTS summary_transactions_service ON public.summary_transactions;
+    DROP POLICY IF EXISTS financial_summaries_service ON public.financial_summaries;
+    DROP POLICY IF EXISTS financial_transactions_service ON public.financial_transactions;
+    DROP POLICY IF EXISTS business_profiles_service ON public.business_profiles;
+
+    -- 2. Revoke grants given to app_service_user in 0020
+    REVOKE ALL ON public.business_profiles FROM app_service_user;
+    REVOKE ALL ON public.financial_transactions FROM app_service_user;
+    REVOKE ALL ON public.financial_summaries FROM app_service_user;
+    REVOKE ALL ON public.summary_transactions FROM app_service_user;
+    REVOKE ALL ON public.government_schemes FROM app_service_user;
+    REVOKE ALL ON public.scheme_eligibility_rules FROM app_service_user;
+    REVOKE ALL ON public.scheme_matches FROM app_service_user;
+    REVOKE ALL ON public.gst_records FROM app_service_user;
+    """)

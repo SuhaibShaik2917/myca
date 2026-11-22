@@ -64,7 +64,7 @@ def setup_m2_2_tenant():
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'Milestone 2.2 Test Org', %s);", (org_id, pan))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'M2.2 CA Reviewer');", (user_id, f"ca_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'M2.2 CA Reviewer');", (user_id, f"ca_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_id, user_id))
             cur.execute("""
                 INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, trade_name, legal_name, is_primary)

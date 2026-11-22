@@ -844,6 +844,160 @@ def simulate_sequential_ecl_cross_utilization(
     }
 
 
+def evaluate_section_17_5_vehicle_and_repair_eligibility(
+    category_or_desc: str,
+    hsn_sac: Optional[str] = None,
+    facts: Optional[Dict[str, Any]] = None,
+    business_profile: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Statutory evaluation of Section 17(5)(a) and Section 17(5)(ab) of the CGST Act, 2017.
+
+    STATUTORY PROVISIONS:
+    1. Section 17(5)(a): ITC is BLOCKED on motor vehicles for transportation of persons
+       having approved seating capacity of NOT MORE THAN 13 PERSONS (including the driver),
+       EXCEPT when used for making the following taxable supplies:
+       (A) further supply of such motor vehicles;
+       (B) transportation of passengers;
+       (C) imparting training on driving such motor vehicles.
+
+       - Boundary condition:
+         * Seating capacity <= 13 (including exactly 13 seats): Within blocked class.
+         * Seating capacity > 13 (i.e. >= 14 persons including driver): EXEMPT from 17(5)(a) block (ELIGIBLE).
+
+       - Goods Transport Vehicles:
+         * Trucks, lorries, HSN 8704: Not vehicles for transportation of persons; outside 17(5)(a) block entirely.
+
+    2. Section 17(5)(ab): General insurance, servicing, repair and maintenance follow the vehicle's
+       eligibility under Section 17(5)(a).
+
+    3. FACTUAL CONTEXT & EVIDENCE GATING:
+       - A business category label alone without verified vehicle evidence CANNOT infer eligibility.
+       - Missing or ambiguous facts MUST route to REVIEW_REQUIRED_FACTS_PENDING.
+    """
+    facts = facts or {}
+    business_profile = business_profile or {}
+    cat_lower = (category_or_desc or "").lower()
+    hsn = str(hsn_sac or "").strip()
+
+    is_repair_or_insurance = (
+        hsn.startswith(("9987", "9971")) or
+        any(k in cat_lower for k in ["repair", "servicing", "insurance", "maintenance"])
+    )
+    is_motor_vehicle = (
+        hsn.startswith(("8702", "8703", "8704", "8711")) or
+        any(k in cat_lower for k in ["motor", "vehicle", "car", "bus", "truck"])
+    )
+
+    if not (is_repair_or_insurance or is_motor_vehicle):
+        return {"applies": False, "status": "NOT_APPLICABLE"}
+
+    # Goods Transport Vehicles (e.g. HSN 8704, trucks, tippers)
+    vehicle_type = (facts.get("vehicle_type") or "").lower()
+    if hsn.startswith("8704") or "goods" in vehicle_type or facts.get("is_goods_transport_vehicle"):
+        if facts.get("is_factual_context_verified", False):
+            return {
+                "applies": True,
+                "is_blocked": False,
+                "status": "ELIGIBLE_STATUTORY_EXCEPTION",
+                "statutory_citation": "Section 17(5)(a) inapplicable: Goods transport vehicle (not for transportation of persons).",
+                "seating_capacity": facts.get("seating_capacity")
+            }
+        else:
+            return {
+                "applies": True,
+                "is_blocked": None,
+                "status": "REVIEW_REQUIRED_FACTS_PENDING",
+                "statutory_citation": "Section 17(5)(a): Goods transport claimed but vehicle RC / registration unverified.",
+                "missing_evidence_required": "Provide verified RC copy confirming goods carriage category."
+            }
+
+    # If facts are explicitly provided, check verification state
+    if facts:
+        is_verified = facts.get("is_factual_context_verified", False)
+        if not is_verified:
+            return {
+                "applies": True,
+                "is_blocked": None,
+                "status": "REVIEW_REQUIRED_FACTS_PENDING",
+                "statutory_citation": "Section 17(5)(a) / Section 17(5)(ab): Factual context, seating capacity, and vehicle usage unverified.",
+                "missing_evidence_required": "Provide vehicle registration certificate (RC), approved seating capacity, and end-use declaration."
+            }
+
+        # Seating Capacity Evaluation (> 13 vs <= 13)
+        seating_capacity = facts.get("seating_capacity")
+        if seating_capacity is not None:
+            try:
+                seats = int(seating_capacity)
+                if seats > 13:
+                    # Strictly MORE THAN 13 persons (e.g. 14, 25, 50 seats)
+                    return {
+                        "applies": True,
+                        "is_blocked": False,
+                        "status": "ELIGIBLE_STATUTORY_EXCEPTION",
+                        "statutory_citation": f"Section 17(5)(a) exception: Approved seating capacity of {seats} persons is MORE THAN 13 persons.",
+                        "seating_capacity": seats
+                    }
+                # If seats <= 13 (including exactly 13 seats), falls under blocked class of "not more than 13 persons"
+            except (ValueError, TypeError):
+                pass
+
+        # Specified Purpose Exceptions under Section 17(5)(a)(A), (B), (C)
+        if facts.get("further_supply_of_vehicles") or facts.get("is_car_dealer"):
+            return {
+                "applies": True,
+                "is_blocked": False,
+                "status": "ELIGIBLE_STATUTORY_EXCEPTION",
+                "statutory_citation": "Section 17(5)(a)(A) exception: Further taxable supply of such motor vehicles.",
+                "seating_capacity": seating_capacity
+            }
+
+        if facts.get("passenger_transport_license") or facts.get("is_passenger_transport_business"):
+            if facts.get("passenger_transport_license"):
+                return {
+                    "applies": True,
+                    "is_blocked": False,
+                    "status": "ELIGIBLE_STATUTORY_EXCEPTION",
+                    "statutory_citation": "Section 17(5)(a)(B) exception: Verified commercial passenger transportation permit.",
+                    "seating_capacity": seating_capacity
+                }
+            else:
+                return {
+                    "applies": True,
+                    "is_blocked": None,
+                    "status": "REVIEW_REQUIRED_FACTS_PENDING",
+                    "statutory_citation": "Section 17(5)(a)(B): Passenger transport claimed without verified commercial transport permit.",
+                    "missing_evidence_required": "Provide commercial passenger transport permit / stage carriage permit."
+                }
+
+        if facts.get("is_driving_school_training"):
+            return {
+                "applies": True,
+                "is_blocked": False,
+                "status": "ELIGIBLE_STATUTORY_EXCEPTION",
+                "statutory_citation": "Section 17(5)(a)(C) exception: Imparting training on driving such motor vehicles.",
+                "seating_capacity": seating_capacity
+            }
+
+        seats_str = f" of {seating_capacity} persons" if seating_capacity is not None else ""
+        return {
+            "applies": True,
+            "is_blocked": True,
+            "status": "BLOCKED_CREDIT_CONFIRMED",
+            "statutory_citation": f"Section 17(5)(a) / 17(5)(ab): Motor vehicle seating capacity{seats_str} is NOT MORE THAN 13 persons and no statutory exception applies.",
+            "seating_capacity": seating_capacity
+        }
+
+    # Default if no facts dictionary provided at all (e.g. bare invoice description)
+    return {
+        "applies": True,
+        "is_blocked": True,
+        "status": "BLOCKED_CREDIT_INDICATOR",
+        "statutory_citation": "Motor vehicle with seating capacity <= 13 persons is blocked under Section 17(5)(a).",
+        "seating_capacity": None
+    }
+
+
 class StatutoryITCRiskEngine:
     """
     Milestone 2 Versioned Statutory ITC Risk & Eligibility Engine.
@@ -1129,21 +1283,50 @@ class StatutoryITCRiskEngine:
             item_desc = (line.get("item_description") or "").lower()
             hsn = str(line.get("hsn_sac_code") or "")
 
-            # Motor Vehicles 17(5)(a) - HSN 8702, 8703
-            if hsn.startswith(("8702", "8703")) or "motor car" in item_desc or "vehicle" in item_desc or "car" in item_desc:
-                assessments.append(ITCAssessmentOut(
-                    purchase_doc_id=p_id,
-                    gstr2b_doc_id=g_id,
-                    rule_code="SEC_17_5_MOTOR",
-                    statutory_section="Section 17(5)(a)",
-                    eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
-                    potential_itc=total_tax,
-                    risk_reversal_amount=total_tax,
-                    findings_explanation="Motor vehicle with seating capacity <= 13 persons is blocked under Section 17(5)(a).",
-                    missing_evidence_required="Provide proof of passenger transport business, driving school, or goods transport use.",
-                    evaluation_date=str(eval_dt)
-                ))
-                break
+            # Motor Vehicles 17(5)(a) & Repair/Maintenance 17(5)(ab)
+            if (
+                hsn.startswith(("8702", "8703", "8704", "8711", "9987", "9971")) or
+                any(k in item_desc for k in ["motor car", "vehicle", "car", "bus", "truck", "servicing", "motor repair", "vehicle repair"])
+            ):
+                veh_facts = line.get("facts") or purchase_doc.get("facts") or {}
+                veh_res = evaluate_section_17_5_vehicle_and_repair_eligibility(
+                    category_or_desc=item_desc,
+                    hsn_sac=hsn,
+                    facts=veh_facts,
+                    business_profile=purchase_doc.get("business_profile") or {}
+                )
+                if veh_res.get("applies"):
+                    if veh_res.get("is_blocked") is True:
+                        assessments.append(ITCAssessmentOut(
+                            purchase_doc_id=p_id,
+                            gstr2b_doc_id=g_id,
+                            rule_code="SEC_17_5_MOTOR",
+                            statutory_section="Section 17(5)(a)" if not hsn.startswith(("9987", "9971")) else "Section 17(5)(ab)",
+                            eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
+                            potential_itc=total_tax,
+                            risk_reversal_amount=total_tax,
+                            findings_explanation=veh_res.get("statutory_citation", "Motor vehicle with seating capacity <= 13 persons is blocked under Section 17(5)(a)."),
+                            missing_evidence_required="Provide proof of passenger transport business permit, driving school, or seating capacity > 13 persons.",
+                            evaluation_date=str(eval_dt)
+                        ))
+                        break
+                    elif veh_res.get("status") == "REVIEW_REQUIRED_FACTS_PENDING":
+                        assessments.append(ITCAssessmentOut(
+                            purchase_doc_id=p_id,
+                            gstr2b_doc_id=g_id,
+                            rule_code="SEC_17_5_MOTOR",
+                            statutory_section="Section 17(5)(a)" if not hsn.startswith(("9987", "9971")) else "Section 17(5)(ab)",
+                            eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
+                            potential_itc=total_tax,
+                            risk_reversal_amount=total_tax,
+                            findings_explanation=veh_res.get("statutory_citation", "Vehicle context and seating capacity unverified."),
+                            missing_evidence_required=veh_res.get("missing_evidence_required", "Provide verified RC copy confirming seating capacity and business end-use."),
+                            evaluation_date=str(eval_dt)
+                        ))
+                        break
+                    elif veh_res.get("is_blocked") is False:
+                        # Statutorily exempt from block (e.g. seating capacity > 13 or goods transport vehicle)
+                        break
 
             # Food & Beverages 17(5)(b) - HSN 9963
             elif hsn.startswith("9963") or "catering" in item_desc or "food" in item_desc:

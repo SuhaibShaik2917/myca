@@ -31,7 +31,7 @@ def m4_tenant():
             profile_id = str(uuid.uuid4())
 
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'M4 Test Enterprise', %s);", (org_id, pan))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Credit Tester');", (user_id, f"m4_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Credit Tester');", (user_id, f"m4_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_id, user_id))
             cur.execute("""
                 INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, legal_name, is_primary)
@@ -141,7 +141,7 @@ def test_multi_tenant_financial_isolation(m4_tenant):
             rand_digits = f"{random.randint(1000, 9999)}"
             pan_b = f"ZZZZZ{rand_digits}A"
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'Org B Isolated', %s);", (org_b, pan_b))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Tester B');", (user_b, f"m4_b_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Tester B');", (user_b, f"m4_b_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_b, user_b))
             cur.execute("""
                 INSERT INTO public.business_profiles (id, org_id, business_type, industry_sector, created_at, updated_at)

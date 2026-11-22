@@ -32,7 +32,7 @@ def ai_tenant():
             udyam = f"UDYAM-MH-12-{random.randint(1000000, 9999999)}"
 
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'Copilot MSME Private Ltd', %s);", (org_id, pan))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'AI Tester');", (user_id, f"ai_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'AI Tester');", (user_id, f"ai_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_id, user_id))
             cur.execute("""
                 INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, legal_name, is_primary)

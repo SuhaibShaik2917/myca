@@ -73,7 +73,7 @@ def test_tenants():
             reg_a = str(uuid.uuid4())
 
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'M2 Tenant A Org', %s);", (org_a, pan_a))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner M2 A');", (user_a, f"user_m2a_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner M2 A');", (user_a, f"user_m2a_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_a, user_a))
             cur.execute("""
                 INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, legal_name, is_primary)
@@ -88,7 +88,7 @@ def test_tenants():
             reg_b = str(uuid.uuid4())
 
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'M2 Tenant B Org', %s);", (org_b, pan_b))
-            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner M2 B');", (user_b, f"user_m2b_{uuid.uuid4().hex[:6]}@example.com"))
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'Owner M2 B');", (user_b, f"user_m2b_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_b, user_b))
             cur.execute("""
                 INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, legal_name, is_primary)

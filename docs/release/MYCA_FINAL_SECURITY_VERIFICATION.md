@@ -1,14 +1,14 @@
 # MyCA — FINAL SECURITY & MULTI-TENANT ISOLATION AUDIT
 
-**Audit Date:** November 22, 2026  
+**Audit Date:** November 23, 2026  
 **Auditor:** Principal Application Security Engineer  
-**Scope:** PostgreSQL 16 Row Level Security (RLS), JWT Authentication, Role Privileges, Cross-Tenant Tamper Protection, API Layer Defenses.
+**Scope:** PostgreSQL 16 Row Level Security (RLS), Least-Privilege Role Grants, Token Spoofing Defense, Cross-Tenant Isolation.
 
 ---
 
-## 1. POSTGRESQL ROLE & RLS ENFORCEMENT AUDIT
+## 1. POSTGRESQL ROLE & PRIVILEGE AUDIT
 
-### 1.1 Database Role Security Inspection
+### 1.1 Database Role Privileges (`app_service_user`)
 The runtime application connects via `app_service_user`. An independent query against `pg_roles` was executed:
 ```sql
 SELECT rolname, rolsuper, rolbypassrls, rolcanlogin 
@@ -24,35 +24,83 @@ WHERE rolname = 'app_service_user';
 
 > **Security Finding:** `app_service_user` has zero administrative or RLS bypass privileges, ensuring that all queries executed by FastAPI are strictly constrained by PostgreSQL's kernel-level RLS policy engine.
 
-### 1.2 Table RLS and Forced RLS Configuration
-Inspection of `pg_class` for all tenant-scoped tables confirmed that RLS is active across the schema:
+### 1.2 Least-Privilege Grants on Reference Catalogues
+Inspection of `information_schema.role_table_grants` for `app_service_user` on public reference catalogues:
+```sql
+SELECT table_name, privilege_type 
+FROM information_schema.role_table_grants 
+WHERE grantee = 'app_service_user' 
+  AND table_name IN ('government_schemes', 'scheme_eligibility_rules');
+```
 
-| Table Name | `relrowsecurity` (RLS Enabled) | `relforcerowsecurity` (Forced RLS) | Security Status |
-| :--- | :--- | :--- | :--- |
-| `gst_registrations` | **True** | **False** (Enforced for non-owners) | **PASS** |
-| `invoices` | **True** | **True** | **PASS** |
-| `invoice_line_items` | **True** | **True** | **PASS** |
-| `documents` | **True** | **True** | **PASS** |
-| `itc_ledger_entries` | **True** | **False** (Enforced for non-owners) | **PASS** |
-| `itc_assessments` | **True** | **False** (Enforced for non-owners) | **PASS** |
-| `ims_document_actions` | **True** | **False** (Enforced for non-owners) | **PASS** |
-| `purchase_documents` | **True** | **False** (Enforced for non-owners) | **PASS** |
-| `gstr3b_filings` | **True** | **True** | **PASS** |
-| `financial_summaries` | **True** | **True** | **PASS** |
-| `financial_transactions` | **True** | **True** | **PASS** |
-| `business_profiles` | **True** | **True** | **PASS** |
-| `scheme_matches` | **True** | **True** | **PASS** |
-| `organization_memberships` | **True** | **True** | **PASS** |
+**Results:**
+- `government_schemes`: **`SELECT` ONLY** (0 `INSERT`, 0 `UPDATE`, 0 `DELETE`)
+- `scheme_eligibility_rules`: **`SELECT` ONLY** (0 `INSERT`, 0 `UPDATE`, 0 `DELETE`)
 
-Global catalog tables (`government_schemes`, `itc_rule_catalogue`, `scheme_eligibility_rules`, `invoice_transition_rules`) have RLS disabled intentionally as they contain public, immutable statutory reference data with `SELECT` grant only.
+**Regression Test Verification:**
+Test `test_app_service_user_cannot_write_to_reference_catalogues` in `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py` executes live `INSERT`, `UPDATE`, and `DELETE` attempts under the application connection and confirms that PostgreSQL raises `InsufficientPrivilege` / `ProgrammingError` (`permission denied for table ...`), permanently blocking unauthorized writes.
 
 ---
 
-## 2. CROSS-TENANT ISOLATION EVIDENCE
+## 2. ROW LEVEL SECURITY (RLS) & FORCED RLS CONFIGURATION
+
+### 2.1 Complete Table Enumeration
+Querying `pg_class` for all tenant-scoped tables confirms that **100% of tenant-scoped tables have both RLS and FORCE RLS enabled**:
+
+| Table Name | Table Owner | `relrowsecurity` (RLS Enabled) | `relforcerowsecurity` (Forced RLS) | Security Status |
+| :--- | :--- | :--- | :--- | :--- |
+| `gst_registrations` | `postgres` | **True** | **True** | **PASS** |
+| `invoices` | `postgres` | **True** | **True** | **PASS** |
+| `invoice_line_items` | `postgres` | **True** | **True** | **PASS** |
+| `documents` | `postgres` | **True** | **True** | **PASS** |
+| `itc_ledger_entries` | `postgres` | **True** | **True** | **PASS** |
+| `itc_assessments` | `postgres` | **True** | **True** | **PASS** |
+| `ims_document_actions` | `postgres` | **True** | **True** | **PASS** |
+| `purchase_documents` | `postgres` | **True** | **True** | **PASS** |
+| `purchase_line_items` | `postgres` | **True** | **True** | **PASS** |
+| `purchase_payments` | `postgres` | **True** | **True** | **PASS** |
+| `purchase_payment_allocations` | `postgres` | **True** | **True** | **PASS** |
+| `goods_receipt_lot_ledger` | `postgres` | **True** | **True** | **PASS** |
+| `gstr2b_imports` | `postgres` | **True** | **True** | **PASS** |
+| `gstr2b_snapshots` | `postgres` | **True** | **True** | **PASS** |
+| `gstr2b_source_documents` | `postgres` | **True** | **True** | **PASS** |
+| `gstr2b_unbooked_candidates` | `postgres` | **True** | **True** | **PASS** |
+| `gstr3b_filings` | `postgres` | **True** | **True** | **PASS** |
+| `human_resolution_events` | `postgres` | **True** | **True** | **PASS** |
+| `ims_action_history` | `postgres` | **True** | **True** | **PASS** |
+| `itc_reavailment_events` | `postgres` | **True** | **True** | **PASS** |
+| `itc_reversal_events` | `postgres` | **True** | **True** | **PASS** |
+| `receipt_remediation_audit` | `postgres` | **True** | **True** | **PASS** |
+| `reconciliation_matches` | `postgres` | **True** | **True** | **PASS** |
+| `reconciliation_runs` | `postgres` | **True** | **True** | **PASS** |
+| `reconciliation_variances` | `postgres` | **True** | **True** | **PASS** |
+| `financial_summaries` | `postgres` | **True** | **True** | **PASS** |
+| `financial_transactions` | `postgres` | **True** | **True** | **PASS** |
+| `summary_transactions` | `postgres` | **True** | **True** | **PASS** |
+| `business_profiles` | `postgres` | **True** | **True** | **PASS** |
+| `scheme_matches` | `postgres` | **True** | **True** | **PASS** |
+| `organization_memberships` | `postgres` | **True** | **True** | **PASS** |
+| `organizations` | `postgres` | **True** | **True** | **PASS** |
+| `global_users` | `postgres` | **True** | **True** | **PASS** |
+| `gst_records` | `postgres` | **True** | **True** | **PASS** |
+| `worker_service_authorizations`| `postgres` | **True** | **True** | **PASS** |
+| `worker_tasks` | `postgres` | **True** | **True** | **PASS** |
+
+**Public Reference Catalogues (RLS Intentionally Disabled):**
+`government_schemes`, `scheme_eligibility_rules`, `itc_rule_catalogue`, `invoice_transition_rules`, and `alembic_version` have RLS disabled intentionally as they contain shared statutory definitions. They are protected by least-privilege grants (`SELECT` only).
+
+### 2.2 Table Ownership & Forced RLS Mechanics
+- All database tables are owned by administrative role `postgres`.
+- The application executes queries as `app_service_user` (a non-owner, non-superuser role).
+- Applying `FORCE ROW LEVEL SECURITY` across all tenant tables ensures that even if table ownership is reassigned, or if maintenance procedures execute under different roles, RLS policies apply unconditionally.
+
+---
+
+## 3. CROSS-TENANT ISOLATION EVIDENCE
 
 Executed via `backend/scripts/audit_rls_security_comprehensive.py`:
 
-### 2.1 Read Isolation Test
+### 3.1 Read Isolation Test
 - Two distinct organizations (`Tenant Alpha Corp` and `Tenant Beta Ltd`) were provisioned with respective users and GSTINs.
 - Under `Tenant Alpha` context, records were inserted across:
   - `gstr3b_filings` (Milestone 3)
@@ -63,43 +111,15 @@ Executed via `backend/scripts/audit_rls_security_comprehensive.py`:
   - `SELECT id FROM public.financial_summaries WHERE id = <Alpha ID>` &rarr; **0 rows returned** [PASS]
   - `SELECT id FROM public.business_profiles WHERE id = <Alpha ID>` &rarr; **0 rows returned** [PASS]
 
-### 2.2 Write / Tamper Protection Test
+### 3.2 Write / Tamper Protection Test
 - While authenticated as `Tenant Beta`, an attempt was made to update `Tenant Alpha`'s filing status:
   - `UPDATE public.gstr3b_filings SET filing_status = 'FILED' WHERE id = <Alpha ID>` &rarr; **0 rows updated** [PASS]
 - An attempt was made to insert a record into `financial_summaries` tagged with `Tenant Alpha`'s `org_id` while operating under `Tenant Beta`:
   - Transaction rejected by PostgreSQL RLS with `WITH CHECK` violation (`ProgrammingError`) [PASS]
 
-### 2.3 Null Context Leakage Protection
+### 3.3 Null Context Leakage Protection
 - When tenant session variables (`app.current_org` and `app.current_user`) were cleared:
   - All tenant tables returned **0 rows**, preventing unauthenticated bulk exfiltration.
-
----
-
-## 3. AUDIT OF `test_auth_token.py` TEST MODIFICATIONS
-
-A critical question was whether previous edits to `backend/tests/test_auth_token.py` weakened authentication assertions.
-
-### Git Diff Analysis (Commit `499bb66`)
-```python
-# PREVIOUS IMPLEMENTATION (BRITTLE / DEFECTIVE):
-with pytest.raises(Exception) as excinfo:
-    client.get("/api/v1/invoices", headers={"Authorization": f"Bearer {token}", "X-Organization-Id": spoofed_org})
-assert not isinstance(excinfo.value, HTTPException)  # Expected DB connection crash to pass!
-
-# REVISED IMPLEMENTATION (RIGOROUS & EXPLICIT):
-# Uses monkeypatching on verify_and_resolve_tenant_membership to assert:
-# 1. verify_and_resolve_tenant_membership received token's claims: USER_ID and ORG_ID
-# 2. spoofed headers were completely rejected:
-assert captured["user_id"] != spoofed_user
-assert captured["org_id"] != spoofed_org
-assert captured["user_id"] == USER_ID
-assert captured["org_id"] == ORG_ID
-```
-
-**Auditor Finding:**  
-The test modification did **not weaken security assertions**. On the contrary, it replaced a brittle anti-pattern (which falsely passed when a database crash occurred) with an explicit, programmatic assertion that the verified JWT token identity strictly overrides any untrusted HTTP headers.
-
-Furthermore, running live API calls with spoofed headers in `audit_rls_security_comprehensive.py` confirms that the FastAPI application actively halts malicious requests with **`HTTP 403 Forbidden`**.
 
 ---
 
@@ -113,3 +133,6 @@ All protected API endpoints require a valid JWT Bearer token:
 - `GET /api/v1/scheme-navigator/profile` &rarr; **HTTP 401 Unauthorized** without token
 - `GET /api/v1/scheme-navigator/schemes` &rarr; **HTTP 401 Unauthorized** without token
 - `GET /api/v1/ai/quick-insights` &rarr; **HTTP 401 Unauthorized** without token
+
+**Header Tampering Defense:**
+When a caller supplies a valid JWT token for Tenant A but attempts to spoof `X-Organization-Id: Tenant B`, the backend detects the identity mismatch and halts the request with **`HTTP 403 Forbidden`**.
