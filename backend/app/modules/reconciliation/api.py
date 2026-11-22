@@ -1115,7 +1115,7 @@ def add_purchase_payment(
 ):
     """Records payment and allocates to purchase documents."""
     try:
-        alloc_list = [a.dict() for a in payload.allocations]
+        alloc_list = [a.model_dump() for a in payload.allocations]
         res = record_purchase_payment(
             session=db,
             org_id=x_org_id,
@@ -2093,7 +2093,7 @@ def export_reconciliation_audit_report(
         "return_period": return_period,
         "registration_id": registration_id,
         "generated_at": datetime.utcnow().isoformat(),
-        "summary": t4.dict(),
+        "summary": t4.model_dump(),
         "unbooked_invoices_count": len(t4.unbooked_gstr2b_documents),
         "unbooked_invoices": t4.unbooked_gstr2b_documents,
         "reversals_lineage_count": len(t4.reversals_lineage),

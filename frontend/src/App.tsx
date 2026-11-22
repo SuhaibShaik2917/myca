@@ -28,7 +28,7 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<Array<{ sender: "user" | "assistant"; text: string }>>([
     {
       sender: "assistant",
-      text: "Namaste! I am your MyCA financial companion. (Demo Mode: Backend services and database migration verification in progress). How can I assist you today?"
+      text: "Namaste! I am your MyCA financial companion. Demo preview: the AI advisor is not connected yet. How can I assist you today?"
     }
   ]);
   const [inputText, setInputText] = useState("");
@@ -47,14 +47,14 @@ export default function App() {
         ...prev,
         {
           sender: "assistant",
-          text: `[Simulated Response] Received inquiry regarding: "${userMsg}". Note: Live Gemini API execution will be linked after full database migration baseline sign-off.`
+          text: `Demo mode: the AI advisor is not connected yet. Your question was: "${userMsg}".`
         }
       ]);
     }, 600);
   };
 
   const handleUploadSimulate = () => {
-    setUploadNotification("Demo Upload: In production, invoices are streamed to secure object storage and queued via public.claim_task().");
+    setUploadNotification("Demo mode: outward invoice upload is not connected yet.");
     setTimeout(() => setUploadNotification(null), 4000);
   };
 
@@ -63,7 +63,7 @@ export default function App() {
       {/* Demo Mode Notification Banner */}
       <div className="bg-amber-500 text-white text-xs py-1.5 px-4 text-center font-medium flex items-center justify-center space-x-2">
         <AlertCircle className="w-4 h-4" />
-        <span>Milestone 2 Active Preview — Multi-Registration GSTR-2B, Purchase Register, Deterministic 4-Pass Reconciliation & ITC Risk Engine.</span>
+        <span>Demo preview — GSTR-2B upload can call the backend; other screens still use sample data.</span>
       </div>
 
       {/* Header */}
@@ -81,7 +81,7 @@ export default function App() {
             Security: PostgreSQL 16 Forced RLS
           </div>
           <div className="text-right">
-            <div className="text-xs font-semibold text-slate-500">[Active Org] Apex Enterprises Pvt Ltd</div>
+            <div className="text-xs font-semibold text-slate-500">Demo organization</div>
             <div className="text-xs text-slate-400 font-mono">PAN: AABCA1234F | GSTIN: 27AABCB1234M1ZT</div>
           </div>
         </div>
