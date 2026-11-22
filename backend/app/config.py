@@ -1,6 +1,6 @@
 import os
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator
 from typing import Optional, List
 
 class Settings(BaseSettings):
@@ -36,8 +36,14 @@ class Settings(BaseSettings):
                 raise ValueError("CRITICAL SECURITY ERROR: Production deployment requires a secure SECRET_KEY of at least 32 characters.")
         return v
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    @field_validator("DATABASE_URL", "DATABASE_WORKER_URL")
+    def validate_database_urls(cls, v):
+        env = os.getenv("ENVIRONMENT", "development")
+        if env == "production":
+            if not v or ":secret@" in v or "localhost" in v or "127.0.0.1" in v:
+                raise ValueError("CRITICAL SECURITY ERROR: Production deployment requires non-default database URLs.")
+        return v
+
+    model_config = ConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 
 settings = Settings()

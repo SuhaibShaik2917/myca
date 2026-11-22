@@ -280,7 +280,7 @@ def get_task_status_endpoint(
 # GST Working Outputs Endpoints
 @router.get("/gst/gstr1-draft", response_model=GSTR1DraftResponse)
 def get_gstr1_draft(
-    period: str = Query(..., regex=r"^\d{4}-\d{2}$", description="Tax period YYYY-MM"),
+    period: str = Query(..., pattern=r"^\d{4}-\d{2}$", description="Tax period YYYY-MM"),
     x_org_id: str = Header(..., alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
@@ -294,7 +294,7 @@ def get_gstr1_draft(
 
 @router.get("/gst/gstr3b-draft", response_model=GSTR3BDraftResponse)
 def get_gstr3b_draft(
-    period: str = Query(..., regex=r"^\d{4}-\d{2}$", description="Tax period YYYY-MM"),
+    period: str = Query(..., pattern=r"^\d{4}-\d{2}$", description="Tax period YYYY-MM"),
     x_org_id: str = Header(..., alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):

@@ -2,17 +2,75 @@ import React, { useState } from "react";
 import { UploadCloud, CheckCircle2, AlertTriangle, FileSpreadsheet, ShieldCheck, Layers, FileCode } from "lucide-react";
 
 interface Gstr2bUploadProps {
-  onUploadSuccess?: (data: any) => void;
+  onUploadSuccess?: (data: Gstr2bUploadResponse) => void;
 }
+
+interface Gstr2bUploadResponse {
+  import_id: string;
+  snapshot_id: string;
+  version_number: number;
+  recipient_gstin: string;
+  return_period: string;
+  financial_year: string;
+  total_documents: number;
+  total_itc_available: string;
+  total_itc_not_available: string;
+  file_hash: string;
+  recomputed_status?: string;
+}
+
+interface Gstr2bRecomputeResponse {
+  new_snapshot_id: string;
+  previous_snapshot_id: string;
+  version_number: number;
+  return_period: string;
+  recipient_gstin: string;
+  total_itc_available: string;
+  total_itc_not_available: string;
+  accepted_docs_count: number;
+  pending_docs_held_count: number;
+  rejected_docs_count: number;
+  recomputed_at: string;
+}
+
+const env = (import.meta as any).env ?? {};
+const API_BASE_URL: string = env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
 export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) => {
   const [returnPeriod, setReturnPeriod] = useState("2026-11");
   const [registrationGstin, setRegistrationGstin] = useState("27AABCB1234M1ZT");
+  const [registrationId, setRegistrationId] = useState<string>(
+    env.VITE_REGISTRATION_ID ?? "00000000-0000-0000-0000-000000000001"
+  );
+  const [userId, setUserId] = useState<string>(env.VITE_USER_ID ?? "");
+  const [orgId, setOrgId] = useState<string>(env.VITE_ORG_ID ?? "");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileHash, setFileHash] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadResult, setUploadResult] = useState<any | null>(null);
+  const [isRecomputing, setIsRecomputing] = useState(false);
+  const [uploadResult, setUploadResult] = useState<Gstr2bUploadResponse | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const authHeaders = (): Record<string, string> => {
+    if (!userId.trim() || !orgId.trim()) {
+      throw new Error("Enter User ID and Organization ID for the development identity headers.");
+    }
+    return {
+      "X-User-Id": userId.trim(),
+      "X-Org-Id": orgId.trim(),
+    };
+  };
+
+  const parseError = async (response: Response): Promise<string> => {
+    try {
+      const body = await response.json();
+      if (typeof body?.detail === "string") return body.detail;
+      if (Array.isArray(body?.detail)) return body.detail.map((d: any) => d?.msg ?? JSON.stringify(d)).join("; ");
+      return `Request failed with status ${response.status}.`;
+    } catch {
+      return `Request failed with status ${response.status}.`;
+    }
+  };
 
   const computeSha256 = async (file: File): Promise<string> => {
     const buffer = await file.arrayBuffer();
@@ -26,8 +84,13 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
       setSelectedFile(file);
-      const hash = await computeSha256(file);
-      setFileHash(hash);
+      try {
+        const hash = await computeSha256(file);
+        setFileHash(hash);
+      } catch {
+        setFileHash(null);
+        setErrorMsg("Could not compute the file hash in this browser context. You can still try the upload.");
+      }
     }
   };
 
@@ -37,46 +100,79 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
       setErrorMsg("Please select a GSTR-2B JSON or Excel file.");
       return;
     }
+    if (!registrationId.trim()) {
+      setErrorMsg("Enter the GST registration ID.");
+      return;
+    }
 
     setIsUploading(true);
     setErrorMsg(null);
 
     try {
       const formData = new FormData();
-      formData.append("registration_id", "00000000-0000-0000-0000-000000000001");
-      formData.append("return_period", returnPeriod);
+      formData.append("registration_id", registrationId.trim());
+      formData.append("return_period", returnPeriod.trim());
       formData.append("file", selectedFile);
 
-      // In real deployment, points to backend endpoint
-      // Simulate response for UI preview if backend unreachable
-      const syntheticResult = {
-        import_id: "imp-2b-7821-49fa",
-        snapshot_id: "snap-2b-9902-88ef",
-        version_number: 1,
-        recipient_gstin: registrationGstin,
-        return_period: returnPeriod,
-        financial_year: "2026-2027",
-        total_documents: 42,
-        total_itc_available: "4,82,500.00",
-        total_itc_not_available: "12,400.00",
-        file_hash: fileHash || "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        sections: [
-          { name: "B2B (Inward Supplies from Registered Persons)", count: 28, itc: "3,40,000.00", status: "available" },
-          { name: "B2BA (Supplier Inward Amendments)", count: 3, itc: "45,000.00", status: "available" },
-          { name: "CDNR (Credit/Debit Notes Registered)", count: 4, itc: "-18,000.00", status: "available" },
-          { name: "ISD (Input Service Distributor Invoices)", count: 2, itc: "25,500.00", status: "available" },
-          { name: "Inward Supplies Attracting Reverse Charge (RCM)", count: 3, itc: "30,000.00", status: "available" },
-          { name: "IMPG / ICEGATE (Import of Goods from Overseas)", count: 1, itc: "60,000.00", status: "available" },
-          { name: "Part B (ITC Not Available - Pos Mismatch / Sec 16(4))", count: 1, itc: "12,400.00", status: "not_available" }
-        ]
-      };
+      const response = await fetch(`${API_BASE_URL}/api/v1/reconciliation/gstr2b/upload`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: formData,
+      });
 
-      setUploadResult(syntheticResult);
-      if (onUploadSuccess) onUploadSuccess(syntheticResult);
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+
+      const data = (await response.json()) as Gstr2bUploadResponse;
+      setUploadResult(data);
+      if (onUploadSuccess) onUploadSuccess(data);
     } catch (err: any) {
-      setErrorMsg(err.message || "Upload failed. Please check network and file format.");
+      setErrorMsg(err?.message || "Upload failed. Please check the backend URL, file format, and development identity headers.");
     } finally {
       setIsUploading(false);
+    }
+  };
+
+  const handleRecompute = async () => {
+    if (!uploadResult) return;
+    setIsRecomputing(true);
+    setErrorMsg(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/reconciliation/gstr2b/recompute`, {
+        method: "POST",
+        headers: {
+          ...authHeaders(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          registration_id: registrationId.trim(),
+          return_period: uploadResult.return_period,
+          snapshot_id: uploadResult.snapshot_id,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+
+      const data = (await response.json()) as Gstr2bRecomputeResponse;
+      setUploadResult((prev) =>
+        prev
+          ? {
+              ...prev,
+              snapshot_id: data.new_snapshot_id,
+              version_number: data.version_number,
+              total_itc_available: data.total_itc_available,
+              total_itc_not_available: data.total_itc_not_available,
+              recomputed_status: `Recomputed at ${data.recomputed_at} — accepted ${data.accepted_docs_count}, pending ${data.pending_docs_held_count}, rejected ${data.rejected_docs_count}.`,
+            }
+          : prev
+      );
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Recompute failed. Please check the backend response.");
+    } finally {
+      setIsRecomputing(false);
     }
   };
 
@@ -129,6 +225,48 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
             </div>
           </div>
 
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+                Registration ID
+              </label>
+              <input
+                type="text"
+                value={registrationId}
+                onChange={(e) => setRegistrationId(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
+                placeholder="GST registration UUID"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+                User ID (dev header)
+              </label>
+              <input
+                type="text"
+                value={userId}
+                onChange={(e) => setUserId(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
+                placeholder="User UUID"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+                Organization ID (dev header)
+              </label>
+              <input
+                type="text"
+                value={orgId}
+                onChange={(e) => setOrgId(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
+                placeholder="Organization UUID"
+                required
+              />
+            </div>
+          </div>
+
           <div>
             <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
               Select Statement File (GST Portal JSON or Excel)
@@ -148,7 +286,7 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
                   </label>
                   <p className="pl-1">or drag and drop</p>
                 </div>
-                <p className="text-xs text-slate-500">Official GST Portal JSON, ZIP, or Excel up to 50MB</p>
+                <p className="text-xs text-slate-500">Official GST Portal JSON or Excel up to 50MB</p>
               </div>
             </div>
           </div>
@@ -201,17 +339,12 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => {
-                  setUploadResult((prev: any) => ({
-                    ...prev,
-                    version_number: (prev?.version_number || 1) + 1,
-                    total_itc_available: "4,50,100.00",
-                    recomputed_status: "Recomputed from IMS actions (Pending docs held in IMS)"
-                  }));
-                }}
-                className="px-3 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                onClick={handleRecompute}
+                disabled={isRecomputing}
+                className="px-3 py-1 bg-indigo-50 hover:bg-indigo-100 disabled:bg-slate-100 text-indigo-700 border border-indigo-200 rounded text-xs font-semibold flex items-center gap-1.5 transition-colors"
               >
-                Recompute Snapshot (After IMS Actions)
+                <Layers className="w-3.5 h-3.5" />
+                {isRecomputing ? "Recomputing..." : "Recompute Snapshot (After IMS Actions)"}
               </button>
               <span className="bg-emerald-100 text-emerald-800 px-2.5 py-1 rounded text-xs font-mono font-bold">
                 Snapshot v{uploadResult.version_number} (Active)
@@ -238,39 +371,30 @@ export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) =
             </div>
           </div>
 
-          <div>
-            <h4 className="text-xs font-semibold text-slate-700 uppercase tracking-wider mb-2 flex items-center gap-1.5">
-              <Layers className="w-3.5 h-3.5" /> Sectional Document Breakdown
-            </h4>
-            <div className="border border-slate-200 rounded-lg overflow-hidden">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
-                  <tr>
-                    <th className="px-3 py-2">Section & Category</th>
-                    <th className="px-3 py-2 text-center">Doc Count</th>
-                    <th className="px-3 py-2 text-right">Total Tax (ITC)</th>
-                    <th className="px-3 py-2 text-center">Statutory Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 font-mono">
-                  {uploadResult.sections.map((sec: any, idx: number) => (
-                    <tr key={idx} className="hover:bg-slate-50">
-                      <td className="px-3 py-2 font-sans font-medium text-slate-800">{sec.name}</td>
-                      <td className="px-3 py-2 text-center text-slate-600">{sec.count}</td>
-                      <td className="px-3 py-2 text-right font-bold text-slate-900">₹{sec.itc}</td>
-                      <td className="px-3 py-2 text-center">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
-                          sec.status === 'available' ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'
-                        }`}>
-                          {sec.status.toUpperCase()}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+            <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
+              <p className="text-slate-500 font-medium">Import ID</p>
+              <p className="font-mono font-bold text-slate-800 mt-0.5 break-all">{uploadResult.import_id}</p>
+            </div>
+            <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
+              <p className="text-slate-500 font-medium">Snapshot ID</p>
+              <p className="font-mono font-bold text-slate-800 mt-0.5 break-all">{uploadResult.snapshot_id}</p>
+            </div>
+            <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
+              <p className="text-slate-500 font-medium">Documents</p>
+              <p className="font-mono font-bold text-slate-800 mt-0.5">{uploadResult.total_documents}</p>
+            </div>
+            <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
+              <p className="text-slate-500 font-medium">Financial Year</p>
+              <p className="font-mono font-bold text-slate-800 mt-0.5">{uploadResult.financial_year}</p>
             </div>
           </div>
+
+          {uploadResult.recomputed_status && (
+            <p className="text-xs text-slate-600 bg-indigo-50 border border-indigo-100 rounded-lg p-3">
+              {uploadResult.recomputed_status}
+            </p>
+          )}
         </div>
       )}
     </div>

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Optional, List, Literal, Dict, Any
 from datetime import date, datetime
 import uuid
@@ -38,8 +38,7 @@ class LineItemOut(LineItemBase):
     org_id: uuid.UUID
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class InvoiceUploadResponse(BaseModel):
     invoice_id: uuid.UUID
@@ -110,8 +109,7 @@ class InvoiceOut(BaseModel):
     line_items: List[LineItemOut] = []
     validation_report: Optional[ValidationReport] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 # GST Working Output Schemas
 GSTR_WORKING_DRAFT_DISCLAIMER = (

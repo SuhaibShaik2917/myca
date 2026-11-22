@@ -27,13 +27,19 @@ def get_tenant_db(
     if not x_org_id:
         raise HTTPException(status_code=400, detail="Missing required X-Org-Id tenant header")
 
+    try:
+        uuid.UUID(x_user_id)
+        uuid.UUID(x_org_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid X-User-Id or X-Org-Id header")
+
     db = SessionLocal()
     try:
         # Server-side verification of active membership before applying GUC
         if not verify_and_resolve_tenant_membership(db, x_user_id, x_org_id):
             raise HTTPException(
                 status_code=403,
-                detail=f"User {x_user_id} does not possess active membership in organization {x_org_id}"
+                detail="User does not possess active membership in the requested organization"
             )
 
         set_tenant_context(db, org_id=x_org_id, user_id=x_user_id)
