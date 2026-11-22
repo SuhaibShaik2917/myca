@@ -34,6 +34,12 @@ interface ProvenanceItem {
   eclMinBalance?: string;
   utilisedAmount?: string;
   interestBasis?: string;
+  reversalStatus?: string;
+  reversalDueDate?: string;
+  filingArn?: string | null;
+  statutoryDeadlineEvidence?: string;
+  annualReturnFilingDate?: string;
+  annualReturnArn?: string;
 }
 
 interface Table4DrillDown {
