@@ -261,7 +261,7 @@ def generate_gstr3b_table4_summary(
                 ri = rev_amt
                 rcs = Decimal("0.00")
 
-            if status == ITCEligibilityEnum.REVIEW_REQUIRED or str(rule).endswith("_FACTS_PENDING"):
+            if status in (ITCEligibilityEnum.REVIEW_REQUIRED, "REVIEW_REQUIRED") or str(rule).endswith("_FACTS_PENDING"):
                 # Items under factual review are potential exposures, not confirmed statutory reversals
                 pass
             elif rule.startswith("SEC_17_5") or rule in ("RULE_38", "RULE_42", "RULE_43") or status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR:
@@ -275,7 +275,7 @@ def generate_gstr3b_table4_summary(
             elif status in (ITCEligibilityEnum.TIME_LIMIT_RISK, ITCEligibilityEnum.REVERSED):
                 comp_4b2_other = _add_component(comp_4b2_other, rc, rs, ri, rcs)
 
-            if rev_amt > Decimal("0.00"):
+            if rev_amt > Decimal("0.00") and status not in (ITCEligibilityEnum.REVIEW_REQUIRED, "REVIEW_REQUIRED") and not str(rule).endswith("_FACTS_PENDING"):
                 reversals_lineage.append({
                     "purchase_doc_id": p_id,
                     "document_number": p_doc.get("document_number", "N/A"),

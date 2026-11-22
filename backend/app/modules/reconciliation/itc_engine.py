@@ -922,7 +922,7 @@ def evaluate_section_17_5_vehicle_and_repair_eligibility(
         # Proviso (ii)(I): Taxable person engaging in the manufacture of such motor vehicles
         has_mfr_claim = bool(facts.get("is_vehicle_manufacturer") or business_profile.get("is_vehicle_manufacturer"))
         has_mfr_license = bool(facts.get("manufacturing_license") or facts.get("is_manufacturer_license_verified") or facts.get("is_verified_vehicle_manufacturer"))
-        relates_to_mfg = facts.get("relates_to_manufactured_vehicles", True)
+        relates_to_mfg = bool(facts.get("relates_to_manufactured_vehicles") or facts.get("is_nexus_to_manufactured_vehicles_verified") or facts.get("relates_to_manufacture"))
         if has_mfr_claim or has_mfr_license:
             if has_mfr_claim and has_mfr_license and relates_to_mfg:
                 return {
@@ -952,8 +952,8 @@ def evaluate_section_17_5_vehicle_and_repair_eligibility(
         # Proviso (ii)(II): Supply of general insurance services in respect of motor vehicles insured by him
         has_ins_claim = bool(facts.get("is_general_insurer") or business_profile.get("is_general_insurer"))
         has_ins_license = bool(facts.get("general_insurance_license") or facts.get("is_general_insurer_license_verified") or facts.get("is_verified_general_insurer"))
-        vehicle_insured_by_taxpayer = bool(facts.get("is_vehicle_insured_by_taxpayer") or facts.get("insurance_policy_verified") or facts.get("policy_number"))
-        if has_ins_claim or has_ins_license or vehicle_insured_by_taxpayer:
+        vehicle_insured_by_taxpayer = bool(facts.get("is_vehicle_insured_by_taxpayer") or facts.get("insurance_policy_verified"))
+        if has_ins_claim or has_ins_license:
             if has_ins_claim and has_ins_license and vehicle_insured_by_taxpayer:
                 return {
                     "applies": True,
@@ -1428,7 +1428,7 @@ class StatutoryITCRiskEngine:
                         break
                     elif veh_res.get("is_blocked") is False:
                         # Statutorily exempt from block (e.g. seating capacity > 13 or goods transport vehicle)
-                        break
+                        continue
 
             # Food & Beverages 17(5)(b) - HSN 9963
             elif hsn.startswith("9963") or "catering" in item_desc or "food" in item_desc:

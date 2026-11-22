@@ -375,6 +375,36 @@ def test_section_17_5_ab_vehicle_repair_lineage():
     assert res_mfr_unverified_context["is_blocked"] is None
     assert res_mfr_unverified_context["status"] == "REVIEW_REQUIRED_FACTS_PENDING"
 
+    # 5d. Manufacturer negative: nexus missing or unverified
+    res_mfr_unverified_nexus = evaluate_section_17_5_vehicle_and_repair_eligibility(
+        category_or_desc="General Vehicle Repair",
+        hsn_sac="998729",
+        facts={
+            "is_vehicle_manufacturer": True,
+            "manufacturing_license": True,
+            "relates_to_manufactured_vehicles": False,
+            "is_factual_context_verified": True
+        }
+    )
+    assert res_mfr_unverified_nexus["is_blocked"] is None
+    assert res_mfr_unverified_nexus["status"] == "REVIEW_REQUIRED_FACTS_PENDING"
+    assert "Services do not relate to vehicles manufactured by the taxpayer" in res_mfr_unverified_nexus["statutory_citation"]
+
+    # 5e. Manufacturer negative: nexus omitted entirely from facts
+    res_mfr_omitted_nexus = evaluate_section_17_5_vehicle_and_repair_eligibility(
+        category_or_desc="Factory Vehicle Repair",
+        hsn_sac="998729",
+        facts={
+            "is_vehicle_manufacturer": True,
+            "manufacturing_license": True,
+            "is_factual_context_verified": True
+            # relates_to_manufactured_vehicles omitted
+        }
+    )
+    assert res_mfr_omitted_nexus["is_blocked"] is None
+    assert res_mfr_omitted_nexus["status"] == "REVIEW_REQUIRED_FACTS_PENDING"
+    assert "Services do not relate to vehicles manufactured by the taxpayer" in res_mfr_omitted_nexus["statutory_citation"]
+
     # 6. Section 17(5)(ab) Proviso (ii)(II): General insurer receiving repairs - positive (verified + insured)
     res_ins = evaluate_section_17_5_vehicle_and_repair_eligibility(
         category_or_desc="Accident Claim Settlement Repair",
@@ -432,6 +462,21 @@ def test_section_17_5_ab_vehicle_repair_lineage():
     )
     assert res_ins_unverified["is_blocked"] is None
     assert res_ins_unverified["status"] == "REVIEW_REQUIRED_FACTS_PENDING"
+
+    # 6e. Commercial business negative: having car repaired with insurance policy attached
+    # Must NOT be falsely routed to missing IRDAI license; must evaluate seating capacity
+    res_commercial_with_policy = evaluate_section_17_5_vehicle_and_repair_eligibility(
+        category_or_desc="Executive Car Repair",
+        hsn_sac="998729",
+        facts={
+            "is_factual_context_verified": True,
+            "policy_number": "POL-COMM-9988",
+            "seating_capacity": 5
+        }
+    )
+    assert res_commercial_with_policy["is_blocked"] is True
+    assert res_commercial_with_policy["status"] == "BLOCKED_CREDIT_CONFIRMED"
+    assert "NOT MORE THAN 13 persons" in res_commercial_with_policy["statutory_citation"]
 
 
 # ============================================================================
@@ -517,3 +562,72 @@ def test_review_required_preservation_in_itc_engine_and_gstr3b():
 
     # Net ITC in Table 4(C) retains the full amount until CA confirms block
     assert t4.net_itc_available == Decimal("28000.00")
+
+
+def test_multi_line_invoice_exception_and_blocked_catering():
+    """
+    Edge Case: Multi-line purchase document containing:
+    - Line 1: Vehicle repair qualifying for Section 17(5)(ab) manufacturer exception (is_blocked = False).
+    - Line 2: Food & catering service (HSN 9963) blocked under Section 17(5)(b).
+    Verifies that an exempt first line does NOT terminate line item evaluation,
+    and subsequent ineligible lines are properly assessed and blocked.
+    """
+    from datetime import date
+    from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
+
+    engine = StatutoryITCRiskEngine()
+    today = date(2026, 11, 23)
+
+    p_doc = {
+        "id": "p_multi_line_1",
+        "document_number": "INV-MULTI-001",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2500.00"),
+        "sgst_amount": Decimal("2500.00"),
+        "igst_amount": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "total_invoice_value": Decimal("30000.00"),
+        "goods_receipt_date": "2026-11-02",
+        "goods_receipt_note_ref": "GRN-MULTI",
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331"
+            }
+        ]
+    }
+
+    g_doc = {
+        "id": "g_multi_1",
+        "section_name": "B2B",
+        "itc_availability": "available",
+        "central_tax": Decimal("2500.00"),
+        "state_ut_tax": Decimal("2500.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "document_number": "INV-MULTI-001",
+        "document_date": "2026-11-01"
+    }
+
+    evals = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc,
+        gstr2b_doc=g_doc,
+        evaluation_date=today
+    )
+
+    rule_codes = [e.rule_code for e in evals]
+    assert "SEC_17_5_FOOD" in rule_codes, (
+        f"Expected SEC_17_5_FOOD to be assessed for catering line item, got {rule_codes}"
+    )
+    food_eval = next(e for e in evals if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval.risk_reversal_amount == Decimal("5000.00")

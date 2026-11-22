@@ -22,7 +22,7 @@ platform win32 -- Python 3.14.4, pytest-9.1.1, pluggy-1.6.0
 rootdir: C:\Users\notyo\.gemini\antigravity\scratch\myca\backend
 plugins: anyio-4.13.0, asyncio-1.4.0
 asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
-collected 258 items
+collected 259 items
 
 tests\test_ai_assistant.py ...                                           [  1%]
 tests\test_auth_token.py .......                                         [  3%]
@@ -35,35 +35,35 @@ tests\test_milestone2_2_itc_ledger.py .....                              [ 34%]
 tests\test_milestone2_3_itc_reconciliation.py .....                      [ 36%]
 tests\test_milestone2_4_source_reconciliation.py ....                    [ 37%]
 tests\test_milestone2_5_tax_heads_and_receipt_gate.py ....               [ 39%]
-tests\test_milestone2_6_receipt_gate_and_reversal.py .........           [ 43%]
+tests\test_milestone2_6_receipt_gate_and_reversal.py .........           [ 42%]
 tests\test_milestone2_7_1_statutory_integrity.py .........               [ 46%]
 tests\test_milestone2_7_2_10_consolidated_defect_remediation.py ........ [ 49%]
 .....                                                                    [ 51%]
 tests\test_milestone2_7_2_11_audit_corrections_and_evidence_validation.py . [ 51%]
 .......                                                                  [ 54%]
-tests\test_milestone2_7_2_12_filing_eligibility_and_statutory_audit.py . [ 55%]
+tests\test_milestone2_7_2_12_filing_eligibility_and_statutory_audit.py . [ 54%]
 .......                                                                  [ 57%]
-tests\test_milestone2_7_2_13_period_chronology_and_reversal_lineage.py . [ 58%]
-.....                                                                    [ 60%]
+tests\test_milestone2_7_2_13_period_chronology_and_reversal_lineage.py . [ 57%]
+.....                                                                    [ 59%]
 tests\test_milestone2_7_2_14_rule37_37a_separation.py ...............    [ 65%]
 tests\test_milestone2_7_2_financial_reconciliation_closure.py .......... [ 69%]
-..........................................                               [ 86%]
+..........................................                               [ 85%]
 tests\test_milestone2_7_inward_accounting_workflow.py ......             [ 88%]
-tests\test_milestone2_reconciliation.py ..........                       [ 92%]
-tests\test_milestone3_gstr3b_offset_and_filing.py .....                  [ 94%]
-tests\test_milestone4_credit_builder.py .....                            [ 96%]
-tests\test_milestone5_scheme_navigator.py .....                          [ 98%]
-tests\test_statutory_section_17_5_boundaries_and_reference_grants.py ... [ 99%]
-..                                                                       [100%]
+tests\test_milestone2_reconciliation.py ..........                       [ 91%]
+tests\test_milestone3_gstr3b_offset_and_filing.py .....                  [ 93%]
+tests\test_milestone4_credit_builder.py .....                            [ 95%]
+tests\test_milestone5_scheme_navigator.py .....                          [ 97%]
+tests\test_statutory_section_17_5_boundaries_and_reference_grants.py ... [ 98%]
+...                                                                      [100%]
 
-============================ 258 passed in 33.09s =============================
+============================ 259 passed in 31.66s =============================
 ```
 
-- **Total Test Items:** 258
-- **Passed:** 258
+- **Total Test Items:** 259
+- **Passed:** 259
 - **Failed:** 0
 - **Errors:** 0
-- **Duration:** 33.09 seconds
+- **Duration:** 31.66 seconds
 - **Pass Rate:** 100.0%
 
 ---
@@ -94,11 +94,13 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
      - Verified manufacturing license + confirmed vehicle nexus &rarr; `ELIGIBLE_STATUTORY_EXCEPTION`.
      - Manufacturer claimed but license unverified &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
      - Factual context unverified &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
+     - Vehicle nexus missing/omitted &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
    - **Proviso (ii)(II) Insurer Negative Tests:**
      - Verified IRDAI license + vehicle insured by taxpayer &rarr; `ELIGIBLE_STATUTORY_EXCEPTION`.
      - Vehicle NOT insured by taxpayer (missing policy evidence) &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
      - Insurer license unverified &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
      - Factual context unverified &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
+     - Commercial business repairing company car with policy attached &rarr; strictly evaluates seating capacity (5 seats &le; 13 blocked under Section 17(5)(a)/(ab)), avoiding false insurer exception routing.
 5. `test_review_required_preservation_in_itc_engine_and_gstr3b`:
    - Evaluates vehicle invoice with unverified facts (`is_factual_context_verified: False`).
    - Asserts engine produces `eligibility_status = ITCEligibilityEnum.REVIEW_REQUIRED`.
@@ -108,6 +110,9 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
      - Asserts `ineligible_sec_17_5_blocked = Decimal("0.00")`.
      - Asserts `total_itc_reversed = Decimal("0.00")`.
      - Asserts `net_itc_available = Decimal("28000.00")` (preserved for CA adjudication).
+6. `test_multi_line_invoice_exception_and_blocked_catering`:
+   - Evaluates multi-line invoice containing exempt vehicle repair (Line 1) and corporate catering (Line 2).
+   - Proves exempt Line 1 continues iteration, allowing Line 2 to be assessed and blocked under `SEC_17_5_FOOD` (reversal = ₹5,000.00).
 
 ---
 

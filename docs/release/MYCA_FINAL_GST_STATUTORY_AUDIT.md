@@ -83,6 +83,12 @@ Section 17(5)(ab) blocks:
    - When RC context is verified but approved seating capacity is omitted (`seating_capacity: None`), the engine does NOT default to a confirmed block; it routes to **`REVIEW_REQUIRED_FACTS_PENDING`** pending RC seating verification.
    - Invoices with empty or missing facts dictionaries route to **`REVIEW_REQUIRED_FACTS_PENDING`**.
 
+8. **Commercial Entity Company Car Policy Differentiation:**
+   - Regular commercial taxpayers submitting vehicle repair invoices with insurance policy details are strictly differentiated from general insurers. They are not trapped in missing IRDAI license queries; their vehicles are evaluated on seating capacity (&le; 13 seats confirmed blocked).
+
+9. **Multi-Line Invoice Iteration Integrity:**
+   - Multi-line purchase documents containing mixed items (e.g., an exempt vehicle repair line alongside catering or personal consumption goods) continue evaluation across all line items rather than prematurely terminating on an exempt line, ensuring that ineligible items under Section 17(5)(b)/(c)/(g) are rigorously assessed and blocked.
+
 ---
 
 ## 3. RULE 37 VS RULE 37A SEPARATION SUMMARY

@@ -11,6 +11,10 @@ Audits:
 6. Unauthenticated / Null-tenant Context Isolation
 7. API Layer Authentication & Spoofed Header Rejection
 """
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import uuid
 import random
 import string

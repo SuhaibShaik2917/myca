@@ -20,7 +20,7 @@ VERDICT: B. 100% PRODUCT SCOPE COMPLETE — EXTERNAL RELEASE BLOCKERS REMAIN
 ### Detailed Justification & Re-Evaluation
 1. **100% Software Scope Complete & Verified:**
    - All modules across **Milestones 1, 2, 3, 4, and 5** as defined in the canonical MyCA PRD and System Architecture are completely implemented, integrated, and verified.
-   - The entire backend test suite (**258/258 tests**) executes cleanly with **100% pass rate** in 33.09s without deprecation warnings, PAN collisions, or email collisions.
+   - The entire backend test suite (**259/259 tests**) executes cleanly with **100% pass rate** in 31.66s without deprecation warnings, PAN collisions, or email collisions.
    - **Least-Privilege Database Grants Verified:** `app_service_user` has strictly `SELECT` permissions on reference catalogues (`government_schemes`, `scheme_eligibility_rules`). Database-level regression tests prove that `INSERT`, `UPDATE`, and `DELETE` attempts by `app_service_user` are denied with `InsufficientPrivilege` / `ProgrammingError` on both tables.
    - **Explicit Role Verification:** Database connections are explicitly asserted to run under `current_user = 'app_service_user'` with `rolsuper=False` and `rolbypassrls=False`.
    - **100% Forced Row Level Security Verified:** All 36 tenant-scoped tables in PostgreSQL 16 have both `relrowsecurity = True` and `relforcerowsecurity = True`.
@@ -53,7 +53,7 @@ VERDICT: B. 100% PRODUCT SCOPE COMPLETE — EXTERNAL RELEASE BLOCKERS REMAIN
 
 | Dimension | Baseline | Final Audit Result | Status |
 | :--- | :--- | :--- | :--- |
-| **Backend Test Suite** | 257 tests (Phase 2) | **258 / 258 Passed** (0 failures, 0 errors in 33.09s) | **VERIFIED** |
+| **Backend Test Suite** | 258 tests (Phase 3 Baseline) | **259 / 259 Passed** (0 failures, 0 errors in 31.66s) | **VERIFIED** |
 | **Database Migrations** | 21 migrations | **21 migrations applied** (Head: `0021_enforce_tenant_force_rls`) | **VERIFIED** |
 | **Migration Rollback Baseline** | State drift risk | **100% exact match against 0019 baseline (79 grants, 88 policies)** | **VERIFIED** |
 | **Least-Privilege Grants** | Extra write grants on catalogues | **SELECT-only on reference catalogues; INSERT/UPDATE/DELETE rejected on both** | **VERIFIED** |
