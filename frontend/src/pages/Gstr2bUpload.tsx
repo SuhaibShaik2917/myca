@@ -34,13 +34,13 @@ interface Gstr2bRecomputeResponse {
 }
 
 const env = (import.meta as any).env ?? {};
-const API_BASE_URL: string = env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const API_BASE_URL: string = (env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
 export const Gstr2bUpload: React.FC<Gstr2bUploadProps> = ({ onUploadSuccess }) => {
   const [returnPeriod, setReturnPeriod] = useState("2026-11");
   const [registrationGstin, setRegistrationGstin] = useState("27AABCB1234M1ZT");
   const [registrationId, setRegistrationId] = useState<string>(
-    env.VITE_REGISTRATION_ID ?? "00000000-0000-0000-0000-000000000001"
+    env.VITE_REGISTRATION_ID ?? ""
   );
   const [userId, setUserId] = useState<string>(env.VITE_USER_ID ?? "");
   const [orgId, setOrgId] = useState<string>(env.VITE_ORG_ID ?? "");
