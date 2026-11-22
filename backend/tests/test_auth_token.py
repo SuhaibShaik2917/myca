@@ -27,19 +27,29 @@ def test_invalid_tokens_are_rejected(token):
         decode_access_token(token)
 
 
-def test_bearer_token_identity_overrides_spoofed_headers():
+def test_bearer_token_identity_overrides_spoofed_headers(monkeypatch):
+    captured = {}
+    def mock_verify(db, user_id, org_id):
+        captured["user_id"] = user_id
+        captured["org_id"] = org_id
+        return True
+
+    monkeypatch.setattr(dependencies, "verify_and_resolve_tenant_membership", mock_verify)
+    monkeypatch.setattr(dependencies, "set_tenant_context", lambda db, org_id, user_id: None)
+
     token = create_access_token(subject=USER_ID, org_id=ORG_ID)
+    spoofed_user = str(uuid.uuid4())
+    spoofed_org = str(uuid.uuid4())
     generator = dependencies.get_tenant_db(
         authorization=f"Bearer {token}",
-        x_user_id=str(uuid.uuid4()),
-        x_org_id=str(uuid.uuid4()),
+        x_user_id=spoofed_user,
+        x_org_id=spoofed_org,
     )
-    # Advance past claim parsing: it only reaches the database lookup with the
-    # token's own identity, so a database connection error proves the override
-    # happened before any tenant context was established.
-    with pytest.raises(Exception) as excinfo:
-        next(generator)
-    assert not isinstance(excinfo.value, HTTPException)
+    next(generator)
+    assert captured["user_id"] == USER_ID
+    assert captured["org_id"] == ORG_ID
+    assert captured["user_id"] != spoofed_user
+    assert captured["org_id"] != spoofed_org
 
 
 def test_invalid_bearer_token_returns_401():
