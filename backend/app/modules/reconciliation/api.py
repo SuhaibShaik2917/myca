@@ -1900,45 +1900,6 @@ def record_itc_ledger_event(
     )
 
 
-@router.get("/itc-ledger/{purchase_doc_id}", response_model=List[ITCLedgerEntryOut])
-def get_purchase_doc_itc_history(
-    purchase_doc_id: str,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
-    db: Session = Depends(get_tenant_db)
-):
-    """
-    Returns full chronological ITC lifecycle audit events for a purchase document.
-    """
-    rows = db.execute(
-        text("""
-        SELECT * FROM public.itc_ledger_entries
-        WHERE purchase_doc_id = :pid AND org_id = :org
-        ORDER BY created_at ASC;
-        """),
-        {"pid": purchase_doc_id, "org": x_org_id}
-    ).fetchall()
-    return [
-        ITCLedgerEntryOut(
-            id=str(r.id),
-            purchase_doc_id=str(r.purchase_doc_id),
-            gstr2b_doc_id=str(r.gstr2b_doc_id) if r.gstr2b_doc_id else None,
-            event_type=r.event_type,
-            tax_period=r.tax_period,
-            cgst_amount=Decimal(str(r.cgst_amount or 0)),
-            sgst_amount=Decimal(str(r.sgst_amount or 0)),
-            igst_amount=Decimal(str(r.igst_amount or 0)),
-            cess_amount=Decimal(str(r.cess_amount or 0)),
-            total_tax=Decimal(str(r.total_tax or 0)),
-            reversal_event_id=str(r.reversal_event_id) if r.reversal_event_id else None,
-            interest_amount=Decimal(str(r.interest_amount or 0)),
-            interest_basis=r.interest_basis,
-            provenance=r.provenance or {},
-            created_at=r.created_at.isoformat()
-        )
-        for r in rows
-    ]
-
-
 @router.get("/itc-ledger/summary", response_model=ITCLedgerSummaryOut)
 def get_itc_ledger_summary(
     registration_id: Optional[str] = None,
@@ -2037,6 +1998,45 @@ def get_itc_ledger_summary(
         total_interest_assessed=tot_interest,
         entries_count=total_entries
     )
+
+
+@router.get("/itc-ledger/{purchase_doc_id}", response_model=List[ITCLedgerEntryOut])
+def get_purchase_doc_itc_history(
+    purchase_doc_id: str,
+    x_org_id: str = Header(..., alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """
+    Returns full chronological ITC lifecycle audit events for a purchase document.
+    """
+    rows = db.execute(
+        text("""
+        SELECT * FROM public.itc_ledger_entries
+        WHERE purchase_doc_id = :pid AND org_id = :org
+        ORDER BY created_at ASC;
+        """),
+        {"pid": purchase_doc_id, "org": x_org_id}
+    ).fetchall()
+    return [
+        ITCLedgerEntryOut(
+            id=str(r.id),
+            purchase_doc_id=str(r.purchase_doc_id),
+            gstr2b_doc_id=str(r.gstr2b_doc_id) if r.gstr2b_doc_id else None,
+            event_type=r.event_type,
+            tax_period=r.tax_period,
+            cgst_amount=Decimal(str(r.cgst_amount or 0)),
+            sgst_amount=Decimal(str(r.sgst_amount or 0)),
+            igst_amount=Decimal(str(r.igst_amount or 0)),
+            cess_amount=Decimal(str(r.cess_amount or 0)),
+            total_tax=Decimal(str(r.total_tax or 0)),
+            reversal_event_id=str(r.reversal_event_id) if r.reversal_event_id else None,
+            interest_amount=Decimal(str(r.interest_amount or 0)),
+            interest_basis=r.interest_basis,
+            provenance=r.provenance or {},
+            created_at=r.created_at.isoformat()
+        )
+        for r in rows
+    ]
 
 
 @router.get("/ims/history/{ims_action_id}", response_model=List[IMSActionHistoryOut])

@@ -1912,8 +1912,8 @@ def test_populated_data_downgrade_quarantine(test_tenants):
 
     # Execute Alembic downgrade specifically to 0009 (testing 0010 rollback quarantine)
     p_down = subprocess.run(
-        ["/opt/myca-venv/bin/alembic", "downgrade", "0009_line_item_isolation"],
-        cwd="/mnt/c/Users/notyo/.gemini/antigravity/scratch/myca/backend",
+        [sys.executable, "-m", "alembic", "downgrade", "0009_line_item_isolation"],
+        cwd=Path(__file__).resolve().parents[1],
         capture_output=True, text=True
     )
     assert p_down.returncode == 0, f"Downgrade failed: {p_down.stderr}"
@@ -1933,8 +1933,8 @@ def test_populated_data_downgrade_quarantine(test_tenants):
 
     # Execute Alembic upgrade back to head (0010)
     p_up = subprocess.run(
-        ["/opt/myca-venv/bin/alembic", "upgrade", "head"],
-        cwd="/mnt/c/Users/notyo/.gemini/antigravity/scratch/myca/backend",
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=Path(__file__).resolve().parents[1],
         capture_output=True, text=True
     )
     assert p_up.returncode == 0, f"Re-upgrade failed: {p_up.stderr}"
@@ -1959,8 +1959,8 @@ def test_gemini_smoke_script_cli_modes():
 
     # 1. Fallback mode
     p_fallback = subprocess.run(
-        ["/opt/myca-venv/bin/python3", "backend/scripts/gemini_live_smoke_test.py", "--test-fallback"],
-        cwd="/mnt/c/Users/notyo/.gemini/antigravity/scratch/myca",
+        [sys.executable, "backend/scripts/gemini_live_smoke_test.py", "--test-fallback"],
+        cwd=Path(__file__).resolve().parents[2],
         capture_output=True, text=True
     )
     assert p_fallback.returncode == 0
@@ -1970,8 +1970,8 @@ def test_gemini_smoke_script_cli_modes():
     env_without_key = os.environ.copy()
     env_without_key.pop("GEMINI_API_KEY", None)
     p_live_req = subprocess.run(
-        ["/opt/myca-venv/bin/python3", "backend/scripts/gemini_live_smoke_test.py", "--require-live"],
-        cwd="/mnt/c/Users/notyo/.gemini/antigravity/scratch/myca",
+        [sys.executable, "backend/scripts/gemini_live_smoke_test.py", "--require-live"],
+        cwd=Path(__file__).resolve().parents[2],
         capture_output=True, text=True, env=env_without_key
     )
     assert p_live_req.returncode == 2
