@@ -95,5 +95,23 @@ async def main():
         headers=auth_headers, count=50, concurrency=10
     )
 
+    # 5. Scheme Navigator Catalog
+    await benchmark_endpoint(
+        "Scheme Navigator Catalog", "GET", f"{BASE_URL}/api/v1/scheme-navigator/schemes",
+        headers=auth_headers, count=50, concurrency=10
+    )
+
+    # 6. Credit Builder Summary
+    await benchmark_endpoint(
+        "Credit Builder Summary", "GET", f"{BASE_URL}/api/v1/credit-builder/summary",
+        headers=auth_headers, count=50, concurrency=10
+    )
+
+    # 7. AI Advisor Quick Insights
+    await benchmark_endpoint(
+        "AI Quick Insights", "GET", f"{BASE_URL}/api/v1/ai/quick-insights",
+        headers=auth_headers, count=50, concurrency=10
+    )
+
 if __name__ == "__main__":
     asyncio.run(main())

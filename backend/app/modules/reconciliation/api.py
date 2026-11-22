@@ -133,10 +133,11 @@ def create_gst_registration(
 
 @router.get("/gst-registrations", response_model=List[GSTRegistrationOut])
 def list_gst_registrations(
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """Lists all GST registrations belonging to this organization."""
+    effective_org = x_org_id or db.info.get("current_org")
     rows = db.execute(
         text("""
         SELECT id, org_id, gstin, state_code, trade_name, legal_name,
@@ -145,7 +146,7 @@ def list_gst_registrations(
         WHERE org_id = :org
         ORDER BY is_primary DESC, created_at ASC;
         """),
-        {"org": x_org_id}
+        {"org": effective_org}
     ).fetchall()
 
     return [
@@ -815,10 +816,16 @@ def list_purchase_documents(
     registration_id: str,
     financial_period: Optional[str] = None,
     status: Optional[str] = None,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """Lists purchase register documents."""
+    try:
+        uuid.UUID(str(registration_id))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid registration_id format: must be a valid UUID")
+
+    effective_org = x_org_id or db.info.get("current_org")
     query = """
     SELECT id, registration_id, document_type, document_number, document_date,
            financial_period, supplier_gstin, supplier_legal_name, recipient_gstin,
@@ -828,7 +835,7 @@ def list_purchase_documents(
     FROM public.purchase_documents
     WHERE org_id = :org AND registration_id = :reg_id
     """
-    params = {"org": x_org_id, "reg_id": registration_id}
+    params = {"org": effective_org, "reg_id": registration_id}
     if financial_period:
         query += " AND financial_period = :fp"
         params["fp"] = financial_period
@@ -1904,12 +1911,13 @@ def record_itc_ledger_event(
 def get_itc_ledger_summary(
     registration_id: Optional[str] = None,
     tax_period: Optional[str] = None,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Returns component-level ledger summary: total availed, reversed permanent, reversed temporary, reavailed, and net balance.
     """
+    effective_org = x_org_id or db.info.get("current_org")
     query = """
     SELECT e.event_type,
            SUM(e.cgst_amount) as cgst,
@@ -1923,7 +1931,7 @@ def get_itc_ledger_summary(
     JOIN public.purchase_documents p ON e.purchase_doc_id = p.id AND e.org_id = p.org_id
     WHERE e.org_id = :org
     """
-    params = {"org": x_org_id}
+    params = {"org": effective_org}
     if registration_id:
         query += " AND p.registration_id = :reg_id"
         params["reg_id"] = registration_id

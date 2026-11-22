@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: myca_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-myca}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d myca"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - myca_net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: myca_backend
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://app_service_user:app_secure_password_2026@db:5432/myca
+      MIGRATION_DATABASE_URL: postgresql://postgres:postgres@db:5432/myca
+      SECRET_KEY: ${SECRET_KEY:-prod_ultra_secure_jwt_secret_key_2026_myca}
+      ENVIRONMENT: production
+      CORS_ORIGINS: '["http://localhost", "http://localhost:80", "http://localhost:5173", "http://127.0.0.1"]'
+      GSP_SANDBOX_MODE: "true"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - myca_net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: myca_frontend
+    restart: always
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "80:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - myca_net
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  myca_net:
+    driver: bridge

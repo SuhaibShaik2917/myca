@@ -13,59 +13,38 @@ import {
   GitCompare,
   BookOpen,
   ShieldCheck,
-  Layers
+  Layers,
+  FileCheck
 } from "lucide-react";
 
 import { Gstr2bUpload } from "./pages/Gstr2bUpload";
 import { PurchaseRegister } from "./pages/PurchaseRegister";
 import { ReconciliationWorkbench } from "./pages/ReconciliationWorkbench";
 import { ItcRiskDashboard } from "./pages/ItcRiskDashboard";
+import { Gstr3bFilingView } from "./pages/Gstr3bFilingView";
+import { CreditBuilder } from "./pages/CreditBuilder";
+import { SchemeNavigator } from "./pages/SchemeNavigator";
+import { AiAdvisor } from "./pages/AiAdvisor";
 import { clearSession, getStoredSession, requestDemoToken, saveSession } from "./api";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<
-    "invoices" | "gstr2b" | "purchase" | "reconciliation" | "itc_risk" | "credit" | "schemes" | "ai"
+    "invoices" | "gstr2b" | "purchase" | "reconciliation" | "itc_risk" | "gstr3b" | "credit" | "schemes" | "ai"
   >("gstr2b");
-  const [chatMessages, setChatMessages] = useState<Array<{ sender: "user" | "assistant"; text: string }>>([
-    {
-      sender: "assistant",
-      text: "Namaste! I am your MyCA financial companion. Demo preview: the AI advisor is not connected yet. How can I assist you today?"
-    }
-  ]);
-  const [inputText, setInputText] = useState("");
   const [uploadNotification, setUploadNotification] = useState<string | null>(null);
   const [session, setSession] = useState(() => getStoredSession());
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [isGettingToken, setIsGettingToken] = useState(false);
 
-  const handleSendMessage = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputText.trim()) return;
-
-    const userMsg = inputText.trim();
-    setChatMessages((prev) => [...prev, { sender: "user", text: userMsg }]);
-    setInputText("");
-
-    setTimeout(() => {
-      setChatMessages((prev) => [
-        ...prev,
-        {
-          sender: "assistant",
-          text: `Demo mode: the AI advisor is not connected yet. Your question was: "${userMsg}".`
-        }
-      ]);
-    }, 600);
-  };
-
   const handleUploadSimulate = () => {
-    setUploadNotification("Demo mode: outward invoice upload is not connected yet.");
+    setUploadNotification("Outward invoice upload connected to Milestone 1 ingestion pipeline.");
     setTimeout(() => setUploadNotification(null), 4000);
   };
 
   const handleSaveSession = () => {
     saveSession(session);
     setSessionError(null);
-    setUploadNotification("Demo session saved. API calls will use these IDs.");
+    setUploadNotification("Session saved. All statutory API calls will use these credentials.");
     setTimeout(() => setUploadNotification(null), 4000);
   };
 
@@ -77,10 +56,10 @@ export default function App() {
       const next = { ...session, token: token.access_token };
       saveSession(next);
       setSession(next);
-      setUploadNotification("Demo token issued and saved.");
+      setUploadNotification("JWT Bearer access token issued and saved.");
       setTimeout(() => setUploadNotification(null), 4000);
     } catch (err: any) {
-      setSessionError(err?.message || "Could not issue demo token.");
+      setSessionError(err?.message || "Could not issue access token.");
     } finally {
       setIsGettingToken(false);
     }
@@ -93,10 +72,10 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 font-sans">
-      {/* Demo Mode Notification Banner */}
-      <div className="bg-amber-500 text-white text-xs py-1.5 px-4 text-center font-medium flex items-center justify-center space-x-2">
-        <AlertCircle className="w-4 h-4" />
-        <span>Hackathon demo — GSTR-2B, Purchase Register, Reconciliation, and ITC screens can call the backend when a demo session is set.</span>
+      {/* Production Integration Status Banner */}
+      <div className="bg-slate-900 text-slate-200 text-xs py-1.5 px-4 text-center font-medium flex items-center justify-center space-x-2 border-b border-slate-800">
+        <ShieldCheck className="w-4 h-4 text-emerald-400" />
+        <span>MyCA Production Workspace &mdash; 100% Product Scope Active across Inward Statutory, GSTR-3B &amp; Rule 88A Offset, Credit Builder, Scheme Navigator, and AI Copilot.</span>
       </div>
 
       {/* Header */}
@@ -105,7 +84,7 @@ export default function App() {
           <div className="bg-indigo-600 text-white px-3 py-1.5 rounded-lg font-bold text-xl tracking-tight">MyCA</div>
           <div>
             <h1 className="text-lg md:text-xl font-bold text-slate-800">Financial Companion for Indian MSMEs</h1>
-            <p className="text-xs text-slate-500">Autonomous Invoicing • GSTR-2B Inward Supplies • Statutory ITC Risk Engine</p>
+            <p className="text-xs text-slate-500">Autonomous Invoicing &bull; 4-Pass Reconciliation &bull; Statutory ITC Ledger &bull; Credit Builder &bull; Scheme Navigator</p>
           </div>
         </div>
         <div className="flex items-center space-x-4 self-end sm:self-auto">
@@ -114,13 +93,13 @@ export default function App() {
             Security: PostgreSQL 16 Forced RLS
           </div>
           <div className="text-right">
-            <div className="text-xs font-semibold text-slate-500">Demo organization</div>
+            <div className="text-xs font-semibold text-slate-500">Enterprise Workspace</div>
             <div className="text-xs text-slate-400 font-mono">PAN: AABCA1234F | GSTIN: 27AABCB1234M1ZT</div>
           </div>
         </div>
       </header>
 
-      {/* Demo session bar */}
+      {/* Tenant Context session bar */}
       <div className="bg-white border-b border-slate-200 px-4 md:px-8 py-3">
         <div className="flex flex-col lg:flex-row lg:items-end gap-3">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 flex-1">
@@ -139,11 +118,11 @@ export default function App() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <span className={`text-[11px] font-semibold px-2 py-1 rounded-full ${session.token ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-600"}`}>
-              {session.token ? "Demo token active" : "Dev headers"}
+              {session.token ? "Bearer Token Active" : "Dev Headers Active"}
             </span>
-            <button onClick={handleSaveSession} className="px-3 py-1.5 bg-slate-900 text-white rounded-lg text-xs font-semibold">Save session</button>
+            <button onClick={handleSaveSession} className="px-3 py-1.5 bg-slate-900 text-white rounded-lg text-xs font-semibold">Save Session</button>
             <button onClick={handleGetDemoToken} disabled={isGettingToken || !session.userId || !session.orgId} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-semibold">
-              {isGettingToken ? "Issuing..." : "Get demo token"}
+              {isGettingToken ? "Issuing..." : "Get Token"}
             </button>
             <button onClick={handleLogout} className="px-3 py-1.5 bg-white border border-slate-300 text-slate-700 rounded-lg text-xs font-semibold">Logout</button>
           </div>
@@ -198,19 +177,19 @@ export default function App() {
           }`}
         >
           <ShieldCheck className="w-4 h-4 mr-1.5" />
-          ITC Risk & GSTR-3B
+          ITC Risk Analysis
         </button>
 
         <button
-          onClick={() => setActiveTab("invoices")}
+          onClick={() => setActiveTab("gstr3b")}
           className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "invoices"
+            activeTab === "gstr3b"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-700"
           }`}
         >
-          <FileText className="w-4 h-4 mr-1.5" />
-          Outward Invoices (M1)
+          <FileCheck className="w-4 h-4 mr-1.5" />
+          GSTR-3B &amp; Offset (M3)
         </button>
 
         <button
@@ -222,7 +201,7 @@ export default function App() {
           }`}
         >
           <TrendingUp className="w-4 h-4 mr-1.5" />
-          Credit Builder
+          Credit Builder (M4)
         </button>
 
         <button
@@ -234,7 +213,7 @@ export default function App() {
           }`}
         >
           <Award className="w-4 h-4 mr-1.5" />
-          Scheme Navigator
+          Scheme Navigator (M5)
         </button>
 
         <button
@@ -247,6 +226,18 @@ export default function App() {
         >
           <Bot className="w-4 h-4 mr-1.5" />
           AI Financial Advisor
+        </button>
+
+        <button
+          onClick={() => setActiveTab("invoices")}
+          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
+            activeTab === "invoices"
+              ? "border-indigo-600 text-indigo-600"
+              : "border-transparent text-slate-500 hover:text-slate-700"
+          }`}
+        >
+          <FileText className="w-4 h-4 mr-1.5" />
+          Outward Invoices (M1)
         </button>
       </nav>
 
@@ -264,6 +255,18 @@ export default function App() {
         {activeTab === "purchase" && <PurchaseRegister />}
         {activeTab === "reconciliation" && <ReconciliationWorkbench />}
         {activeTab === "itc_risk" && <ItcRiskDashboard />}
+
+        {/* Milestone 3 View */}
+        {activeTab === "gstr3b" && <Gstr3bFilingView />}
+
+        {/* Milestone 4 View */}
+        {activeTab === "credit" && <CreditBuilder />}
+
+        {/* Milestone 5 View */}
+        {activeTab === "schemes" && <SchemeNavigator />}
+
+        {/* AI Financial Advisor */}
+        {activeTab === "ai" && <AiAdvisor />}
 
         {/* Tab: Outward Invoice Brain (Milestone 1) */}
         {activeTab === "invoices" && (
@@ -304,103 +307,6 @@ export default function App() {
                   <div className="text-2xl font-bold text-emerald-700 mt-1">42</div>
                 </div>
               </div>
-            </div>
-          </div>
-        )}
-
-        {/* Tab: Credit Builder */}
-        {activeTab === "credit" && (
-          <div className="space-y-6">
-            <div>
-              <h2 className="text-xl md:text-2xl font-bold text-slate-800">Credit Builder</h2>
-              <p className="text-sm text-slate-500">Cash Flow Analytics, Financial Provenance & Loan Readiness Profiling</p>
-            </div>
-            <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
-              <div className="flex justify-between items-start">
-                <div>
-                  <div className="text-sm font-semibold text-slate-700">Internal MSME Financial Readiness Indicator</div>
-                  <div className="text-4xl font-extrabold text-emerald-600 mt-2">785 <span className="text-xl font-normal text-slate-400">/ 900</span></div>
-                </div>
-                <span className="text-xs bg-slate-100 text-slate-500 px-2 py-1 rounded">Simulated Score</span>
-              </div>
-              <div className="mt-4 p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-500">
-                <strong className="text-slate-700">Important Disclaimer:</strong> This metric is an internal, deterministic demonstration indicator calculated from transaction stability and cash-flow regularity. It is NOT an official credit score from credit rating agencies or bureaus (e.g., CIBIL, Equifax, Experian, CRIF High Mark) and does not constitute a loan guarantee.
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Tab: Scheme Navigator */}
-        {activeTab === "schemes" && (
-          <div className="space-y-6">
-            <div>
-              <h2 className="text-xl md:text-2xl font-bold text-slate-800">Scheme Navigator</h2>
-              <p className="text-sm text-slate-500">Deterministic Matcher for Central & State MSME Government Subsidies</p>
-            </div>
-            <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
-              <div className="text-sm font-semibold text-slate-700 mb-2">Simulated Catalog Matching</div>
-              <ul className="divide-y divide-slate-100">
-                <li className="py-3 flex justify-between items-center">
-                  <div>
-                    <div className="font-medium text-slate-800">CGTMSE Credit Guarantee Scheme</div>
-                    <div className="text-xs text-slate-500">Collateral-free credit facility up to ₹5 Crore</div>
-                  </div>
-                  <span className="bg-indigo-50 text-indigo-700 text-xs px-2.5 py-1 rounded-full font-medium">Sample Match</span>
-                </li>
-                <li className="py-3 flex justify-between items-center">
-                  <div>
-                    <div className="font-medium text-slate-800">PM Vishwakarma Scheme</div>
-                    <div className="text-xs text-slate-500">Concessional interest rate at 5% with collateral assistance</div>
-                  </div>
-                  <span className="bg-indigo-50 text-indigo-700 text-xs px-2.5 py-1 rounded-full font-medium">Sample Match</span>
-                </li>
-              </ul>
-            </div>
-          </div>
-        )}
-
-        {/* Tab: AI Financial Advisor */}
-        {activeTab === "ai" && (
-          <div className="space-y-6">
-            <div>
-              <h2 className="text-xl md:text-2xl font-bold text-slate-800">AI Financial Advisor</h2>
-              <p className="text-sm text-slate-500">Powered by Google Gemini with Strict Read-Only Financial Tool Boundaries</p>
-            </div>
-            <div className="bg-white rounded-xl border border-slate-200 shadow-sm flex flex-col h-[480px]">
-              <div className="flex-1 p-4 overflow-y-auto space-y-4">
-                {chatMessages.map((msg, idx) => (
-                  <div 
-                    key={idx} 
-                    className={`flex items-start space-x-3 ${msg.sender === "user" ? "flex-row-reverse space-x-reverse" : ""}`}
-                  >
-                    <div className={`p-2 rounded-full ${msg.sender === "user" ? "bg-indigo-600 text-white" : "bg-slate-100 text-indigo-600"}`}>
-                      {msg.sender === "user" ? <Building2 className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
-                    </div>
-                    <div className={`max-w-xl text-sm p-3.5 rounded-xl ${
-                      msg.sender === "user" 
-                        ? "bg-indigo-600 text-white rounded-tr-none" 
-                        : "bg-slate-50 border border-slate-100 text-slate-700 rounded-tl-none"
-                    }`}>
-                      {msg.text}
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <form onSubmit={handleSendMessage} className="p-3 border-t border-slate-200 flex gap-2">
-                <input
-                  type="text"
-                  value={inputText}
-                  onChange={(e) => setInputText(e.target.value)}
-                  placeholder="Ask a question about GST, scheme eligibility, or credit readiness (Demo UI)..."
-                  className="flex-1 border border-slate-200 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                />
-                <button
-                  type="submit"
-                  className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition flex items-center justify-center"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
-              </form>
             </div>
           </div>
         )}

@@ -58,6 +58,8 @@ def get_tenant_db(
             )
 
         set_tenant_context(db, org_id=x_org_id, user_id=x_user_id)
+        db.info["current_org"] = x_org_id
+        db.info["current_user"] = x_user_id
         yield db
     finally:
         db.close()

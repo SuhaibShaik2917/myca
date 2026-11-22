@@ -12,6 +12,10 @@ from app.config import settings
 from app.modules.auth.api import router as auth_router
 from app.modules.invoice_brain.api import router as invoice_brain_router
 from app.modules.reconciliation.api import router as reconciliation_router
+from app.modules.gstr3b.api import router as gstr3b_router
+from app.modules.credit_builder.api import router as credit_builder_router
+from app.modules.scheme_navigator.api import router as scheme_navigator_router
+from app.modules.ai_assistant.api import router as ai_assistant_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -32,6 +36,10 @@ app.add_middleware(
 app.include_router(auth_router, prefix=settings.API_V1_STR)
 app.include_router(invoice_brain_router, prefix=settings.API_V1_STR)
 app.include_router(reconciliation_router, prefix=settings.API_V1_STR)
+app.include_router(gstr3b_router, prefix=settings.API_V1_STR)
+app.include_router(credit_builder_router, prefix=settings.API_V1_STR)
+app.include_router(scheme_navigator_router, prefix=settings.API_V1_STR)
+app.include_router(ai_assistant_router, prefix=settings.API_V1_STR)
 
 @app.get("/health")
 def health_check():

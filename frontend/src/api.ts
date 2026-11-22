@@ -197,3 +197,267 @@ export interface ItcLedgerSummary {
 export function getItcLedgerSummary(): Promise<ItcLedgerSummary> {
   return apiFetch<ItcLedgerSummary>("/api/v1/reconciliation/itc-ledger/summary");
 }
+
+// -------------------------------------------------------------
+// Milestone 3: GSTR-3B Preparation, Offset & Filing API
+// -------------------------------------------------------------
+export interface Gstr3bFilingResponse {
+  filing_id: string;
+  org_id: string;
+  registration_id: string;
+  tax_period: string;
+  filing_status: string;
+  table_3_1: any;
+  table_4: any;
+  offset_result: any;
+  arn?: string | null;
+  cin?: string | null;
+  filing_date?: string | null;
+  created_at: string;
+  message: string;
+}
+
+export function prepareGstr3b(registrationId: string, taxPeriod: string): Promise<Gstr3bFilingResponse> {
+  return apiFetch<Gstr3bFilingResponse>("/api/v1/gstr3b/prepare", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ registration_id: registrationId, tax_period: taxPeriod }),
+  });
+}
+
+export function reviewGstr3b(filingId: string, action: string, remarks?: string): Promise<Gstr3bFilingResponse> {
+  return apiFetch<Gstr3bFilingResponse>(`/api/v1/gstr3b/${filingId}/review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, remarks }),
+  });
+}
+
+export function fileGstr3bSandbox(filingId: string): Promise<Gstr3bFilingResponse> {
+  return apiFetch<Gstr3bFilingResponse>(`/api/v1/gstr3b/${filingId}/file-sandbox`, {
+    method: "POST",
+  });
+}
+
+// -------------------------------------------------------------
+// Milestone 4: Credit Builder API
+// -------------------------------------------------------------
+export interface StatementUploadResponse {
+  transactions_imported: number;
+  total_credits: string;
+  total_debits: string;
+  net_flow: string;
+  period_start?: string | null;
+  period_end?: string | null;
+  message: string;
+}
+
+export interface FinancialSummaryOut {
+  total_revenue: string;
+  total_expenses: string;
+  net_profit_proxy: string;
+  net_margin_pct: string;
+  monthly_trends: Array<{
+    month: string;
+    inflow: string;
+    outflow: string;
+    net_cash_flow: string;
+    transaction_count: number;
+  }>;
+  expense_categories: Array<{ category: string; amount: string; percentage: string }>;
+  revenue_categories: Array<{ category: string; amount: string; percentage: string }>;
+}
+
+export interface ReadinessScoreOut {
+  score: number;
+  rating: string;
+  dscr_proxy: string;
+  cash_flow_stability: string;
+  gst_compliance_score: number;
+  factors: Array<{
+    name: string;
+    score: number;
+    max_score: number;
+    rating: string;
+    description: string;
+  }>;
+  disclaimer: string;
+}
+
+export interface LoanDossierOut {
+  legal_name: string;
+  pan: string;
+  gstin?: string | null;
+  scorecard: ReadinessScoreOut;
+  summary: FinancialSummaryOut;
+  recommended_loan_products: string[];
+  generated_at: string;
+  disclaimer: string;
+}
+
+export function uploadBankStatement(csvText: string): Promise<StatementUploadResponse> {
+  const formData = new URLSearchParams();
+  formData.append("csv_text", csvText);
+  return apiFetch<StatementUploadResponse>("/api/v1/credit-builder/statements/upload", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: formData.toString(),
+  });
+}
+
+export function getFinancialSummary(): Promise<FinancialSummaryOut> {
+  return apiFetch<FinancialSummaryOut>("/api/v1/credit-builder/summary");
+}
+
+export function getReadinessScore(): Promise<ReadinessScoreOut> {
+  return apiFetch<ReadinessScoreOut>("/api/v1/credit-builder/readiness-score");
+}
+
+export function getLoanDossier(): Promise<LoanDossierOut> {
+  return apiFetch<LoanDossierOut>("/api/v1/credit-builder/loan-dossier");
+}
+
+// -------------------------------------------------------------
+// Milestone 5: Scheme Navigator API
+// -------------------------------------------------------------
+export interface SchemeRuleOut {
+  rule_key: string;
+  operator: string;
+  target_value: string;
+  rule_description: string;
+}
+
+export interface GovernmentSchemeOut {
+  id: string;
+  scheme_code: string;
+  name: string;
+  ministry: string;
+  category: string;
+  description: string;
+  benefits_summary: string;
+  max_subsidy_amount?: string | null;
+  is_active: boolean;
+  rules: SchemeRuleOut[];
+}
+
+export interface EvaluatedCriterion {
+  rule_key: string;
+  description: string;
+  passed: boolean;
+  expected: string;
+  actual: string;
+}
+
+export interface SchemeMatchOut {
+  id?: string | null;
+  org_id: string;
+  scheme_id: string;
+  scheme_code: string;
+  scheme_name: string;
+  ministry: string;
+  category: string;
+  match_score: string | number;
+  status: string;
+  evaluated_criteria: EvaluatedCriterion[];
+  benefits_summary: string;
+  max_subsidy_amount?: string | null;
+}
+
+export interface SchemeChecklistOut {
+  scheme_code: string;
+  name: string;
+  ministry: string;
+  category: string;
+  eligibility_summary: string;
+  required_documents: string[];
+  application_steps: string[];
+  portal_url: string;
+  official_guidelines_url: string;
+}
+
+export interface BusinessProfileOut {
+  id: string;
+  org_id: string;
+  business_type: string;
+  industry_sector: string;
+  turnover_bracket?: string | null;
+  annual_turnover?: string | null;
+  credit_score?: number | null;
+  udyam_number?: string | null;
+  gstin?: string | null;
+}
+
+export function listGovernmentSchemes(category?: string): Promise<GovernmentSchemeOut[]> {
+  const query = category ? `?category=${category}` : "";
+  return apiFetch<GovernmentSchemeOut[]>(`/api/v1/scheme-navigator/schemes${query}`);
+}
+
+export function getBusinessProfile(): Promise<BusinessProfileOut> {
+  return apiFetch<BusinessProfileOut>("/api/v1/scheme-navigator/profile");
+}
+
+export function updateBusinessProfile(profile: any): Promise<BusinessProfileOut> {
+  return apiFetch<BusinessProfileOut>("/api/v1/scheme-navigator/profile", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(profile),
+  });
+}
+
+export function evaluateSchemes(profileOverride?: any): Promise<SchemeMatchOut[]> {
+  return apiFetch<SchemeMatchOut[]>("/api/v1/scheme-navigator/evaluate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: profileOverride ? JSON.stringify(profileOverride) : "{}",
+  });
+}
+
+export function getSchemeChecklist(schemeCode: string): Promise<SchemeChecklistOut> {
+  return apiFetch<SchemeChecklistOut>(`/api/v1/scheme-navigator/checklist/${schemeCode}`);
+}
+
+// -------------------------------------------------------------
+// AI Advisor API
+// -------------------------------------------------------------
+export interface QuickInsightOut {
+  id: string;
+  category: string;
+  title: string;
+  summary: string;
+  statutory_reference?: string | null;
+  severity: "info" | "warning" | "critical" | "success";
+  action_link?: string | null;
+}
+
+export interface ChatResponseOut {
+  reply: string;
+  grounding_applied: boolean;
+  grounding_context?: any;
+  model_used: string;
+  timestamp: string;
+}
+
+export function sendAiChat(messages: Array<{ role: string; content: string }>, includeGrounding: boolean = true): Promise<ChatResponseOut> {
+  return apiFetch<ChatResponseOut>("/api/v1/ai/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages, include_gst_grounding: includeGrounding }),
+  });
+}
+
+export function getQuickInsights(): Promise<QuickInsightOut[]> {
+  return apiFetch<QuickInsightOut[]>("/api/v1/ai/quick-insights");
+}
+
+// -------------------------------------------------------------
+// Inward Invoice Promotion (Milestone 1 to 2 bridge)
+// -------------------------------------------------------------
+export function promoteInvoiceToPurchase(invoiceId: string): Promise<any> {
+  return apiFetch<any>(`/api/v1/invoices/${invoiceId}/promote-to-purchase`, {
+    method: "POST",
+  });
+}
+
+export function listInvoices(): Promise<any[]> {
+  return apiFetch<any[]>("/api/v1/invoices/");
+}
