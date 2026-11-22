@@ -16,9 +16,10 @@
 | **F-03** | Future-dated supplier fixture quarantine | Isolated synthetic mock fixtures with future dates (`2026-02-15`, `2026-11-30`) into dedicated test sandboxes; production ledger rejects future dates. | `test_future_dated_ledger_events_strictly_quarantined_from_verified_snapshot` |
 | **F-04** | Section 17(5)(a)/(ab) vehicle seating threshold reconciliation | **Reconciled to Statutory Text:** Approved capacity of **not more than 13 persons** ($\le 13$) is BLOCKED; capacity of **more than 13 persons** ($> 13$, i.e. 14+) is ELIGIBLE (outside Section 17(5)(a) restriction, subject to Section 16 general conditions). Boundary tests prove 13 seats blocked and 14 seats eligible. | `test_statutory_section_17_5_boundaries_and_reference_grants.py::test_section_17_5_exact_13_seats_vs_14_seats_boundary` |
 | **F-05** | Dual Evidence Standard for Statutory Exceptions | Commercial permit ALONE does not grant Section 17(5)(a)(B) exception. Requires **BOTH** commercial passenger permit AND actual use for making taxable passenger transport supplies. Missing permit or unverified taxable use routes to `REVIEW_REQUIRED_FACTS_PENDING`. | `test_statutory_section_17_5_boundaries_and_reference_grants.py::test_section_17_5_goods_transport_and_statutory_facts` |
-| **F-06** | Section 17(5)(ab) Proviso (ii) Specific Provisions | Explicit exceptions evaluated for **motor vehicle manufacturers** and **general insurers** receiving repair, servicing, and insurance services. | `test_statutory_section_17_5_boundaries_and_reference_grants.py::test_section_17_5_ab_vehicle_repair_lineage` |
+| **F-06** | Section 17(5)(ab) Proviso (ii) Insurer & Manufacturer Exceptions | **Rigorous Factual & Statutory Gating:** Insurer exception requires general insurance license AND verified proof that the vehicle is insured by the taxpayer (`is_vehicle_insured_by_taxpayer`). Manufacturer exception requires industrial manufacturing license AND confirmed nexus to vehicles manufactured. Both execute AFTER general factual context verification; unverified claims route to `REVIEW_REQUIRED_FACTS_PENDING`. | `test_statutory_section_17_5_boundaries_and_reference_grants.py::test_section_17_5_ab_vehicle_repair_lineage` |
 | **F-07** | Incomplete Factual Records & Missing Facts Handling | Missing seating capacity on otherwise verified RC routes to `REVIEW_REQUIRED_FACTS_PENDING` (not confirmed block). Invoices with missing or empty facts dictionaries route to `REVIEW_REQUIRED_FACTS_PENDING`. | `test_statutory_section_17_5_boundaries_and_reference_grants.py::test_section_17_5_goods_transport_and_statutory_facts` |
-| **F-08** | Model A vs Model B Net ITC reconciliation | Both Model A (direct net) and Model B (Circular 170 Gross auto-population) reconcile to exact **₹3,13,750.00**. | `test_unified_financial_report_reconciliation` |
+| **F-08** | Review-Required Status Preservation in Engine & Downstream GSTR-3B | When an assessment routes to `REVIEW_REQUIRED_FACTS_PENDING`, `itc_engine.py` sets status to `REVIEW_REQUIRED`, `potential_itc = total_tax`, and `risk_reversal_amount = Decimal("0.00")`. Downstream `gstr3b_itc.py` strictly excludes `REVIEW_REQUIRED` items from Table 4(B)(1) permanent reversals, preserving Net ITC in Table 4(C) until CA adjudication. | `test_statutory_section_17_5_boundaries_and_reference_grants.py::test_review_required_preservation_in_itc_engine_and_gstr3b` |
+| **F-09** | Model A vs Model B Net ITC reconciliation | Both Model A (direct net) and Model B (Circular 170 Gross auto-population) reconcile to exact **₹3,13,750.00**. | `test_unified_financial_report_reconciliation` |
 
 ---
 
@@ -60,11 +61,25 @@ Section 17(5)(ab) blocks:
    - **Further Supply (Section 17(5)(a)(A)):** Requires both dealership authorization/license AND actual outward taxable vehicle supplies.
    - **Driving School Training (Section 17(5)(a)(C)):** Requires both motor driving school license AND actual training vehicle use.
 
-5. **Section 17(5)(ab) Proviso (ii) Specific Provisions:**
-   - **Motor Vehicle Manufacturers:** ITC on general insurance, servicing, and repair received by vehicle manufacturers is **ELIGIBLE** (`ELIGIBLE_STATUTORY_EXCEPTION`).
-   - **General Insurers:** ITC on repair and maintenance services in respect of vehicles insured by the taxpayer is **ELIGIBLE** (`ELIGIBLE_STATUTORY_EXCEPTION`).
+5. **Section 17(5)(ab) Proviso (ii) Insurer & Manufacturer Exceptions:**
+   - **General Factual Context Gating:** Under statutory rules, no exception can be inferred without verified factual evidence (`is_factual_context_verified: True`). Unverified claims route to `REVIEW_REQUIRED_FACTS_PENDING`.
+   - **Motor Vehicle Manufacturers (Proviso (ii)(I)):**
+     - Requires verified industrial manufacturing license or factory registration confirming vehicle manufacture.
+     - Requires established nexus of repair/servicing to motor vehicles manufactured by the taxpayer (`relates_to_manufactured_vehicles`).
+     - Without verified license or nexus, routes to **`REVIEW_REQUIRED_FACTS_PENDING`**.
+     - When fully verified, grants **`ELIGIBLE_STATUTORY_EXCEPTION`**.
+   - **General Insurers (Proviso (ii)(II)):**
+     - Requires verified IRDAI general insurance license/registration.
+     - Strictly requires verified proof that the specific motor vehicle is actually insured by the taxpayer (`is_vehicle_insured_by_taxpayer` / policy evidence).
+     - If insurer exception is claimed without proof that the vehicle is insured by the taxpayer, the engine routes to **`REVIEW_REQUIRED_FACTS_PENDING`** with citation: *"General insurer exception claimed, but evidence that the motor vehicle is insured by the taxpayer is missing or unverified."*
+     - Only when taxpayer status, general insurance license, AND insured-vehicle proof are verified does it grant **`ELIGIBLE_STATUTORY_EXCEPTION`**.
 
-6. **Missing Facts & Incomplete Factual Records:**
+6. **Downstream Review-Required Status Preservation:**
+   - When an assessment routes to `REVIEW_REQUIRED_FACTS_PENDING`, `StatutoryITCRiskEngine` sets `eligibility_status = ITCEligibilityEnum.REVIEW_REQUIRED`, `potential_itc = total_tax`, and `risk_reversal_amount = Decimal("0.00")`.
+   - In `generate_gstr3b_table4_summary` (`gstr3b_itc.py`), items under factual review (`status == REVIEW_REQUIRED` or rule ending with `_FACTS_PENDING`) are strictly excluded from Table 4(B)(1) permanent statutory reversals.
+   - Consequently, Net ITC in Table 4(C) is preserved in full pending CA review, preventing premature or improper tax reversal liabilities on unadjudicated claims.
+
+7. **Missing Facts & Incomplete Factual Records:**
    - When RC context is verified but approved seating capacity is omitted (`seating_capacity: None`), the engine does NOT default to a confirmed block; it routes to **`REVIEW_REQUIRED_FACTS_PENDING`** pending RC seating verification.
    - Invoices with empty or missing facts dictionaries route to **`REVIEW_REQUIRED_FACTS_PENDING`**.
 

@@ -261,7 +261,10 @@ def generate_gstr3b_table4_summary(
                 ri = rev_amt
                 rcs = Decimal("0.00")
 
-            if rule.startswith("SEC_17_5") or rule in ("RULE_38", "RULE_42", "RULE_43") or status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR:
+            if status == ITCEligibilityEnum.REVIEW_REQUIRED or str(rule).endswith("_FACTS_PENDING"):
+                # Items under factual review are potential exposures, not confirmed statutory reversals
+                pass
+            elif rule.startswith("SEC_17_5") or rule in ("RULE_38", "RULE_42", "RULE_43") or status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR:
                 comp_4b1 = _add_component(comp_4b1, rc, rs, ri, rcs)
             elif rule == "RULE_37_180_DAYS" or status == ITCEligibilityEnum.PAYMENT_180_DAY_RISK:
                 comp_4b2_r37 = _add_component(comp_4b2_r37, rc, rs, ri, rcs)

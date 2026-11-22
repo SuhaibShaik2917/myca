@@ -315,31 +315,105 @@ def audit_m1_m5_cross_tenant_isolation():
             assert len(res) == 0, f"CRITICAL RLS BREACH: Org B can read Org A's {tbl}!"
             print(f"  [Read Isolation] PASS: Org B cannot see Org A's record in {tbl}.")
 
-        # Step C: Cross-tenant Write/Tamper Attempts from Org B into Org A
-        for tbl, target_id in [("invoices", inv_id_a), ("gstr3b_filings", filing_id_a), ("financial_summaries", summary_id_a)]:
-            update_count = db.execute(text(f"UPDATE public.{tbl} SET id = :id WHERE id = :id;"), {"id": target_id}).rowcount
-            assert update_count == 0, f"CRITICAL RLS BREACH: Org B UPDATE on Org A's {tbl} succeeded!"
-            print(f"  [Cross-Tenant Tamper] PASS: Org B UPDATE on Org A's {tbl} affected 0 rows.")
+        # Step C: Cross-tenant Write/Tamper Attempts from Org B into Org A (Across ALL 11 Domains)
+        # C1: Cross-Tenant UPDATE Attempts
+        all_11_targets = [
+            ("invoices", "UPDATE public.invoices SET invoice_number = 'TAMPER' WHERE id = :id", inv_id_a),
+            ("documents", "UPDATE public.documents SET file_name = 'tamper.pdf' WHERE id = :id", doc_id_a),
+            ("gst_registrations", "UPDATE public.gst_registrations SET legal_name = 'TAMPER' WHERE id = :id", reg_id_a),
+            ("purchase_documents", "UPDATE public.purchase_documents SET document_number = 'TAMPER' WHERE id = :id", purch_id_a),
+            ("itc_ledger_entries", "UPDATE public.itc_ledger_entries SET tax_period = '999999' WHERE id = :id", ledger_id_a),
+            ("gst_records", "UPDATE public.gst_records SET return_type = 'TAMPER' WHERE id = :id", gst_rec_id_a),
+            ("financial_transactions", "UPDATE public.financial_transactions SET category = 'TAMPER' WHERE id = :id", fin_tx_id_a),
+            ("gstr3b_filings", "UPDATE public.gstr3b_filings SET filing_status = 'FILED' WHERE id = :id", filing_id_a),
+            ("financial_summaries", "UPDATE public.financial_summaries SET summary_period = '999999' WHERE id = :id", summary_id_a),
+            ("business_profiles", "UPDATE public.business_profiles SET business_type = 'TAMPER' WHERE id = :id", prof_id_a),
+            ("scheme_matches", "UPDATE public.scheme_matches SET status = 'approved' WHERE id = :id", match_id_a),
+        ]
 
-        # Step D: Cross-tenant Insert Attempt (inserting org_a record while under org_b)
-        cross_insert_blocked = False
-        try:
-            db.execute(text("""
+        for tbl, update_stmt, target_id in all_11_targets:
+            savepoint = db.begin_nested()
+            try:
+                res = db.execute(text(update_stmt), {"id": target_id})
+                update_count = res.rowcount
+                assert update_count == 0, f"CRITICAL RLS BREACH: Org B successfully updated Org A's {tbl}!"
+                savepoint.commit()
+                print(f"  [Cross-Tenant UPDATE] PASS: Org B UPDATE on Org A's {tbl} affected 0 rows (RLS isolation).")
+            except Exception as e:
+                savepoint.rollback()
+                err_str = str(e).lower()
+                if "permission denied" in err_str or "insufficientprivilege" in err_str:
+                    print(f"  [Cross-Tenant UPDATE] PASS: Org B UPDATE on Org A's {tbl} blocked by least-privilege grant denial (immutable ledger).")
+                else:
+                    raise
+
+        # C2: Cross-Tenant DELETE Attempts (Across ALL 11 Domains)
+        all_11_deletes = [
+            ("scheme_matches", "DELETE FROM public.scheme_matches WHERE id = :id", match_id_a),
+            ("itc_ledger_entries", "DELETE FROM public.itc_ledger_entries WHERE id = :id", ledger_id_a),
+            ("invoices", "DELETE FROM public.invoices WHERE id = :id", inv_id_a),
+            ("documents", "DELETE FROM public.documents WHERE id = :id", doc_id_a),
+            ("purchase_documents", "DELETE FROM public.purchase_documents WHERE id = :id", purch_id_a),
+            ("gst_records", "DELETE FROM public.gst_records WHERE id = :id", gst_rec_id_a),
+            ("financial_transactions", "DELETE FROM public.financial_transactions WHERE id = :id", fin_tx_id_a),
+            ("gstr3b_filings", "DELETE FROM public.gstr3b_filings WHERE id = :id", filing_id_a),
+            ("financial_summaries", "DELETE FROM public.financial_summaries WHERE id = :id", summary_id_a),
+            ("business_profiles", "DELETE FROM public.business_profiles WHERE id = :id", prof_id_a),
+            ("gst_registrations", "DELETE FROM public.gst_registrations WHERE id = :id", reg_id_a),
+        ]
+
+        for tbl, delete_stmt, target_id in all_11_deletes:
+            savepoint = db.begin_nested()
+            try:
+                res = db.execute(text(delete_stmt), {"id": target_id})
+                delete_count = res.rowcount
+                assert delete_count == 0, f"CRITICAL RLS BREACH: Org B successfully deleted Org A's {tbl}!"
+                savepoint.commit()
+                print(f"  [Cross-Tenant DELETE] PASS: Org B DELETE on Org A's {tbl} affected 0 rows (RLS isolation).")
+            except Exception as e:
+                savepoint.rollback()
+                err_str = str(e).lower()
+                if "permission denied" in err_str or "insufficientprivilege" in err_str:
+                    print(f"  [Cross-Tenant DELETE] PASS: Org B DELETE on Org A's {tbl} blocked by least-privilege grant denial (immutable ledger).")
+                else:
+                    raise
+
+        # Step D: Cross-tenant Insert Attempts (inserting org_a record while authenticated as org_b)
+        insert_tamper_targets = [
+            ("financial_summaries", """
                 INSERT INTO public.financial_summaries (id, org_id, summary_period, total_inflow, total_outflow, net_cash_flow)
                 VALUES (:id, :org_a, '112025', 0, 0, 0);
-            """), {"id": str(uuid.uuid4()), "org_a": org_a})
-            db.commit()
-        except Exception:
-            cross_insert_blocked = True
-            db.rollback()
-        assert cross_insert_blocked, "CRITICAL RLS BREACH: Org B was able to insert records into Org A!"
-        print("  [Cross-Tenant Insert] PASS: Cross-tenant insert rejected by RLS WITH CHECK.")
+            """),
+            ("invoices", """
+                INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_amount, status)
+                VALUES (:id, :org_a, :prof_a, 'INV-TAMPER-001', '2025-11-01', 'Tamper', 1000, 'uploaded');
+            """),
+            ("documents", """
+                INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
+                VALUES (:id, :org_a, 'invoice', 'tamper.pdf', 10, 'application/pdf', '/tmp/t.pdf', '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+            """),
+            ("business_profiles", """
+                INSERT INTO public.business_profiles (id, org_id, business_type, industry_sector, turnover_bracket, annual_turnover)
+                VALUES (:id, :org_a, 'Private Limited', 'Automotive', 'under_5cr', 10000);
+            """),
+        ]
+
+        for tbl, insert_sql in insert_tamper_targets:
+            cross_insert_blocked = False
+            try:
+                db.execute(text(insert_sql), {"id": str(uuid.uuid4()), "org_a": org_a, "prof_a": prof_id_a})
+                db.commit()
+            except Exception:
+                cross_insert_blocked = True
+                db.rollback()
+            assert cross_insert_blocked, f"CRITICAL RLS BREACH: Org B was able to insert records into Org A's {tbl}!"
+            print(f"  [Cross-Tenant INSERT] PASS: Spoofed insert into {tbl} rejected by RLS WITH CHECK.")
 
         # Step E: Null tenant context isolation
         db.execute(text("SELECT set_config('app.current_org', '', false), set_config('app.current_user', '', false);"))
-        for tbl in ["invoices", "documents", "gst_registrations", "purchase_documents", "itc_ledger_entries", "gstr3b_filings", "financial_summaries", "business_profiles", "scheme_matches"]:
+        for tbl in ["invoices", "documents", "gst_registrations", "purchase_documents", "itc_ledger_entries", "gst_records", "financial_transactions", "gstr3b_filings", "financial_summaries", "business_profiles", "scheme_matches"]:
             assert len(db.execute(text(f"SELECT id FROM public.{tbl};")).fetchall()) == 0, f"Leak in {tbl} under null context!"
-        print("  [Null Context Isolation] PASS: Under null context, all tenant tables return 0 rows.")
+        print("  [Null Context Isolation] PASS: Under null context, all 11 tenant tables return 0 rows.")
 
     finally:
         db.close()

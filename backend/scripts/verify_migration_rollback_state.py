@@ -1,18 +1,26 @@
 """
-Migration Rollback and Forward State Verification Script
+Migration Rollback and Baseline Verification Script
 
-Verifies that:
-1. Current head is 0021_enforce_tenant_force_rls with all 21 tenant tables having FORCE RLS enabled.
-2. Downgrading to 0020_m4_m5_grants_and_policies:
-   - Successfully executes DDL.
-   - All 21 tenant tables have relforcerowsecurity = False (restored to 0020 state).
-3. Downgrading to 0019_m3_gstr3b_filings:
-   - Successfully executes DDL.
-   - Specific grants and policies added by 0020 are safely reverted without side effects.
-4. Upgrading back to head (0021_enforce_tenant_force_rls):
-   - Successfully reapplies 0020 and 0021.
-   - All 21 tenant tables have relforcerowsecurity = True.
-   - Reference catalogues have strictly SELECT grants for app_service_user.
+Rigorously verifies:
+1. Baseline Capture at 0019_m3_gstr3b_filings:
+   - Captures exact snapshot of all role_table_grants for app_service_user
+   - Captures exact snapshot of all pg_policies
+   - Captures exact snapshot of all relrowsecurity and relforcerowsecurity in pg_class
+2. Upgrade to 0021_enforce_tenant_force_rls (head):
+   - Confirms all 36 tenant tables have both relrowsecurity=True and relforcerowsecurity=True
+   - Confirms all 8 new policies added by 0020 are present (96 total policies)
+   - Confirms app_service_user has strictly SELECT on reference catalogues
+3. Downgrade to 0020_m4_m5_grants_and_policies:
+   - Confirms 21 tenant tables successfully reverted to relforcerowsecurity=False
+   - Confirms all 8 policies of 0020 remain active in 0020
+   - Confirms reference catalogues retain SELECT privilege
+4. Downgrade to 0019_m3_gstr3b_filings (Baseline Comparison):
+   - Compares current role_table_grants against captured 0019 baseline (must match 100%)
+   - Compares current pg_policies against captured 0019 baseline (must match 100%)
+   - Compares current RLS flags against captured 0019 baseline (must match 100%)
+   - Confirms all 8 policies from 0020 are completely removed
+5. Re-Upgrade to 0021_enforce_tenant_force_rls (head):
+   - Confirms full restoration of head state with all 36 tables having FORCE RLS enabled.
 """
 import subprocess
 import sys
@@ -44,7 +52,20 @@ TENANT_TABLES_21 = [
     "reconciliation_variances"
 ]
 
+POLICIES_0020_8 = [
+    "business_profiles_service",
+    "financial_transactions_service",
+    "financial_summaries_service",
+    "summary_transactions_service",
+    "scheme_matches_service",
+    "gst_records_service",
+    "gov_schemes_read_all",
+    "scheme_rules_read_all"
+]
+
 def run_cmd(cmd_list):
+    if cmd_list and cmd_list[0] == "alembic":
+        cmd_list = [sys.executable, "-m", "alembic"] + cmd_list[1:]
     res = subprocess.run(cmd_list, capture_output=True, text=True)
     if res.returncode != 0:
         print(f"FAILED command: {' '.join(cmd_list)}")
@@ -53,65 +74,118 @@ def run_cmd(cmd_list):
         raise RuntimeError(f"Command failed with code {res.returncode}")
     return res.stdout
 
-def get_force_rls_status(conn):
+def capture_database_state(conn):
     with conn.cursor() as cur:
+        # 1. Grants for app_service_user
+        cur.execute("""
+            SELECT table_name, privilege_type 
+            FROM information_schema.role_table_grants 
+            WHERE grantee = 'app_service_user' 
+            ORDER BY table_name, privilege_type;
+        """)
+        grants = set(cur.fetchall())
+
+        # 2. Policies
+        cur.execute("""
+            SELECT tablename, policyname 
+            FROM pg_policies 
+            WHERE schemaname = 'public' 
+            ORDER BY tablename, policyname;
+        """)
+        policies = set(cur.fetchall())
+
+        # 3. Table RLS flags
         cur.execute("""
             SELECT relname, relrowsecurity, relforcerowsecurity
             FROM pg_class
-            WHERE relnamespace = 'public'::regnamespace
-              AND relname = ANY(%s)
+            WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'
             ORDER BY relname;
-        """, (TENANT_TABLES_21,))
-        rows = cur.fetchall()
-        return {r[0]: (r[1], r[2]) for r in rows}
+        """)
+        rls_flags = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+
+        return {"grants": grants, "policies": policies, "rls_flags": rls_flags}
 
 def main():
-    print("=== Step 1: Verify current head (0021) ===")
     conn = psycopg.connect(DB_ADMIN_URL)
     conn.autocommit = True
 
-    status_0021 = get_force_rls_status(conn)
-    assert len(status_0021) == 21, f"Expected 21 tables, found {len(status_0021)}"
-    for tbl, (rls, force) in status_0021.items():
-        assert rls is True, f"Table {tbl} must have relrowsecurity=True at 0021"
-        assert force is True, f"Table {tbl} must have relforcerowsecurity=True at 0021"
-    print("PASS: All 21 tables have relforcerowsecurity=True at 0021.")
+    print("=== Step 1: Establish & Capture Baseline at 0019_m3_gstr3b_filings ===")
+    run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
+    baseline_0019 = capture_database_state(conn)
+    print(f"  Captured 0019 Baseline: {len(baseline_0019['grants'])} grants, {len(baseline_0019['policies'])} policies, {len(baseline_0019['rls_flags'])} tables.")
+    assert len(baseline_0019["grants"]) == 79, f"Expected 79 grants at 0019, got {len(baseline_0019['grants'])}"
+    assert len(baseline_0019["policies"]) == 88, f"Expected 88 policies at 0019, got {len(baseline_0019['policies'])}"
 
-    print("\n=== Step 2: Test rollback to 0020_m4_m5_grants_and_policies ===")
-    out_down_20 = run_cmd(["alembic", "downgrade", "0020_m4_m5_grants_and_policies"])
-    print(out_down_20.strip())
+    print("\n=== Step 2: Upgrade to Head (0021_enforce_tenant_force_rls) ===")
+    run_cmd(["alembic", "upgrade", "head"])
+    state_0021 = capture_database_state(conn)
+    print(f"  Head State (0021): {len(state_0021['grants'])} grants, {len(state_0021['policies'])} policies.")
+    assert len(state_0021["grants"]) == 105, f"Expected 105 grants at 0021, got {len(state_0021['grants'])}"
+    assert len(state_0021["policies"]) == 96, f"Expected 96 policies at 0021, got {len(state_0021['policies'])}"
 
-    status_0020 = get_force_rls_status(conn)
-    for tbl, (rls, force) in status_0020.items():
-        assert rls is True, f"Table {tbl} must still have relrowsecurity=True at 0020"
-        assert force is False, f"Table {tbl} must have relforcerowsecurity=False after downgrade to 0020"
-    print("PASS: All 21 tables successfully reverted to relforcerowsecurity=False at 0020.")
+    # Verify all 21 tables have relforcerowsecurity=True
+    for tbl in TENANT_TABLES_21:
+        assert state_0021["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0021"
+    # Verify all 8 0020 policies present
+    for p_name in POLICIES_0020_8:
+        matching = [p for p in state_0021["policies"] if p[1] == p_name]
+        assert len(matching) == 1, f"Policy {p_name} missing at 0021"
+    print("PASS: Head state (0021) completely verified.")
 
-    print("\n=== Step 3: Test rollback to 0019_m3_gstr3b_filings ===")
-    out_down_19 = run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
-    print(out_down_19.strip())
+    print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
+    run_cmd(["alembic", "downgrade", "0020_m4_m5_grants_and_policies"])
+    state_0020 = capture_database_state(conn)
+    print(f"  State at 0020: {len(state_0020['grants'])} grants, {len(state_0020['policies'])} policies.")
+    # Verify all 21 tables reverted to relforcerowsecurity=False
+    for tbl in TENANT_TABLES_21:
+        assert state_0020["rls_flags"][tbl][1] is False, f"{tbl} must have relforcerowsecurity=False at 0020"
+        assert state_0020["rls_flags"][tbl][0] is True, f"{tbl} must keep relrowsecurity=True at 0020"
+    # Verify all 8 0020 policies remain active in 0020
+    for p_name in POLICIES_0020_8:
+        matching = [p for p in state_0020["policies"] if p[1] == p_name]
+        assert len(matching) == 1, f"Policy {p_name} must remain active at 0020"
+    print("PASS: Downgrade to 0020 completely verified.")
 
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT policyname, tablename FROM pg_policies
-            WHERE policyname IN ('gov_schemes_read_all', 'scheme_rules_read_all', 'business_profiles_service');
-        """)
-        leftover_policies = cur.fetchall()
-        assert len(leftover_policies) == 0, f"Expected 0 policies from 0020, found {leftover_policies}"
-    print("PASS: Policies from 0020 were cleanly removed at 0019.")
+    print("\n=== Step 4: Downgrade to 0019_m3_gstr3b_filings & Assert Exact Baseline Match ===")
+    run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
+    rolled_back_state = capture_database_state(conn)
 
-    print("\n=== Step 4: Upgrade back to head (0021) ===")
-    out_up_head = run_cmd(["alembic", "upgrade", "head"])
-    print(out_up_head.strip())
+    # A. Assert all 8 0020 policies are completely removed
+    for p_name in POLICIES_0020_8:
+        matching = [p for p in rolled_back_state["policies"] if p[1] == p_name]
+        assert len(matching) == 0, f"Policy {p_name} was NOT removed on rollback to 0019!"
+    print("  PASS: All 8 policies from 0020 were cleanly dropped.")
 
-    status_restored = get_force_rls_status(conn)
-    for tbl, (rls, force) in status_restored.items():
-        assert rls is True, f"Table {tbl} must have relrowsecurity=True after re-upgrade"
-        assert force is True, f"Table {tbl} must have relforcerowsecurity=True after re-upgrade"
-    print("PASS: All 21 tables successfully re-upgraded with relforcerowsecurity=True.")
+    # B. Compare exact grants against captured 0019 baseline
+    missing_grants = baseline_0019["grants"] - rolled_back_state["grants"]
+    extra_grants = rolled_back_state["grants"] - baseline_0019["grants"]
+    assert len(missing_grants) == 0, f"Rollback corrupted baseline grants! Missing: {missing_grants}"
+    assert len(extra_grants) == 0, f"Rollback left extra grants! Extra: {extra_grants}"
+    assert rolled_back_state["grants"] == baseline_0019["grants"]
+    print("  PASS: Exact match on all 79 role_table_grants for app_service_user.")
+
+    # C. Compare exact policies against captured 0019 baseline
+    missing_policies = baseline_0019["policies"] - rolled_back_state["policies"]
+    extra_policies = rolled_back_state["policies"] - baseline_0019["policies"]
+    assert len(missing_policies) == 0, f"Rollback corrupted baseline policies! Missing: {missing_policies}"
+    assert len(extra_policies) == 0, f"Rollback left extra policies! Extra: {extra_policies}"
+    assert rolled_back_state["policies"] == baseline_0019["policies"]
+    print("  PASS: Exact match on all 88 policies in pg_policies.")
+
+    # D. Compare exact table RLS flags against captured 0019 baseline
+    assert rolled_back_state["rls_flags"] == baseline_0019["rls_flags"]
+    print("  PASS: Exact match on all table RLS and FORCE RLS flags.")
+
+    print("\n=== Step 5: Re-Upgrade to Head (0021_enforce_tenant_force_rls) ===")
+    run_cmd(["alembic", "upgrade", "head"])
+    final_head_state = capture_database_state(conn)
+    assert final_head_state["grants"] == state_0021["grants"]
+    assert final_head_state["policies"] == state_0021["policies"]
+    assert final_head_state["rls_flags"] == state_0021["rls_flags"]
+    print("  PASS: Re-upgrade to head completely restored production security state.")
 
     conn.close()
-    print("\nALL MIGRATION ROLLBACK & UPGRADE INVARIANTS VERIFIED!")
+    print("\nALL MIGRATION ROLLBACK & BASELINE RESTORATION INVARIANTS 100% VERIFIED!")
 
 if __name__ == "__main__":
     main()

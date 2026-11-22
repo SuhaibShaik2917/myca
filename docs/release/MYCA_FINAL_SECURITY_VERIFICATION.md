@@ -2,7 +2,8 @@
 
 **Audit Date:** November 23, 2026  
 **Auditor:** Principal Application Security Engineer  
-**Scope:** PostgreSQL 16 Row Level Security (RLS), Least-Privilege Role Grants, Token Spoofing Defense, Cross-Tenant Isolation.
+**Audit Branch:** `remediation/audit-findings-phase3` (Merging to `master`)  
+**Scope:** PostgreSQL 16 Row Level Security (RLS), Least-Privilege Role Grants, Token Spoofing Defense, 11-Domain Cross-Tenant Write Isolation, Migration Rollback Baseline Exact Match.
 
 ---
 
@@ -109,7 +110,7 @@ Executed via `backend/scripts/audit_rls_security_comprehensive.py`:
 
 ### 3.1 Read Isolation Test
 - Two distinct organizations (`Tenant Alpha Corp` and `Tenant Beta Ltd`) were provisioned with respective users and GSTINs.
-- Under `Tenant Alpha` context, records were inserted across 11 core tenant tables:
+- Under `Tenant Alpha` context, records were inserted across all 11 core tenant domain tables:
   - `invoices`
   - `documents`
   - `gst_registrations`
@@ -125,14 +126,18 @@ Executed via `backend/scripts/audit_rls_security_comprehensive.py`:
   - `SELECT id FROM public.<table_name> WHERE id = <Alpha ID>` &rarr; **0 rows returned across all 11 tables** [PASS]
 
 ### 3.2 Write / Tamper Protection Test
-- While authenticated as `Tenant Beta`, attempts to update `Tenant Alpha`'s records in `invoices`, `gstr3b_filings`, and `financial_summaries`:
-  - `UPDATE public.<table_name> ... WHERE id = <Alpha ID>` &rarr; **0 rows updated** [PASS]
-- An attempt was made to insert a record into `financial_summaries` tagged with `Tenant Alpha`'s `org_id` while operating under `Tenant Beta`:
-  - Transaction rejected by PostgreSQL RLS with `WITH CHECK` violation (`ProgrammingError`) [PASS]
+- While authenticated as `Tenant Beta`, UPDATE attempts were executed on `Tenant Alpha`'s records across all 11 core tables:
+  - `invoices`, `documents`, `gst_registrations`, `purchase_documents`, `gst_records`, `financial_transactions`, `gstr3b_filings`, `financial_summaries`, `business_profiles`, `scheme_matches`: **0 rows updated** (RLS isolation enforced) [PASS]
+  - `itc_ledger_entries`: blocked by **least-privilege grant denial** (immutable statutory ledger) [PASS]
+- While authenticated as `Tenant Beta`, DELETE attempts were executed on `Tenant Alpha`'s records across all tables:
+  - `invoices`, `documents`, `gst_registrations`, `purchase_documents`, `gst_records`, `financial_transactions`, `gstr3b_filings`, `financial_summaries`, `business_profiles`, `scheme_matches`: **0 rows deleted** (RLS isolation enforced) [PASS]
+  - `itc_ledger_entries`: blocked by **least-privilege grant denial** (immutable statutory ledger) [PASS]
+- Cross-tenant INSERT attempts with spoofed `org_id` were executed under `Tenant Beta`:
+  - Attempted inserts into `financial_summaries`, `invoices`, `documents`, and `business_profiles` were rejected by PostgreSQL RLS `WITH CHECK` constraints (`ProgrammingError`) [PASS]
 
 ### 3.3 Null Context Leakage Protection
 - When tenant session variables (`app.current_org` and `app.current_user`) were cleared:
-  - All tenant tables returned **0 rows**, preventing unauthenticated bulk exfiltration.
+  - All 11 tenant tables returned **0 rows**, preventing unauthenticated bulk exfiltration.
 
 ---
 
@@ -152,9 +157,15 @@ When a caller supplies a valid JWT token for Tenant A but attempts to spoof `X-O
 
 ---
 
-## 5. MIGRATION ROLLBACK SAFETY VERIFICATION
+## 5. MIGRATION ROLLBACK SAFETY & BASELINE VERIFICATION
 
-Migration downgrade safety verified via `backend/scripts/verify_migration_rollback_state.py`:
-- `0021` downgrade sets `NO FORCE ROW LEVEL SECURITY` on all 21 tables (restoring exact `0020` state).
-- `0020` downgrade selectively revokes the 8 grants and drops the 8 policies added in `0020` (avoiding broad `REVOKE ALL`).
-- Full round-trip downgrade to `0019` and re-upgrade to `0021` executes cleanly and restores all 36 tables to `FORCE RLS = True`.
+Migration downgrade safety and baseline restoration verified via `backend/scripts/verify_migration_rollback_state.py`:
+- **Step 1 (Establish Baseline at 0019):** Downgraded to `0019_m3_gstr3b_filings` to capture exact baseline: **79 role_table_grants** for `app_service_user`, **88 policies** in `pg_policies`, and **41 tables**.
+- **Step 2 (Upgrade to Head 0021):** Upgraded to `0021_enforce_tenant_force_rls`: **105 grants**, **96 policies**, and confirmed all 36 tenant tables have both `relrowsecurity = True` and `relforcerowsecurity = True`.
+- **Step 3 (Downgrade to 0020):** Downgraded to `0020_m4_m5_grants_and_policies`: confirmed 21 tenant tables successfully reverted to `relforcerowsecurity = False` while retaining all 8 new policies.
+- **Step 4 (Downgrade to 0019 & Baseline Comparison):** Downgraded to `0019_m3_gstr3b_filings`:
+  - Confirmed all 8 policies from 0020 were cleanly dropped (0 leftover).
+  - Compared exact role table grants against baseline: **0 missing grants, 0 extra grants (100% exact match)**.
+  - Compared exact policies against baseline: **0 missing policies, 0 extra policies (100% exact match)**.
+  - Compared table RLS and FORCE RLS flags: **100% exact match**.
+- **Step 5 (Re-Upgrade to Head 0021):** Re-upgraded to `0021_enforce_tenant_force_rls`, fully restoring head state with 105 grants and 96 policies.

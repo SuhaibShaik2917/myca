@@ -904,54 +904,90 @@ def evaluate_section_17_5_vehicle_and_repair_eligibility(
     if not (is_repair_or_insurance or is_motor_vehicle):
         return {"applies": False, "status": "NOT_APPLICABLE"}
 
-    # 1. Section 17(5)(ab) Proviso (ii): Vehicle Manufacturers & General Insurers
-    if is_repair_or_insurance:
-        if facts.get("is_vehicle_manufacturer") or business_profile.get("is_vehicle_manufacturer"):
-            return {
-                "applies": True,
-                "is_blocked": False,
-                "status": "ELIGIBLE_STATUTORY_EXCEPTION",
-                "statutory_citation": "Section 17(5)(ab) Proviso (ii) exception: Repair/servicing services received by motor vehicle manufacturer.",
-                "seating_capacity": facts.get("seating_capacity")
-            }
-        if facts.get("is_general_insurer") or business_profile.get("is_general_insurer"):
-            return {
-                "applies": True,
-                "is_blocked": False,
-                "status": "ELIGIBLE_STATUTORY_EXCEPTION",
-                "statutory_citation": "Section 17(5)(ab) Proviso (ii) exception: General insurance services/repairs in respect of vehicles insured by taxpayer.",
-                "seating_capacity": facts.get("seating_capacity")
-            }
-
-    # 2. Goods Transport Vehicles (e.g. HSN 8704, trucks, tippers)
-    vehicle_type = (facts.get("vehicle_type") or "").lower()
-    if hsn.startswith("8704") or "goods" in vehicle_type or facts.get("is_goods_transport_vehicle"):
-        if facts.get("is_factual_context_verified", False):
-            return {
-                "applies": True,
-                "is_blocked": False,
-                "status": "ELIGIBLE_STATUTORY_EXCEPTION",
-                "statutory_citation": "Section 17(5)(a) inapplicable: Goods transport vehicle (not for transportation of persons; subject to Section 16 general conditions).",
-                "seating_capacity": facts.get("seating_capacity")
-            }
-        else:
-            return {
-                "applies": True,
-                "is_blocked": None,
-                "status": "REVIEW_REQUIRED_FACTS_PENDING",
-                "statutory_citation": "Section 17(5)(a): Goods transport claimed but vehicle RC / registration unverified.",
-                "missing_evidence_required": "Provide verified RC copy confirming goods carriage category."
-            }
-
-    # 3. Missing facts dictionary or unverified factual context
-    is_verified = facts.get("is_factual_context_verified", False)
+    # 1. Factual Context Verification Gate:
+    # Under statutory rules, NO exception can be inferred without verified factual evidence.
+    # A profile boolean or unverified claim alone cannot bypass verification.
+    is_verified = bool(facts and facts.get("is_factual_context_verified", False))
     if not facts or not is_verified:
         return {
             "applies": True,
             "is_blocked": None,
             "status": "REVIEW_REQUIRED_FACTS_PENDING",
-            "statutory_citation": "Section 17(5)(a) / Section 17(5)(ab): Vehicle context, seating capacity, and actual taxable usage unverified from RC.",
-            "missing_evidence_required": "Provide vehicle registration certificate (RC) confirming approved seating capacity and proof of actual taxable usage."
+            "statutory_citation": "Section 17(5)(a) / Section 17(5)(ab): Factual context, vehicle RC, seating capacity, or statutory exception unverified.",
+            "missing_evidence_required": "Provide verified vehicle registration certificate (RC), insurance policy, or manufacturer/insurer statutory evidence."
+        }
+
+    # 2. Section 17(5)(ab) Proviso (ii): Vehicle Manufacturers & General Insurers
+    if is_repair_or_insurance:
+        # Proviso (ii)(I): Taxable person engaging in the manufacture of such motor vehicles
+        has_mfr_claim = bool(facts.get("is_vehicle_manufacturer") or business_profile.get("is_vehicle_manufacturer"))
+        has_mfr_license = bool(facts.get("manufacturing_license") or facts.get("is_manufacturer_license_verified") or facts.get("is_verified_vehicle_manufacturer"))
+        relates_to_mfg = facts.get("relates_to_manufactured_vehicles", True)
+        if has_mfr_claim or has_mfr_license:
+            if has_mfr_claim and has_mfr_license and relates_to_mfg:
+                return {
+                    "applies": True,
+                    "is_blocked": False,
+                    "status": "ELIGIBLE_STATUTORY_EXCEPTION",
+                    "statutory_citation": "Section 17(5)(ab) Proviso (ii)(I) exception: Repair, servicing, or insurance services received by verified motor vehicle manufacturer.",
+                    "seating_capacity": facts.get("seating_capacity")
+                }
+            elif has_mfr_claim and not has_mfr_license:
+                return {
+                    "applies": True,
+                    "is_blocked": None,
+                    "status": "REVIEW_REQUIRED_FACTS_PENDING",
+                    "statutory_citation": "Section 17(5)(ab) Proviso (ii)(I): Vehicle manufacturing exception claimed without verified industrial manufacturing license.",
+                    "missing_evidence_required": "Provide verified industrial manufacturing license or factory registration confirming manufacture of motor vehicles."
+                }
+            else:
+                return {
+                    "applies": True,
+                    "is_blocked": None,
+                    "status": "REVIEW_REQUIRED_FACTS_PENDING",
+                    "statutory_citation": "Section 17(5)(ab) Proviso (ii)(I): Services do not relate to vehicles manufactured by the taxpayer.",
+                    "missing_evidence_required": "Provide evidence establishing nexus of repair/servicing to motor vehicles manufactured by taxpayer."
+                }
+
+        # Proviso (ii)(II): Supply of general insurance services in respect of motor vehicles insured by him
+        has_ins_claim = bool(facts.get("is_general_insurer") or business_profile.get("is_general_insurer"))
+        has_ins_license = bool(facts.get("general_insurance_license") or facts.get("is_general_insurer_license_verified") or facts.get("is_verified_general_insurer"))
+        vehicle_insured_by_taxpayer = bool(facts.get("is_vehicle_insured_by_taxpayer") or facts.get("insurance_policy_verified") or facts.get("policy_number"))
+        if has_ins_claim or has_ins_license or vehicle_insured_by_taxpayer:
+            if has_ins_claim and has_ins_license and vehicle_insured_by_taxpayer:
+                return {
+                    "applies": True,
+                    "is_blocked": False,
+                    "status": "ELIGIBLE_STATUTORY_EXCEPTION",
+                    "statutory_citation": "Section 17(5)(ab) Proviso (ii)(II) exception: General insurance / repair services received by general insurer in respect of motor vehicles insured by him.",
+                    "seating_capacity": facts.get("seating_capacity")
+                }
+            elif (has_ins_claim or has_ins_license) and not vehicle_insured_by_taxpayer:
+                return {
+                    "applies": True,
+                    "is_blocked": None,
+                    "status": "REVIEW_REQUIRED_FACTS_PENDING",
+                    "statutory_citation": "Section 17(5)(ab) Proviso (ii)(II): General insurer exception claimed, but evidence that the motor vehicle is insured by the taxpayer is missing or unverified.",
+                    "missing_evidence_required": "Provide insurance policy docket or claim file establishing that the vehicle is insured by the taxpayer."
+                }
+            else:
+                return {
+                    "applies": True,
+                    "is_blocked": None,
+                    "status": "REVIEW_REQUIRED_FACTS_PENDING",
+                    "statutory_citation": "Section 17(5)(ab) Proviso (ii)(II): Insurer exception claimed without verified IRDAI general insurance license.",
+                    "missing_evidence_required": "Provide verified IRDAI general insurance registration / license."
+                }
+
+    # 3. Goods Transport Vehicles (e.g. HSN 8704, trucks, tippers)
+    vehicle_type = (facts.get("vehicle_type") or "").lower()
+    if hsn.startswith("8704") or "goods" in vehicle_type or facts.get("is_goods_transport_vehicle"):
+        return {
+            "applies": True,
+            "is_blocked": False,
+            "status": "ELIGIBLE_STATUTORY_EXCEPTION",
+            "statutory_citation": "Section 17(5)(a) inapplicable: Goods transport vehicle (not for transportation of persons; subject to Section 16 general conditions).",
+            "seating_capacity": facts.get("seating_capacity")
         }
 
     # 4. Seating Capacity Evaluation (> 13 vs <= 13)
@@ -1382,9 +1418,9 @@ class StatutoryITCRiskEngine:
                             gstr2b_doc_id=g_id,
                             rule_code="SEC_17_5_MOTOR",
                             statutory_section="Section 17(5)(a)" if not hsn.startswith(("9987", "9971")) else "Section 17(5)(ab)",
-                            eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
+                            eligibility_status=ITCEligibilityEnum.REVIEW_REQUIRED,
                             potential_itc=total_tax,
-                            risk_reversal_amount=total_tax,
+                            risk_reversal_amount=Decimal("0.00"),
                             findings_explanation=veh_res.get("statutory_citation", "Vehicle context and seating capacity unverified."),
                             missing_evidence_required=veh_res.get("missing_evidence_required", "Provide verified RC copy confirming seating capacity and business end-use."),
                             evaluation_date=str(eval_dt)

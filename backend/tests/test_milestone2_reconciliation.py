@@ -842,7 +842,8 @@ def test_itc_risk_engine_statutory_rules():
             "total_invoice_value": Decimal("118000.00"),
             "goods_receipt_date": "2026-11-02",
             "goods_receipt_note_ref": "GRN-01",
-            "item_description": desc
+            "item_description": desc,
+            "facts": {"is_factual_context_verified": True, "seating_capacity": 5} if rule_code == "SEC_17_5_MOTOR" else {}
         }
         evals_blocked = engine.evaluate_itc_eligibility(purchase_doc=p_blocked, gstr2b_doc=g_doc, evaluation_date=today)
         target_eval = next(e for e in evals_blocked if e.rule_code == rule_code)
