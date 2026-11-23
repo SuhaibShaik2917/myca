@@ -5,6 +5,7 @@ Ensures reference data catalogs are seeded and manages isolated test statutory a
 
 import os
 os.environ.setdefault("ENVIRONMENT", "test")
+os.environ.setdefault("STATUTORY_AUDIT_SIGNING_KEY", "MYCA_CI_TEST_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.6_MIN32CHAR")
 import pytest
 from datetime import datetime, timezone
 from sqlalchemy import text

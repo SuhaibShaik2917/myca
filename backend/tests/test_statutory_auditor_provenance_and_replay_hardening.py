@@ -1710,3 +1710,83 @@ def test_gateway_missing_db_fails_closed(clean_test_auditor_env):
     )
     assert ok is False
     assert "DATABASE_UNAVAILABLE" in msg
+
+
+def test_gateway_nonce_persisted_across_migration_downgrade_and_reupgrade(clean_test_auditor_env):
+    """
+    CRITICAL DEFECT REMEDIATION TEST (High 3):
+    1. Consumes a valid gateway nonce in the head revision (0026).
+    2. Executes Alembic downgrade to 0025.
+    3. Proves the consumed nonce is still present in PostgreSQL (not deleted/dropped).
+    4. Executes Alembic re-upgrade to head (0026).
+    5. Proves that presenting the exact same gateway token again is rejected with GATEWAY_NONCE_REPLAY.
+    """
+    import subprocess
+    import sys
+    admin_db = clean_test_auditor_env["admin_db"]
+    m_no = clean_test_auditor_env["mem_no"]
+    cop_date = datetime(2030, 12, 31).date()
+    persist_nonce = f"NONCE-PERSIST-DOWNGRADE-{uuid.uuid4().hex[:12]}"
+
+    token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=f"ICAI-PERSIST-{uuid.uuid4().hex[:8]}",
+        cop_valid_until=cop_date,
+        nonce=persist_nonce
+    )
+
+    # 1. First verification consumes nonce in PostgreSQL
+    ok1, msg1, _ = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test",
+        db=admin_db
+    )
+    assert ok1 is True, f"Initial verification failed: {msg1}"
+
+    # Verify nonce recorded in database
+    count1 = admin_db.execute(
+        text("SELECT count(*) FROM public.statutory_gateway_nonce_registry WHERE nonce = :n;"),
+        {"n": persist_nonce}
+    ).scalar()
+    assert count1 == 1, "Nonce must be recorded in public.statutory_gateway_nonce_registry"
+
+    # 2. Downgrade migration to 0025
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    res_down = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "0025_manual_review_and_nonce"],
+        cwd=backend_dir,
+        capture_output=True,
+        text=True
+    )
+    assert res_down.returncode == 0, f"Alembic downgrade failed: {res_down.stderr}"
+
+    # 3. Assert nonce history was NOT dropped or deleted
+    admin_db.rollback()
+    count_after_down = admin_db.execute(
+        text("SELECT count(*) FROM public.statutory_gateway_nonce_registry WHERE nonce = :n;"),
+        {"n": persist_nonce}
+    ).scalar()
+    assert count_after_down == 1, "Consumed gateway nonce history was wiped or dropped on migration downgrade!"
+
+    # 4. Re-upgrade migration to head (0026)
+    res_up = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=backend_dir,
+        capture_output=True,
+        text=True
+    )
+    assert res_up.returncode == 0, f"Alembic re-upgrade failed: {res_up.stderr}"
+
+    # 5. Assert presenting the same token is still rejected with GATEWAY_NONCE_REPLAY
+    admin_db.rollback()
+    ok2, msg2, _ = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test",
+        db=admin_db
+    )
+    assert ok2 is False, "Replay attack succeeded after downgrade & re-upgrade cycle!"
+    assert "GATEWAY_NONCE_REPLAY" in msg2, f"Expected GATEWAY_NONCE_REPLAY, got: {msg2}"

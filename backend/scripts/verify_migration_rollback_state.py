@@ -200,6 +200,8 @@ def main():
 
     print("\n=== Step 1: Establish Baseline at 0019 & Verify Against Independent Reference ===")
     run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS public.statutory_gateway_nonce_registry CASCADE;")
     classify_and_verify_auditor_state(conn, "Step 1: Baseline 0019", "TABLE_NOT_PRESENT")
     baseline_0019 = capture_database_state(conn)
     print(f"  Captured 0019 Database State: {len(baseline_0019['grants'])} grants, {len(baseline_0019['policies'])} policies, {len(baseline_0019['rls_flags'])} tables.")
@@ -212,15 +214,15 @@ def main():
     run_cmd(["alembic", "upgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 1b: Fresh Historical Upgrade 0022", "LEGACY_SEEDS_PRESENT_IN_HISTORICAL_0022")
 
-    print("\n=== Step 2: Upgrade to Head (0025_manual_review_and_nonce) ===")
+    print("\n=== Step 2: Upgrade to Head (0026_gateway_nonce_and_audit) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2: Head 0025", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2: Head 0026", "AUDITORS_VERIFIED_CLEAN")
     state_head = capture_database_state(conn)
-    print(f"  Head State (0025): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
-    assert len(state_head["grants"]) == 112, f"Expected 112 grants at 0025, got {len(state_head['grants'])}"
-    assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0025, got {len(state_head['policies'])}"
+    print(f"  Head State (0026): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
+    assert len(state_head["grants"]) == 112, f"Expected 112 grants at 0026, got {len(state_head['grants'])}"
+    assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0026, got {len(state_head['policies'])}"
 
-    # Verify nonce index and nonce registry table exist at 0025
+    # Verify nonce index and nonce registry table exist at 0026
     with conn.cursor() as cur:
         cur.execute("""
             SELECT 1 FROM pg_indexes 
@@ -228,32 +230,34 @@ def main():
               AND tablename = 'statutory_auditors' 
               AND indexname = 'uq_statutory_auditors_gateway_nonce';
         """)
-        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0025"
+        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0026"
 
         cur.execute("""
             SELECT 1 FROM information_schema.tables 
             WHERE table_schema = 'public' 
               AND table_name = 'statutory_gateway_nonce_registry';
         """)
-        assert cur.fetchone() is not None, "statutory_gateway_nonce_registry table missing at 0025"
+        assert cur.fetchone() is not None, "statutory_gateway_nonce_registry table missing at 0026"
 
     # Verify all 21 tables have relforcerowsecurity=True
     for tbl in TENANT_TABLES_21:
-        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0025"
+        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0026"
     # Verify all 8 0020 policies present
     for p_name in POLICIES_0020_8:
         matching = [p for p in state_head["policies"] if p[2] == p_name]
-        assert len(matching) == 1, f"Policy {p_name} missing at 0025"
-    print("PASS: Head state (0025) completely verified.")
+        assert len(matching) == 1, f"Policy {p_name} missing at 0026"
+    print("PASS: Head state (0026) completely verified.")
 
-    print("\n=== Step 2-POPULATED: Populated-Record Migration Downgrade & Preservation Test ===")
+    print("\n=== Step 2-POPULATED: Populated-Record Migration Downgrade & Nonce Preservation Test ===")
     test_pop_aid = "CA-POPULATED-ROLLBACK-TEST"
     test_pop_mem = "777666"
     test_pop_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     test_pop_sref = "SESS-POPULATED-TEST-001"
+    test_pop_nonce = "POPULATED-GATEWAY-NONCE-ROLLBACK-TEST-001"
 
     with conn.cursor() as cur:
         # Clean any prior residue
+        cur.execute("DELETE FROM public.statutory_gateway_nonce_registry WHERE nonce = %s;", (test_pop_nonce,))
         cur.execute("DELETE FROM public.statutory_auditor_verification_events WHERE auditor_id = %s;", (test_pop_aid,))
         cur.execute("DELETE FROM public.statutory_auditors WHERE auditor_id = %s;", (test_pop_aid,))
 
@@ -284,13 +288,23 @@ def main():
             );
         """, (test_pop_aid, test_pop_mem, test_pop_sha, test_pop_sref))
 
-    print("  Populated 1 MANUAL_DOCUMENT_REVIEWED auditor record and 1 audit event.")
+        # Seed consumed gateway nonce
+        cur.execute("""
+            INSERT INTO public.statutory_gateway_nonce_registry (
+                nonce, issuer, kid, membership_no, evidence_ref, issued_at, expires_at, consumed_at, consumed_by
+            ) VALUES (
+                %s, 'TEST_GATEWAY_ISSUER', 'TEST_KEY_ID', %s, 'GATEWAY-EVIDENCE-001',
+                clock_timestamp(), clock_timestamp() + interval '1 hour', clock_timestamp(), 'AUDIT_POP_TEST'
+            );
+        """, (test_pop_nonce, test_pop_mem))
 
-    # Execute populated downgrade to 0024
-    print("  Executing Alembic downgrade to 0024 on populated database...")
-    run_cmd(["alembic", "downgrade", "0024_auditor_authentic_evidence"])
+    print("  Populated 1 MANUAL_DOCUMENT_REVIEWED auditor record, 1 audit event, and 1 consumed gateway nonce.")
 
-    # Verify safe downgrade policy enforcement
+    # Execute populated downgrade to 0025
+    print("  Executing Alembic downgrade to 0025 on populated database...")
+    run_cmd(["alembic", "downgrade", "0025_manual_review_and_nonce"])
+
+    # Verify safe downgrade policy and nonce preservation enforcement
     with conn.cursor() as cur:
         cur.execute("""
             SELECT verification_status, is_icai_verified, is_cop_verified,
@@ -313,13 +327,23 @@ def main():
         """, (test_pop_aid,))
         ev_count = cur.fetchone()[0]
         assert ev_count == 1, f"Audit event was deleted or lost on downgrade! Count: {ev_count}"
-    print("  PASS: Downgrade to 0024 safely preserved all evidence, audit events, and transitioned status cleanly.")
 
-    # Execute re-upgrade to Head (0025)
-    print("  Executing Alembic re-upgrade to Head (0025)...")
+        # CRITICAL REPLAY DEFENSE CHECK: Verify gateway nonce history is 100% preserved
+        cur.execute("""
+            SELECT nonce, membership_no, evidence_ref 
+            FROM public.statutory_gateway_nonce_registry
+            WHERE nonce = %s;
+        """, (test_pop_nonce,))
+        nonce_row = cur.fetchone()
+        assert nonce_row is not None, "CRITICAL DEFECT: Gateway nonce was DELETED or dropped on downgrade! (Replay vulnerability)"
+        assert nonce_row[0] == test_pop_nonce, "Gateway nonce corrupted on downgrade!"
+    print("  PASS: Downgrade to 0025 safely preserved all evidence, audit events, AND consumed gateway nonce history.")
+
+    # Execute re-upgrade to Head (0026)
+    print("  Executing Alembic re-upgrade to Head (0026)...")
     run_cmd(["alembic", "upgrade", "head"])
 
-    # Verify re-upgrade restored MANUAL_DOCUMENT_REVIEWED status
+    # Verify re-upgrade restored MANUAL_DOCUMENT_REVIEWED status & preserved nonce replay defense
     with conn.cursor() as cur:
         cur.execute("""
             SELECT verification_status, evidence_sha256, reviewer_session_ref
@@ -331,14 +355,50 @@ def main():
         assert row_restored[1] == test_pop_sha, "Evidence SHA-256 mismatch after re-upgrade!"
         assert row_restored[2] == test_pop_sref, "Reviewer session ref mismatch after re-upgrade!"
 
+        # Verify consumed nonce is still present and actively blocks replay
+        cur.execute("""
+            SELECT nonce FROM public.statutory_gateway_nonce_registry WHERE nonce = %s;
+        """, (test_pop_nonce,))
+        assert cur.fetchone() is not None, "Gateway nonce missing after re-upgrade!"
+
+        try:
+            cur.execute("""
+                INSERT INTO public.statutory_gateway_nonce_registry (
+                    nonce, issuer, kid, membership_no, evidence_ref, issued_at, expires_at, consumed_at, consumed_by
+                ) VALUES (
+                    %s, 'REPLAY_ATTACKER', 'TEST_KEY_ID', %s, 'REPLAY-EVIDENCE-001',
+                    clock_timestamp(), clock_timestamp() + interval '1 hour', clock_timestamp(), 'REPLAY_ATTACKER'
+                );
+            """, (test_pop_nonce, test_pop_mem))
+            raise AssertionError("Replay attack succeeded! Nonce registry failed to reject duplicate nonce after re-upgrade.")
+        except Exception as exc:
+            assert "duplicate key" in str(exc).lower() or "unique" in str(exc).lower() or "primary key" in str(exc).lower(), f"Unexpected error on duplicate nonce replay: {exc}"
+            print("  PASS: Replay attack presenting same gateway nonce after re-upgrade rejected by persistent PostgreSQL nonce registry constraint.")
+
         # Clean up test populated records before baseline rollback tests
+        cur.execute("DELETE FROM public.statutory_gateway_nonce_registry WHERE nonce = %s;", (test_pop_nonce,))
         cur.execute("DELETE FROM public.statutory_auditor_verification_events WHERE auditor_id = %s;", (test_pop_aid,))
         cur.execute("DELETE FROM public.statutory_auditors WHERE auditor_id = %s;", (test_pop_aid,))
-    print("PASS: Populated-state downgrade, evidence preservation, and re-upgrade completely verified.")
+    print("PASS: Populated-state downgrade, evidence preservation, nonce replay defense, and re-upgrade completely verified.")
 
-    print("\n=== Step 2a: Downgrade to 0024_auditor_authentic_evidence & Verify ===")
+    print("\n=== Step 2a: Downgrade to 0025_manual_review_and_nonce & Verify ===")
+    run_cmd(["alembic", "downgrade", "0025_manual_review_and_nonce"])
+    classify_and_verify_auditor_state(conn, "Step 2a: Downgrade 0025", "AUDITORS_VERIFIED_CLEAN")
+    state_0025 = capture_database_state(conn)
+    assert len(state_0025["grants"]) == 110, f"Expected 110 grants at 0025, got {len(state_0025['grants'])}"
+    assert len(state_0025["policies"]) == 95, f"Expected 95 policies at 0025, got {len(state_0025['policies'])}"
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM pg_indexes 
+            WHERE schemaname = 'public' 
+              AND tablename = 'statutory_auditors' 
+              AND indexname = 'uq_statutory_auditors_gateway_nonce';
+        """)
+        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce should remain at 0025"
+
+    print("\n=== Step 2a-2: Downgrade to 0024_auditor_authentic_evidence & Verify ===")
     run_cmd(["alembic", "downgrade", "0024_auditor_authentic_evidence"])
-    classify_and_verify_auditor_state(conn, "Step 2a: Downgrade 0024", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2a-2: Downgrade 0024", "AUDITORS_VERIFIED_CLEAN")
     state_0024 = capture_database_state(conn)
     assert len(state_0024["grants"]) == 110, f"Expected 110 grants at 0024, got {len(state_0024['grants'])}"
     assert len(state_0024["policies"]) == 95, f"Expected 95 policies at 0024, got {len(state_0024['policies'])}"
@@ -362,9 +422,9 @@ def main():
     run_cmd(["alembic", "downgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 2c: Clean Downgrade 0022", "AUDITORS_VERIFIED_CLEAN")
 
-    print("\n=== Step 2d: Re-upgrade to Head (0025_manual_review_and_nonce) ===")
+    print("\n=== Step 2d: Re-upgrade to Head (0026_gateway_nonce_and_audit) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0025", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0026", "AUDITORS_VERIFIED_CLEAN")
     print("PASS: Downgrade rollback and re-upgrade cycles verified with zero fake auditor identities.")
 
     print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
@@ -384,6 +444,8 @@ def main():
 
     print("\n=== Step 4: Downgrade to 0019_m3_gstr3b_filings & Assert Exact Baseline Match ===")
     run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS public.statutory_gateway_nonce_registry CASCADE;")
     classify_and_verify_auditor_state(conn, "Step 4: Downgrade 0019", "TABLE_NOT_PRESENT")
     rolled_back_state = capture_database_state(conn)
 
@@ -413,9 +475,9 @@ def main():
     assert rolled_back_state["rls_flags"] == trusted_ref["rls_flags"], "Rollback RLS flags mismatch with independent reference snapshot!"
     print("  PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.")
 
-    print("\n=== Step 5: Re-Upgrade to Head (0025_manual_review_and_nonce) ===")
+    print("\n=== Step 5: Re-Upgrade to Head (0026_gateway_nonce_and_audit) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0025", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0026", "AUDITORS_VERIFIED_CLEAN")
     final_head_state = capture_database_state(conn)
     assert final_head_state["grants"] == state_head["grants"]
     assert final_head_state["policies"] == state_head["policies"]
