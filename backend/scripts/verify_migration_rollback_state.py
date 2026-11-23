@@ -217,10 +217,10 @@ def main():
     classify_and_verify_auditor_state(conn, "Step 2: Head 0025", "AUDITORS_VERIFIED_CLEAN")
     state_head = capture_database_state(conn)
     print(f"  Head State (0025): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
-    assert len(state_head["grants"]) == 110, f"Expected 110 grants at 0025, got {len(state_head['grants'])}"
+    assert len(state_head["grants"]) == 112, f"Expected 112 grants at 0025, got {len(state_head['grants'])}"
     assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0025, got {len(state_head['policies'])}"
 
-    # Verify nonce index exists at 0025
+    # Verify nonce index and nonce registry table exist at 0025
     with conn.cursor() as cur:
         cur.execute("""
             SELECT 1 FROM pg_indexes 
@@ -230,6 +230,13 @@ def main():
         """)
         assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0025"
 
+        cur.execute("""
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+              AND table_name = 'statutory_gateway_nonce_registry';
+        """)
+        assert cur.fetchone() is not None, "statutory_gateway_nonce_registry table missing at 0025"
+
     # Verify all 21 tables have relforcerowsecurity=True
     for tbl in TENANT_TABLES_21:
         assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0025"
@@ -238,6 +245,96 @@ def main():
         matching = [p for p in state_head["policies"] if p[2] == p_name]
         assert len(matching) == 1, f"Policy {p_name} missing at 0025"
     print("PASS: Head state (0025) completely verified.")
+
+    print("\n=== Step 2-POPULATED: Populated-Record Migration Downgrade & Preservation Test ===")
+    test_pop_aid = "CA-POPULATED-ROLLBACK-TEST"
+    test_pop_mem = "777666"
+    test_pop_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    test_pop_sref = "SESS-POPULATED-TEST-001"
+
+    with conn.cursor() as cur:
+        # Clean any prior residue
+        cur.execute("DELETE FROM public.statutory_auditor_verification_events WHERE auditor_id = %s;", (test_pop_aid,))
+        cur.execute("DELETE FROM public.statutory_auditors WHERE auditor_id = %s;", (test_pop_aid,))
+
+        # Seed populated MANUAL_DOCUMENT_REVIEWED record and audit event
+        cur.execute("""
+            INSERT INTO public.statutory_auditors (
+                auditor_id, membership_no, name, role, cop_status, cop_valid_until,
+                approved_by, approved_at, is_revoked, verification_source, verification_status,
+                is_icai_verified, is_cop_verified, verified_at, verification_evidence_ref,
+                evidence_sha256, reviewer_session_ref
+            ) VALUES (
+                %s, %s, 'CA Populated Test', 'CHARTERED_ACCOUNTANT', 'ACTIVE', '2030-12-31',
+                'admin@myca.internal', clock_timestamp(), false, 'MANUAL_EVIDENCE_REVIEW', 'MANUAL_DOCUMENT_REVIEWED',
+                false, false, clock_timestamp(), 'MANUAL-EVIDENCE-SHA256:E3B0C44298FC1C14',
+                %s, %s
+            );
+        """, (test_pop_aid, test_pop_mem, test_pop_sha, test_pop_sref))
+
+        cur.execute("""
+            INSERT INTO public.statutory_auditor_verification_events (
+                auditor_id, membership_no, verification_method, verification_status,
+                evidence_ref, evidence_sha256, reviewer_id, reviewer_session_ref,
+                decision, decision_reason, created_at
+            ) VALUES (
+                %s, %s, 'MANUAL_REVIEW', 'MANUAL_DOCUMENT_REVIEWED',
+                'MANUAL-EVIDENCE-SHA256:E3B0C44298FC1C14', %s, 'ADMIN-TEST-01', %s,
+                'APPROVED', 'Test populated evidence review', clock_timestamp()
+            );
+        """, (test_pop_aid, test_pop_mem, test_pop_sha, test_pop_sref))
+
+    print("  Populated 1 MANUAL_DOCUMENT_REVIEWED auditor record and 1 audit event.")
+
+    # Execute populated downgrade to 0024
+    print("  Executing Alembic downgrade to 0024 on populated database...")
+    run_cmd(["alembic", "downgrade", "0024_auditor_authentic_evidence"])
+
+    # Verify safe downgrade policy enforcement
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT verification_status, is_icai_verified, is_cop_verified,
+                   evidence_sha256, reviewer_session_ref
+            FROM public.statutory_auditors
+            WHERE auditor_id = %s;
+        """, (test_pop_aid,))
+        row = cur.fetchone()
+        assert row is not None, "Populated auditor record was DELETED on downgrade! (Violation)"
+        assert row[0] == "PENDING_INDEPENDENT_VERIFICATION", f"Expected PENDING_INDEPENDENT_VERIFICATION on downgrade, got {row[0]}"
+        assert row[1] is False, "Record must NOT be converted to independently verified!"
+        assert row[2] is False, "COP must remain unverified!"
+        assert row[3] == test_pop_sha, f"Evidence SHA-256 corrupted or discarded on downgrade! Got: {row[3]}"
+        assert row[4] == test_pop_sref, f"Reviewer session reference discarded on downgrade! Got: {row[4]}"
+
+        # Verify audit ledger event is 100% preserved
+        cur.execute("""
+            SELECT COUNT(*) FROM public.statutory_auditor_verification_events
+            WHERE auditor_id = %s;
+        """, (test_pop_aid,))
+        ev_count = cur.fetchone()[0]
+        assert ev_count == 1, f"Audit event was deleted or lost on downgrade! Count: {ev_count}"
+    print("  PASS: Downgrade to 0024 safely preserved all evidence, audit events, and transitioned status cleanly.")
+
+    # Execute re-upgrade to Head (0025)
+    print("  Executing Alembic re-upgrade to Head (0025)...")
+    run_cmd(["alembic", "upgrade", "head"])
+
+    # Verify re-upgrade restored MANUAL_DOCUMENT_REVIEWED status
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT verification_status, evidence_sha256, reviewer_session_ref
+            FROM public.statutory_auditors
+            WHERE auditor_id = %s;
+        """, (test_pop_aid,))
+        row_restored = cur.fetchone()
+        assert row_restored[0] == "MANUAL_DOCUMENT_REVIEWED", f"Expected MANUAL_DOCUMENT_REVIEWED after re-upgrade, got {row_restored[0]}"
+        assert row_restored[1] == test_pop_sha, "Evidence SHA-256 mismatch after re-upgrade!"
+        assert row_restored[2] == test_pop_sref, "Reviewer session ref mismatch after re-upgrade!"
+
+        # Clean up test populated records before baseline rollback tests
+        cur.execute("DELETE FROM public.statutory_auditor_verification_events WHERE auditor_id = %s;", (test_pop_aid,))
+        cur.execute("DELETE FROM public.statutory_auditors WHERE auditor_id = %s;", (test_pop_aid,))
+    print("PASS: Populated-state downgrade, evidence preservation, and re-upgrade completely verified.")
 
     print("\n=== Step 2a: Downgrade to 0024_auditor_authentic_evidence & Verify ===")
     run_cmd(["alembic", "downgrade", "0024_auditor_authentic_evidence"])

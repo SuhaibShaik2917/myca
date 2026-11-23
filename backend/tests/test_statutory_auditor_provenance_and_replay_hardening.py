@@ -36,6 +36,7 @@ from sqlalchemy import text, event
 
 from tests.test_db_config import get_admin_session
 from app.database import SessionLocal, engine
+from app.core.security import create_access_token
 from app.modules.reconciliation.itc_engine import (
     validate_auditor_credentials,
     onboard_verified_statutory_auditor,
@@ -114,14 +115,93 @@ class MockFailingSession:
 
 @pytest.fixture
 def clean_test_auditor_env():
-    """Provides isolated test auditor ID and ensures complete cleanup on teardown."""
+    """Provides isolated test auditor ID, genuine test organization and users, and ensures complete cleanup on teardown."""
     admin_db = get_admin_session()
     test_id = f"CA-AUDIT-TEST-{uuid.uuid4().hex[:8].upper()}"
     mem_no = f"{uuid.uuid4().int % 900000 + 100000}"  # Genuine 6-digit number
 
-    yield {"id": test_id, "mem_no": mem_no, "admin_db": admin_db}
+    # Provision authentic test organization, users, and organization memberships
+    test_org_id = str(uuid.uuid4())
+    test_admin_user_id = str(uuid.uuid4())
+    test_admin_email = f"compliance.officer.{uuid.uuid4().hex[:6]}@myca.test"
+    test_viewer_user_id = str(uuid.uuid4())
+    test_viewer_email = f"viewer.{uuid.uuid4().hex[:6]}@myca.test"
+    test_uploader_user_id = str(uuid.uuid4())
+    test_uploader_email = f"uploader.{uuid.uuid4().hex[:6]}@myca.test"
+    test_inactive_user_id = str(uuid.uuid4())
+    test_inactive_email = f"inactive.{uuid.uuid4().hex[:6]}@myca.test"
+
+    pan = f"AAACP{uuid.uuid4().int % 9000 + 1000}K"
+    admin_db.execute(
+        text("INSERT INTO public.organizations (id, legal_name, pan) VALUES (:oid, 'Auditor Test Org', :pan);"),
+        {"oid": test_org_id, "pan": pan}
+    )
+    admin_db.execute(
+        text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:uid, :email, 'Compliance Officer', true);"),
+        {"uid": test_admin_user_id, "email": test_admin_email}
+    )
+    admin_db.execute(
+        text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:uid, :email, 'Viewer User', true);"),
+        {"uid": test_viewer_user_id, "email": test_viewer_email}
+    )
+    admin_db.execute(
+        text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:uid, :email, 'Uploader Officer', true);"),
+        {"uid": test_uploader_user_id, "email": test_uploader_email}
+    )
+    admin_db.execute(
+        text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:uid, :email, 'Inactive Officer', false);"),
+        {"uid": test_inactive_user_id, "email": test_inactive_email}
+    )
+
+    admin_db.execute(
+        text("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (:oid, :uid, 'admin', 'active');"),
+        {"oid": test_org_id, "uid": test_admin_user_id}
+    )
+    admin_db.execute(
+        text("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (:oid, :uid, 'viewer', 'active');"),
+        {"oid": test_org_id, "uid": test_viewer_user_id}
+    )
+    admin_db.execute(
+        text("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (:oid, :uid, 'viewer', 'active');"),
+        {"oid": test_org_id, "uid": test_uploader_user_id}
+    )
+    admin_db.execute(
+        text("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (:oid, :uid, 'admin', 'active');"),
+        {"oid": test_org_id, "uid": test_inactive_user_id}
+    )
+    admin_db.commit()
+
+    admin_token = create_access_token(subject=test_admin_user_id, org_id=test_org_id)
+    viewer_token = create_access_token(subject=test_viewer_user_id, org_id=test_org_id)
+    uploader_token = create_access_token(subject=test_uploader_user_id, org_id=test_org_id)
+    inactive_token = create_access_token(subject=test_inactive_user_id, org_id=test_org_id)
+
+    env_dict = {
+        "id": test_id,
+        "mem_no": mem_no,
+        "admin_db": admin_db,
+        "org_id": test_org_id,
+        "admin_user_id": test_admin_user_id,
+        "admin_email": test_admin_email,
+        "admin_token": admin_token,
+        "viewer_user_id": test_viewer_user_id,
+        "viewer_email": test_viewer_email,
+        "viewer_token": viewer_token,
+        "uploader_user_id": test_uploader_user_id,
+        "uploader_email": test_uploader_email,
+        "uploader_token": uploader_token,
+        "inactive_user_id": test_inactive_user_id,
+        "inactive_email": test_inactive_email,
+        "inactive_token": inactive_token,
+    }
+
+    yield env_dict
 
     try:
+        admin_db.execute(
+            text("DELETE FROM public.statutory_gateway_nonce_registry WHERE membership_no = :mem;"),
+            {"mem": mem_no}
+        )
         admin_db.execute(
             text("DELETE FROM public.statutory_audit_signature_replays WHERE verifier_id = :vid;"),
             {"vid": test_id}
@@ -133,6 +213,18 @@ def clean_test_auditor_env():
         admin_db.execute(
             text("DELETE FROM public.statutory_auditors WHERE auditor_id = :vid;"),
             {"vid": test_id}
+        )
+        admin_db.execute(
+            text("DELETE FROM public.organization_memberships WHERE org_id = :oid;"),
+            {"oid": test_org_id}
+        )
+        admin_db.execute(
+            text("DELETE FROM public.global_users WHERE id IN (:u1, :u2, :u3, :u4);"),
+            {"u1": test_admin_user_id, "u2": test_viewer_user_id, "u3": test_uploader_user_id, "u4": test_inactive_user_id}
+        )
+        admin_db.execute(
+            text("DELETE FROM public.organizations WHERE id = :oid;"),
+            {"oid": test_org_id}
         )
         admin_db.commit()
     except Exception:
@@ -446,26 +538,31 @@ def test_icai_gateway_cryptographic_verification_claims_and_replay(clean_test_au
     6. Claim mismatch (e.g. mismatched membership number) fails with CLAIM_MISMATCH.
     7. Replayed nonce fails with NONCE_REPLAY_DETECTED.
     """
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
     ev_ref = f"ICAI-GATEWAY-REF-{uuid.uuid4().hex[:8]}"
     cop_date = datetime(2030, 12, 31).date()
+    step1_nonce = f"NONCE-UNIQUE-{uuid.uuid4().hex[:8]}"
 
     # 1. Valid signed response
     token = make_test_gateway_token(
         membership_no=m_no,
         evidence_ref=ev_ref,
         cop_valid_until=cop_date,
-        nonce="NONCE-UNIQUE-001"
+        nonce=step1_nonce
     )
     ok, msg, data = verify_icai_gateway_signed_response(
         signed_token=token,
         expected_membership_no=m_no,
         expected_cop_valid_until=cop_date,
-        environment="test"
+        environment="test",
+        db=admin_db,
+        auditor_id=vid
     )
     assert ok is True
     assert data["kid"] == TEST_KEY_ID
-    assert data["jti"] == "NONCE-UNIQUE-001"
+    assert data["jti"] == step1_nonce
 
     # 2. Tampered signature fails
     tampered_token = token[:-8] + "ABCDEF12"
@@ -473,7 +570,9 @@ def test_icai_gateway_cryptographic_verification_claims_and_replay(clean_test_au
         signed_token=tampered_token,
         expected_membership_no=m_no,
         expected_cop_valid_until=cop_date,
-        environment="test"
+        environment="test",
+        db=admin_db,
+        auditor_id=vid
     )
     assert ok_tamp is False
     assert "Signature verification failed" in msg_tamp or "CRYPTOGRAPHIC_VERIFICATION_FAILED" in msg_tamp
@@ -488,7 +587,9 @@ def test_icai_gateway_cryptographic_verification_claims_and_replay(clean_test_au
         signed_token=token_bad_kid,
         expected_membership_no=m_no,
         expected_cop_valid_until=cop_date,
-        environment="test"
+        environment="test",
+        db=admin_db,
+        auditor_id=vid
     )
     assert ok_kid is False
     assert "UNKNOWN_KEY" in msg_kid
@@ -505,7 +606,9 @@ def test_icai_gateway_cryptographic_verification_claims_and_replay(clean_test_au
         signed_token=token_exp,
         expected_membership_no=m_no,
         expected_cop_valid_until=cop_date,
-        environment="test"
+        environment="test",
+        db=admin_db,
+        auditor_id=vid
     )
     assert ok_exp is False
     assert "EXPIRED_GATEWAY_TOKEN" in msg_exp or "Signature has expired" in msg_exp
@@ -522,7 +625,9 @@ def test_icai_gateway_cryptographic_verification_claims_and_replay(clean_test_au
         signed_token=token_rev,
         expected_membership_no=m_no,
         expected_cop_valid_until=cop_date,
-        environment="test"
+        environment="test",
+        db=admin_db,
+        auditor_id=vid
     )
     assert ok_rev is False
     assert "REVOKED" in msg_rev or "KEY_REVOKED" in msg_rev
@@ -538,21 +643,25 @@ def test_icai_gateway_cryptographic_verification_claims_and_replay(clean_test_au
         signed_token=token_claim,
         expected_membership_no="999999",  # mismatched
         expected_cop_valid_until=cop_date,
-        environment="test"
+        environment="test",
+        db=admin_db,
+        auditor_id=vid
     )
     assert ok_claim is False
     assert "MISMATCH" in msg_claim or "CLAIM_MISMATCH" in msg_claim
 
     # 7. Replayed nonce (jti) fails
-    # token has nonce "NONCE-UNIQUE-001" which was registered in step 1
+    # token has nonce step1_nonce which was registered in step 1
     ok_replay, msg_replay, _ = verify_icai_gateway_signed_response(
         signed_token=token,
         expected_membership_no=m_no,
         expected_cop_valid_until=cop_date,
-        environment="test"
+        environment="test",
+        db=admin_db,
+        auditor_id=vid
     )
     assert ok_replay is False
-    assert "NONCE_REPLAY" in msg_replay or "already been consumed" in msg_replay
+    assert "GATEWAY_NONCE_REPLAY" in msg_replay or "already been consumed" in msg_replay
 
 
 def test_icai_gateway_unconfigured_production_fails_closed(clean_test_auditor_env):
@@ -639,24 +748,22 @@ def test_gateway_symmetric_hs256_prohibited_in_production(clean_test_auditor_env
 def test_manual_evidence_review_provenance_success(clean_test_auditor_env):
     """
     Verifies successful manual review verification:
-    - Server computes SHA-256 over uploaded document bytes.
-    - Validates authorized reviewer role (STATUTORY_AUDITOR_ADMIN).
+    - Server validates authenticated principal access token.
+    - Server verifies user existence and active status in global_users.
+    - Server queries authoritative role from organization_memberships (admin/owner).
+    - Server computes SHA-256 over raw uploaded document bytes.
     - Enforces maker-checker (uploader != reviewer).
     - Logs immutable event in statutory_auditor_verification_events.
     """
     admin_db = clean_test_auditor_env["admin_db"]
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
+    admin_token = clean_test_auditor_env["admin_token"]
+    admin_user_id = clean_test_auditor_env["admin_user_id"]
+    admin_email = clean_test_auditor_env["admin_email"]
+    uploader_id = clean_test_auditor_env["uploader_user_id"]
     doc_bytes = b"%PDF-1.4 Mock ICAI Member Card and COP Certificate for test auditor"
     computed_hash = hashlib.sha256(doc_bytes).hexdigest()
-
-    reviewer_ctx = {
-        "user_id": "OFFICER-COMPLIANCE-01",
-        "email": "compliance.officer@myca.internal",
-        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
-        "is_active": True,
-        "session_id": f"SESS-{uuid.uuid4().hex[:12]}"
-    }
 
     auditor = onboard_verified_statutory_auditor(
         db=admin_db,
@@ -664,12 +771,12 @@ def test_manual_evidence_review_provenance_success(clean_test_auditor_env):
         membership_no=m_no,
         name="CA Manual Review Pass",
         role="CHARTERED_ACCOUNTANT",
-        approved_by="OFFICER-COMPLIANCE-01",
+        approved_by=admin_email,
         cop_valid_until=datetime(2030, 12, 31).date(),
         verification_source="MANUAL_EVIDENCE_REVIEW",
         document_bytes=doc_bytes,
-        reviewer_context=reviewer_ctx,
-        uploader_id="OPERATOR-UPLOADER-02",  # Maker != Checker
+        auth_token=admin_token,
+        uploader_id=uploader_id,  # Maker != Checker
         environment="test"
     )
 
@@ -687,7 +794,7 @@ def test_manual_evidence_review_provenance_success(clean_test_auditor_env):
     r_map = row._mapping
     assert r_map["evidence_sha256"] == computed_hash
     assert r_map["decision"] == "APPROVED"
-    assert r_map["reviewer_id"] == "OFFICER-COMPLIANCE-01"
+    assert r_map["reviewer_id"] == admin_user_id
     assert r_map["verification_status"] == "MANUAL_DOCUMENT_REVIEWED"
 
     # Verify credential lookup succeeds with explicit human-reviewed documentary disclosure
@@ -700,18 +807,139 @@ def test_manual_evidence_review_provenance_success(clean_test_auditor_env):
         app_db.close()
 
 
-def test_manual_evidence_review_unauthorized_role_rejected(clean_test_auditor_env):
-    """Verifies that a reviewer without an authorized compliance role is rejected."""
+def test_manual_evidence_review_unauthenticated_rejected(clean_test_auditor_env):
+    """Verifies that an unauthenticated caller without a Bearer token is rejected."""
     admin_db = clean_test_auditor_env["admin_db"]
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
-    doc_bytes = b"Dummy certificate bytes"
+    doc_bytes = b"%PDF-1.4 Dummy certificate bytes"
 
-    reviewer_ctx = {
-        "user_id": "STANDARD-USER-01",
-        "roles": ["STANDARD_USER", "VIEWER"],  # Unauthorized role
+    try:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id=vid,
+            membership_no=m_no,
+            name="CA Unauthenticated",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by="OFFICER-01",
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            verification_source="MANUAL_EVIDENCE_REVIEW",
+            document_bytes=doc_bytes,
+            auth_token=None,  # No token!
+            uploader_id="OTHER-01",
+            environment="test"
+        )
+        assert False, "Should fail without authenticated token"
+    except ValueError as ex:
+        assert "UNAUTHENTICATED_REVIEWER" in str(ex)
+
+
+def test_manual_evidence_review_missing_user_in_global_users_rejected(clean_test_auditor_env):
+    """Verifies that a token with a user ID not present in global_users is rejected."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    org_id = clean_test_auditor_env["org_id"]
+    doc_bytes = b"%PDF-1.4 Dummy certificate bytes"
+    fake_user_id = str(uuid.uuid4())
+    fake_token = create_access_token(subject=fake_user_id, org_id=org_id)
+
+    try:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id=vid,
+            membership_no=m_no,
+            name="CA Fake User",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by="FAKE-ADMIN",
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            verification_source="MANUAL_EVIDENCE_REVIEW",
+            document_bytes=doc_bytes,
+            auth_token=fake_token,
+            uploader_id="OTHER-01",
+            environment="test"
+        )
+        assert False, "Should fail with unregistered reviewer"
+    except ValueError as ex:
+        assert "UNREGISTERED_REVIEWER" in str(ex)
+
+
+def test_manual_evidence_review_inactive_user_rejected(clean_test_auditor_env):
+    """Verifies that an inactive/suspended user in global_users is rejected."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    inactive_token = clean_test_auditor_env["inactive_token"]
+    inactive_email = clean_test_auditor_env["inactive_email"]
+    doc_bytes = b"%PDF-1.4 Dummy certificate bytes"
+
+    try:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id=vid,
+            membership_no=m_no,
+            name="CA Inactive User",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by=inactive_email,
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            verification_source="MANUAL_EVIDENCE_REVIEW",
+            document_bytes=doc_bytes,
+            auth_token=inactive_token,
+            uploader_id="OTHER-01",
+            environment="test"
+        )
+        assert False, "Should fail with inactive reviewer"
+    except ValueError as ex:
+        assert "INACTIVE_REVIEWER" in str(ex)
+
+
+def test_manual_evidence_review_unauthorized_role_rejected(clean_test_auditor_env):
+    """Verifies that a user with non-admin/non-owner role (e.g. viewer) is rejected."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    viewer_token = clean_test_auditor_env["viewer_token"]
+    viewer_email = clean_test_auditor_env["viewer_email"]
+    doc_bytes = b"%PDF-1.4 Dummy certificate bytes"
+
+    try:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id=vid,
+            membership_no=m_no,
+            name="CA Unauthorized Role",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by=viewer_email,
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            verification_source="MANUAL_EVIDENCE_REVIEW",
+            document_bytes=doc_bytes,
+            auth_token=viewer_token,
+            uploader_id="OTHER-01",
+            environment="test"
+        )
+        assert False, "Should fail with unauthorized reviewer role"
+    except ValueError as ex:
+        assert "UNAUTHORIZED_REVIEWER_ROLE" in str(ex) or "INSUFFICIENT_PERMISSIONS" in str(ex)
+
+
+def test_manual_evidence_review_caller_supplied_roles_ignored_and_rejected(clean_test_auditor_env):
+    """
+    Verifies that caller-supplied claims/roles in reviewer_context are strictly ignored:
+    A viewer attempting to self-elevate by passing roles=['admin', 'STATUTORY_AUDITOR_ADMIN']
+    is still rejected because the server queries organization_memberships in PostgreSQL.
+    """
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    viewer_token = clean_test_auditor_env["viewer_token"]
+    doc_bytes = b"%PDF-1.4 Dummy certificate bytes"
+
+    spoofed_ctx = {
+        "access_token": viewer_token,
+        "roles": ["admin", "owner", "STATUTORY_AUDITOR_ADMIN", "CHIEF_COMPLIANCE_OFFICER"],
         "is_active": True,
-        "session_id": "SESS-001"
+        "can_verify_statutory_auditors": True,
+        "approved_by": "CHIEF_AUDITOR"
     }
 
     try:
@@ -719,19 +947,51 @@ def test_manual_evidence_review_unauthorized_role_rejected(clean_test_auditor_en
             db=admin_db,
             auditor_id=vid,
             membership_no=m_no,
-            name="CA Unauthorized Reviewer",
+            name="CA Spoofed Roles",
             role="CHARTERED_ACCOUNTANT",
-            approved_by="STANDARD-USER-01",
+            approved_by="CHIEF_AUDITOR",
             cop_valid_until=datetime(2030, 12, 31).date(),
             verification_source="MANUAL_EVIDENCE_REVIEW",
             document_bytes=doc_bytes,
-            reviewer_context=reviewer_ctx,
-            uploader_id="OPERATOR-01",
+            reviewer_context=spoofed_ctx,
+            uploader_id="OTHER-01",
             environment="test"
         )
-        assert False, "Should fail with unauthorized reviewer"
+        assert False, "Should reject caller-supplied roles and query DB"
     except ValueError as ex:
-        assert "INSUFFICIENT_PERMISSIONS" in str(ex) or "UNAUTHORIZED_REVIEWER_ROLE" in str(ex)
+        assert "UNAUTHORIZED_REVIEWER_ROLE" in str(ex)
+
+
+def test_manual_evidence_review_expired_token_rejected(clean_test_auditor_env):
+    """Verifies that an expired Bearer access token is rejected."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    admin_user_id = clean_test_auditor_env["admin_user_id"]
+    org_id = clean_test_auditor_env["org_id"]
+    doc_bytes = b"%PDF-1.4 Dummy certificate bytes"
+
+    # Generate an expired token (expires_minutes=-30)
+    expired_token = create_access_token(subject=admin_user_id, org_id=org_id, expires_minutes=-30)
+
+    try:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id=vid,
+            membership_no=m_no,
+            name="CA Expired Token",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by="ADMIN",
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            verification_source="MANUAL_EVIDENCE_REVIEW",
+            document_bytes=doc_bytes,
+            auth_token=expired_token,
+            uploader_id="OTHER-01",
+            environment="test"
+        )
+        assert False, "Should fail with expired token"
+    except ValueError as ex:
+        assert "INVALID_REVIEWER_SESSION" in str(ex) or "expired" in str(ex).lower()
 
 
 def test_manual_evidence_review_maker_checker_rejected(clean_test_auditor_env):
@@ -739,28 +999,45 @@ def test_manual_evidence_review_maker_checker_rejected(clean_test_auditor_env):
     admin_db = clean_test_auditor_env["admin_db"]
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
-    doc_bytes = b"Dummy certificate bytes"
+    admin_token = clean_test_auditor_env["admin_token"]
+    admin_user_id = clean_test_auditor_env["admin_user_id"]
+    admin_email = clean_test_auditor_env["admin_email"]
+    doc_bytes = b"%PDF-1.4 Dummy certificate bytes"
 
-    reviewer_ctx = {
-        "user_id": "OPERATOR-SAME-01",
-        "roles": ["STATUTORY_AUDITOR_ADMIN"],
-        "is_active": True,
-        "session_id": "SESS-SAME-01"
-    }
-
+    # 1. Test by matching user_id
     try:
         onboard_verified_statutory_auditor(
             db=admin_db,
             auditor_id=vid,
             membership_no=m_no,
-            name="CA Maker Checker Violation",
+            name="CA Maker Checker UserID",
             role="CHARTERED_ACCOUNTANT",
-            approved_by="OPERATOR-SAME-01",
+            approved_by=admin_email,
             cop_valid_until=datetime(2030, 12, 31).date(),
             verification_source="MANUAL_EVIDENCE_REVIEW",
             document_bytes=doc_bytes,
-            reviewer_context=reviewer_ctx,
-            uploader_id="OPERATOR-SAME-01",  # Same as reviewer!
+            auth_token=admin_token,
+            uploader_id=admin_user_id,  # Same as reviewer user_id!
+            environment="test"
+        )
+        assert False, "Should fail with maker-checker violation"
+    except ValueError as ex:
+        assert "MAKER_CHECKER_VIOLATION" in str(ex)
+
+    # 2. Test by matching email
+    try:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id=vid,
+            membership_no=m_no,
+            name="CA Maker Checker Email",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by=admin_email,
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            verification_source="MANUAL_EVIDENCE_REVIEW",
+            document_bytes=doc_bytes,
+            auth_token=admin_token,
+            uploader_id=admin_email,  # Same as reviewer email!
             environment="test"
         )
         assert False, "Should fail with maker-checker violation"
@@ -773,15 +1050,11 @@ def test_manual_evidence_review_tampered_document_bytes_rejected(clean_test_audi
     admin_db = clean_test_auditor_env["admin_db"]
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
-    doc_bytes = b"Genuine certificate bytes"
+    admin_token = clean_test_auditor_env["admin_token"]
+    admin_email = clean_test_auditor_env["admin_email"]
+    uploader_id = clean_test_auditor_env["uploader_user_id"]
+    doc_bytes = b"%PDF-1.4 Genuine certificate bytes"
     fake_hash = hashlib.sha256(b"Tampered different bytes").hexdigest()
-
-    reviewer_ctx = {
-        "user_id": "ADMIN-01",
-        "roles": ["STATUTORY_AUDITOR_ADMIN"],
-        "is_active": True,
-        "session_id": "SESS-01"
-    }
 
     try:
         onboard_verified_statutory_auditor(
@@ -790,12 +1063,12 @@ def test_manual_evidence_review_tampered_document_bytes_rejected(clean_test_audi
             membership_no=m_no,
             name="CA Hash Mismatch",
             role="CHARTERED_ACCOUNTANT",
-            approved_by="ADMIN-01",
+            approved_by=admin_email,
             cop_valid_until=datetime(2030, 12, 31).date(),
             verification_source="MANUAL_EVIDENCE_REVIEW",
             document_bytes=doc_bytes,
-            reviewer_context=reviewer_ctx,
-            uploader_id="UPLOADER-01",
+            auth_token=admin_token,
+            uploader_id=uploader_id,
             claimed_evidence_sha256=fake_hash,
             environment="test"
         )
@@ -808,12 +1081,7 @@ def test_manual_review_missing_db_fails_closed(clean_test_auditor_env):
     """Verifies that verify_manual_evidence_review fails closed when db is None."""
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
-    reviewer_ctx = {
-        "user_id": "OFFICER-01",
-        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
-        "is_active": True,
-        "session_id": "SESS-01"
-    }
+    admin_token = clean_test_auditor_env["admin_token"]
     ok, msg, data = verify_manual_evidence_review(
         db=None,
         auditor_id=vid,
@@ -821,49 +1089,46 @@ def test_manual_review_missing_db_fails_closed(clean_test_auditor_env):
         cop_status="ACTIVE",
         cop_valid_until=datetime(2030, 12, 31).date(),
         document_bytes=b"%PDF-1.4 genuine content",
-        reviewer_context=reviewer_ctx,
+        auth_token=admin_token,
         uploader_id="OTHER-01"
     )
     assert ok is False
     assert "DATABASE_UNAVAILABLE" in msg
 
 
-def test_manual_review_inactive_reviewer_fails_closed(clean_test_auditor_env):
-    """Verifies that an inactive/suspended reviewer is rejected."""
-    admin_db = clean_test_auditor_env["admin_db"]
-    vid = clean_test_auditor_env["id"]
-    m_no = clean_test_auditor_env["mem_no"]
-    reviewer_ctx = {
-        "user_id": "OFFICER-INACTIVE",
-        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
-        "is_active": False,
-        "session_id": "SESS-INACTIVE"
-    }
-    ok, msg, data = verify_manual_evidence_review(
-        db=admin_db,
-        auditor_id=vid,
-        membership_no=m_no,
-        cop_status="ACTIVE",
-        cop_valid_until=datetime(2030, 12, 31).date(),
-        document_bytes=b"%PDF-1.4 genuine content",
-        reviewer_context=reviewer_ctx,
-        uploader_id="OTHER-01"
-    )
-    assert ok is False
-    assert "INACTIVE_REVIEWER" in msg
-
-
 def test_manual_review_audit_event_persistence_failure_fails_closed(clean_test_auditor_env):
     """Verifies that if audit event persistence fails, verification fails closed (no swallowed exceptions)."""
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
-    failing_db = MockFailingSession()
-    reviewer_ctx = {
-        "user_id": "OFFICER-01",
-        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
-        "is_active": True,
-        "session_id": "SESS-01"
-    }
+    admin_token = clean_test_auditor_env["admin_token"]
+    admin_user_id = clean_test_auditor_env["admin_user_id"]
+    admin_email = clean_test_auditor_env["admin_email"]
+
+    class MockAuditEventFailingSession:
+        def execute(self, statement, params=None):
+            s = str(statement)
+            if "FROM public.global_users" in s:
+                class MockUserRes:
+                    def fetchone(self):
+                        class MockUserRow:
+                            _mapping = {"id": admin_user_id, "email": admin_email, "full_name": "Compliance Admin", "is_active": True}
+                        return MockUserRow()
+                return MockUserRes()
+            if "FROM public.organization_memberships" in s:
+                class MockMemRes:
+                    def fetchone(self):
+                        class MockMemRow:
+                            _mapping = {"role": "admin", "status": "active"}
+                        return MockMemRow()
+                return MockMemRes()
+            if "statutory_auditor_verification_events" in s:
+                raise ConnectionError("Simulated database failure during audit event persistence")
+            return None
+
+        def rollback(self):
+            pass
+
+    failing_db = MockAuditEventFailingSession()
     ok, msg, data = verify_manual_evidence_review(
         db=failing_db,
         auditor_id=vid,
@@ -871,7 +1136,7 @@ def test_manual_review_audit_event_persistence_failure_fails_closed(clean_test_a
         cop_status="ACTIVE",
         cop_valid_until=datetime(2030, 12, 31).date(),
         document_bytes=b"%PDF-1.4 genuine content",
-        reviewer_context=reviewer_ctx,
+        auth_token=admin_token,
         uploader_id="OTHER-01"
     )
     assert ok is False
@@ -886,14 +1151,10 @@ def test_manual_review_cannot_self_assert_independently_verified(clean_test_audi
     admin_db = clean_test_auditor_env["admin_db"]
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
+    admin_token = clean_test_auditor_env["admin_token"]
+    admin_email = clean_test_auditor_env["admin_email"]
+    uploader_id = clean_test_auditor_env["uploader_user_id"]
     doc_bytes = b"%PDF-1.4 Mock ICAI Member Card and COP Certificate"
-
-    reviewer_ctx = {
-        "user_id": "OFFICER-COMPLIANCE-02",
-        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
-        "is_active": True,
-        "session_id": f"SESS-{uuid.uuid4().hex[:12]}"
-    }
 
     auditor = onboard_verified_statutory_auditor(
         db=admin_db,
@@ -901,13 +1162,13 @@ def test_manual_review_cannot_self_assert_independently_verified(clean_test_audi
         membership_no=m_no,
         name="CA No Conflation",
         role="CHARTERED_ACCOUNTANT",
-        approved_by="OFFICER-COMPLIANCE-02",
+        approved_by=admin_email,
         cop_valid_until=datetime(2030, 12, 31).date(),
         verification_source="MANUAL_EVIDENCE_REVIEW",
         verification_status="INDEPENDENTLY_VERIFIED",  # Self-assertion attempt
         document_bytes=doc_bytes,
-        reviewer_context=reviewer_ctx,
-        uploader_id="OPERATOR-UPLOADER-03",
+        auth_token=admin_token,
+        uploader_id=uploader_id,
         environment="test"
     )
 
@@ -1243,3 +1504,209 @@ def test_signature_replay_db_failure_fails_closed_no_in_memory_fallback():
     )
     assert ok is False
     assert "DATABASE_TRANSACTION_FAILURE" in msg
+
+
+# ============================================================================
+# PART 5: ATOMIC PERSISTENT ICAI GATEWAY NONCE CONSUMPTION & REPLAY DEFENSE
+# ============================================================================
+
+def test_conclusive_gateway_nonce_atomic_concurrency_race(clean_test_auditor_env):
+    """
+    Rigorously tests concurrent gateway nonce consumption across distinct DB sessions:
+    Two worker threads strike verify_icai_gateway_signed_response simultaneously
+    with the exact same gateway token/nonce.
+    Asserts:
+    1. Exactly 1 worker succeeds with GATEWAY_VERIFIED.
+    2. Exactly 1 worker receives GATEWAY_NONCE_REPLAY.
+    3. Exactly 1 row exists in public.statutory_gateway_nonce_registry.
+    """
+    admin_db = clean_test_auditor_env["admin_db"]
+    m_no = clean_test_auditor_env["mem_no"]
+    ev_ref = f"ICAI-RACE-REF-{uuid.uuid4().hex[:8]}"
+    cop_date = datetime(2030, 12, 31).date()
+    race_nonce = f"NONCE-RACE-{uuid.uuid4().hex[:12]}"
+
+    token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=ev_ref,
+        cop_valid_until=cop_date,
+        nonce=race_nonce
+    )
+
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def worker(worker_id):
+        session = SessionLocal()
+        try:
+            barrier.wait(timeout=10)
+            ok, msg, data = verify_icai_gateway_signed_response(
+                signed_token=token,
+                expected_membership_no=m_no,
+                expected_cop_valid_until=cop_date,
+                environment="test",
+                db=session,
+                auditor_id=f"AUDITOR-RACE-{worker_id}"
+            )
+            results.append((worker_id, ok, msg))
+        except Exception as ex:
+            errors.append((worker_id, ex))
+        finally:
+            session.close()
+
+    t1 = threading.Thread(target=worker, args=(1,))
+    t2 = threading.Thread(target=worker, args=(2,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert not errors, f"Unexpected thread errors during race: {errors}"
+    assert len(results) == 2, f"Expected 2 results, got {len(results)}"
+
+    successes = [r for r in results if r[1] is True]
+    replays = [r for r in results if r[1] is False]
+
+    assert len(successes) == 1, f"Expected exactly 1 success, got {len(successes)}: {results}"
+    assert len(replays) == 1, f"Expected exactly 1 replay detection, got {len(replays)}: {results}"
+    assert "GATEWAY_NONCE_REPLAY" in replays[0][2]
+
+    # Verify exactly 1 row in dedicated database table
+    count = admin_db.execute(
+        text("SELECT count(*) FROM public.statutory_gateway_nonce_registry WHERE nonce = :n;"),
+        {"n": race_nonce}
+    ).scalar()
+    assert count == 1, f"Expected exactly 1 registry entry in DB, found {count}"
+
+
+def test_gateway_nonce_cross_auditor_reuse_rejected(clean_test_auditor_env):
+    """Verifies that the same gateway token/nonce cannot be reused for a different auditor."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    m_no_1 = clean_test_auditor_env["mem_no"]
+    cop_date = datetime(2030, 12, 31).date()
+    reuse_nonce = f"NONCE-CROSS-{uuid.uuid4().hex[:12]}"
+    ev_ref = f"ICAI-CROSS-REF-{uuid.uuid4().hex[:8]}"
+
+    token = make_test_gateway_token(
+        membership_no=m_no_1,
+        evidence_ref=ev_ref,
+        cop_valid_until=cop_date,
+        nonce=reuse_nonce
+    )
+
+    # First consumption on auditor 1 succeeds
+    ok1, msg1, data1 = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no_1,
+        expected_cop_valid_until=cop_date,
+        environment="test",
+        db=admin_db,
+        auditor_id="AUDITOR-CROSS-1"
+    )
+    assert ok1 is True
+
+    # Second consumption attempt on auditor 2 with same nonce fails
+    ok2, msg2, data2 = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no_1,
+        expected_cop_valid_until=cop_date,
+        environment="test",
+        db=admin_db,
+        auditor_id="AUDITOR-CROSS-2"
+    )
+    assert ok2 is False
+    assert "GATEWAY_NONCE_REPLAY" in msg2
+
+
+def test_gateway_nonce_restart_replay_defense(clean_test_auditor_env):
+    """
+    Verifies persistent database anti-replay across process/memory restarts:
+    Clearing test trust store (in-memory state) does NOT erase consumed nonces in PostgreSQL.
+    """
+    admin_db = clean_test_auditor_env["admin_db"]
+    m_no = clean_test_auditor_env["mem_no"]
+    cop_date = datetime(2030, 12, 31).date()
+    restart_nonce = f"NONCE-RESTART-{uuid.uuid4().hex[:12]}"
+
+    token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=f"ICAI-RESTART-{uuid.uuid4().hex[:8]}",
+        cop_valid_until=cop_date,
+        nonce=restart_nonce
+    )
+
+    # 1. First verification consumes nonce in PostgreSQL
+    ok1, msg1, _ = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test",
+        db=admin_db
+    )
+    assert ok1 is True
+
+    # 2. Simulate process restart / memory wipe
+    clear_test_gateway_trust_store()
+    register_test_gateway_key(TEST_KEY_ID, TEST_SECRET)
+
+    # 3. Present same token again
+    ok2, msg2, _ = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test",
+        db=admin_db
+    )
+    assert ok2 is False
+    assert "GATEWAY_NONCE_REPLAY" in msg2
+
+
+def test_gateway_expired_token_rejected_before_nonce_consumption(clean_test_auditor_env):
+    """Verifies that an expired gateway token fails closed before any nonce is registered."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    m_no = clean_test_auditor_env["mem_no"]
+    exp_nonce = f"NONCE-EXPIRED-{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc)
+
+    token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref="ICAI-EXP-REF",
+        nonce=exp_nonce,
+        issued_at=now - timedelta(days=2),
+        expires_at=now - timedelta(days=1)
+    )
+
+    ok, msg, _ = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        environment="test",
+        db=admin_db
+    )
+    assert ok is False
+    assert "EXPIRED_GATEWAY_TOKEN" in msg or "Signature has expired" in msg
+
+    # Nonce MUST NOT be consumed in database
+    count = admin_db.execute(
+        text("SELECT count(*) FROM public.statutory_gateway_nonce_registry WHERE nonce = :n;"),
+        {"n": exp_nonce}
+    ).scalar()
+    assert count == 0, "Expired token nonce must not be recorded in database"
+
+
+def test_gateway_missing_db_fails_closed(clean_test_auditor_env):
+    """Verifies that verify_icai_gateway_signed_response fails closed when db is None."""
+    m_no = clean_test_auditor_env["mem_no"]
+    token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref="ICAI-NO-DB-REF",
+        nonce="NONCE-NO-DB"
+    )
+    ok, msg, _ = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        environment="test",
+        db=None
+    )
+    assert ok is False
+    assert "DATABASE_UNAVAILABLE" in msg

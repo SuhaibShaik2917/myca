@@ -36,7 +36,6 @@ PRODUCTION_ALLOWED_ALGORITHMS = ["RS256", "ES256"]
 
 # In-memory test trust store for automated tests only (KID -> Key Metadata)
 _TEST_TRUST_STORE: Dict[str, Dict[str, Any]] = {}
-_RECORDED_GATEWAY_NONCES: set[str] = set()
 
 
 def register_test_gateway_key(
@@ -64,9 +63,8 @@ def register_test_gateway_key(
 
 
 def clear_test_gateway_trust_store() -> None:
-    """Clears the test trust store and recorded nonces."""
+    """Clears the test trust store."""
     _TEST_TRUST_STORE.clear()
-    _RECORDED_GATEWAY_NONCES.clear()
 
 
 def load_official_icai_trust_store() -> Dict[str, Dict[str, Any]]:
@@ -176,7 +174,8 @@ def verify_icai_gateway_signed_response(
     expected_cop_valid_until: Optional[date] = None,
     expected_evidence_ref: Optional[str] = None,
     environment: Optional[str] = None,
-    db: Optional[Any] = None
+    db: Optional[Any] = None,
+    auditor_id: Optional[str] = None
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Rigorously verifies a signed ICAI digital verification gateway response token.
@@ -294,36 +293,23 @@ def verify_icai_gateway_signed_response(
         return False, f"STALE_VERIFICATION: Gateway response was issued at {iat_dt.isoformat()}, exceeding maximum 24-hour freshness window.", {}
 
     # 8. Nonce replay protection (jti)
+    # 8. Nonce extraction and mandatory expiry validation
     jti = claims.get("jti")
     if not jti or not isinstance(jti, str):
         return False, "MISSING_NONCE: Gateway response token lacks required unique response identifier ('jti').", {}
 
-    # In production, database is strictly required for persistent replay defense
-    if env not in ("test", "testing", "development") and db is None:
-        return False, "DATABASE_UNAVAILABLE: Active database session required for persistent replay defense in production.", {}
+    exp_ts = claims.get("exp")
+    if not exp_ts:
+        return False, "MISSING_EXPIRY: Gateway response token lacks expiration ('exp') claim.", {}
+    exp_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+    if now_utc > exp_dt:
+        return False, f"EXPIRED_GATEWAY_TOKEN: Gateway response token expired at {exp_dt.isoformat()}.", {}
 
-    if db is not None:
-        try:
-            res = db.execute(
-                text("""
-                    SELECT 1 FROM public.statutory_auditors WHERE gateway_response_id = :nonce
-                    UNION ALL
-                    SELECT 1 FROM public.statutory_auditor_verification_events WHERE evidence_ref = :nonce;
-                """),
-                {"nonce": jti}
-            ).fetchone()
-            if res:
-                return False, f"GATEWAY_NONCE_REPLAY: Gateway response nonce '{jti}' has already been consumed.", {}
-        except Exception as ex:
-            if hasattr(db, "rollback"):
-                db.rollback()
-            return False, f"DATABASE_ERROR: Replay check failed: {ex}", {}
-    else:
-        # In-memory check only in test/dev when db is omitted
-        if jti in _RECORDED_GATEWAY_NONCES:
-            return False, f"GATEWAY_NONCE_REPLAY: Gateway response nonce '{jti}' has already been consumed.", {}
+    # 9. Active database session strictly required for atomic persistent replay defense
+    if db is None:
+        return False, "DATABASE_UNAVAILABLE: Active database session required for atomic persistent replay defense.", {}
 
-    # 9. Statutory claim binding
+    # 10. Statutory claim binding (validated before consuming nonce)
     signed_mem_no = str(claims.get("membership_no") or "").strip()
     if signed_mem_no != expected_membership_no.strip():
         return False, f"MEMBERSHIP_MISMATCH: Signed membership number '{signed_mem_no}' does not match expected '{expected_membership_no}'.", {}
@@ -354,13 +340,41 @@ def verify_icai_gateway_signed_response(
         if signed_valid_until != exp_date:
             return False, f"COP_DATE_MISMATCH: Signed validity date '{signed_valid_until}' does not match expected '{exp_date}'.", {}
 
+    signed_ev_ref = str(claims.get("evidence_ref") or "").strip()
     if expected_evidence_ref:
-        signed_ev_ref = str(claims.get("evidence_ref") or "").strip()
         if signed_ev_ref != expected_evidence_ref.strip():
             return False, f"EVIDENCE_REF_MISMATCH: Signed evidence reference '{signed_ev_ref}' does not match expected '{expected_evidence_ref}'.", {}
 
-    # Record nonce
-    _RECORDED_GATEWAY_NONCES.add(jti)
+    # 11. Atomic persistent database consumption into dedicated PostgreSQL nonce registry
+    try:
+        nonce_stmt = text("""
+            INSERT INTO public.statutory_gateway_nonce_registry (
+                nonce, issuer, kid, membership_no, evidence_ref,
+                issued_at, expires_at, consumed_at, consumed_by
+            ) VALUES (
+                :nonce, :issuer, :kid, :mem, :ev_ref,
+                :iat, :exp, clock_timestamp(), :auditor_id
+            )
+            ON CONFLICT (nonce) DO NOTHING;
+        """)
+        nonce_res = db.execute(nonce_stmt, {
+            "nonce": jti,
+            "issuer": claims.get("iss", OFFICIAL_ICAI_GATEWAY_ISSUER),
+            "kid": kid,
+            "mem": signed_mem_no,
+            "ev_ref": signed_ev_ref,
+            "iat": iat_dt,
+            "exp": exp_dt,
+            "auditor_id": auditor_id or signed_mem_no,
+        })
+        if hasattr(db, "commit"):
+            db.commit()
+        if nonce_res.rowcount == 0:
+            return False, f"GATEWAY_NONCE_REPLAY: Gateway response nonce '{jti}' has already been consumed.", {}
+    except Exception as ex:
+        if hasattr(db, "rollback"):
+            db.rollback()
+        return False, f"DATABASE_ERROR: Replay check failed: {ex}", {}
 
     verified_data = {
         "membership_no": signed_mem_no,

@@ -1382,6 +1382,7 @@ def onboard_verified_statutory_auditor(
     reviewer_context: Optional[Dict[str, Any]] = None,
     uploader_id: Optional[str] = None,
     claimed_evidence_sha256: Optional[str] = None,
+    auth_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Onboards an auditor into the controlled database registry with independent verification provenance.
@@ -1439,7 +1440,8 @@ def onboard_verified_statutory_auditor(
                 expected_cop_valid_until=c_val,
                 expected_evidence_ref=verification_evidence_ref if (verification_evidence_ref and "." not in verification_evidence_ref) else None,
                 environment=env,
-                db=db
+                db=db,
+                auditor_id=auditor_id
             )
             if is_valid_gw:
                 final_icai_verified = True
@@ -1464,7 +1466,8 @@ def onboard_verified_statutory_auditor(
             document_bytes=document_bytes,
             reviewer_context=reviewer_context,
             uploader_id=uploader_id,
-            claimed_evidence_sha256=claimed_evidence_sha256
+            claimed_evidence_sha256=claimed_evidence_sha256,
+            auth_token=auth_token,
         )
         if is_valid_man:
             final_icai_verified = False  # Human reviewed; not digitally verified by ICAI
@@ -1475,6 +1478,7 @@ def onboard_verified_statutory_auditor(
             verification_evidence_ref = man_data.get("evidence_ref")
             verified_at = man_data.get("verified_at")
             auth_reason = man_msg
+            appr = man_data.get("approved_by") or appr
         else:
             final_status = "PENDING_INDEPENDENT_VERIFICATION"
             auth_reason = f"Manual evidence review failed: {man_msg}"

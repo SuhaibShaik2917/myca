@@ -3,12 +3,15 @@ MyCA Statutory Auditor Verification — Authenticated Manual Evidence Reviewer.
 
 Implements controlled manual evidence verification with durable persistence and honest status:
 1. Server-side Reviewer Authentication:
-   - Validates reviewer identity against active database session (public.global_users).
-   - Rejects unauthenticated callers, forged identities, or inactive/suspended accounts.
-2. Authorization & Permissions:
-   - Enforces statutory verification permissions (STATUTORY_AUDITOR_ADMIN, CHIEF_COMPLIANCE_OFFICER, SENIOR_TAX_AUDIT_SUPERVISOR).
+   - Derives reviewer identity exclusively from the validated authenticated principal token.
+   - Validates that the reviewer user exists in public.global_users and is_active is True.
+   - Rejects unauthenticated callers, forged identities, missing users, or inactive/suspended accounts.
+2. Server-side Authorization & Role Lookup:
+   - Queries authoritative role from public.organization_memberships in the database.
+   - Requires active membership and administrative role ('admin' or 'owner').
+   - NEVER trusts caller-supplied roles, is_active, can_verify_statutory_auditors, or approved_by.
 3. Separation of Duties (Maker-Checker):
-   - Reviewer cannot approve their own submitted evidence (uploader_id != reviewer_id).
+   - Reviewer cannot approve their own submitted evidence (uploader_id != reviewer_id / reviewer_email).
 4. Documentary Evidence Verification:
    - Server computes SHA-256 directly from raw uploaded bytes.
    - Validates file size (16B - 10MB) and allowed MIME types (PDF, PNG, JPEG).
@@ -29,12 +32,10 @@ from datetime import datetime, timezone, timedelta, date
 from typing import Dict, Any, Optional, Tuple
 from sqlalchemy import text
 
-AUTHORIZED_REVIEWER_ROLES = [
-    "STATUTORY_AUDITOR_ADMIN",
-    "CHIEF_COMPLIANCE_OFFICER",
-    "SENIOR_TAX_AUDIT_SUPERVISOR",
-]
+from app.core.security import decode_access_token
 
+AUTHORIZED_ORGANIZATION_ROLES = ["admin", "owner"]
+AUTHORIZED_REVIEWER_ROLES = AUTHORIZED_ORGANIZATION_ROLES
 ALLOWED_DOCUMENT_TYPES = ["application/pdf", "image/png", "image/jpeg"]
 MIN_DOCUMENT_SIZE_BYTES = 16
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -55,75 +56,112 @@ def verify_manual_evidence_review(
     cop_status: str,
     cop_valid_until: date,
     document_bytes: Optional[bytes],
-    reviewer_context: Optional[Dict[str, Any]],
+    reviewer_context: Optional[Dict[str, Any]] = None,
     uploader_id: Optional[str] = None,
     claimed_evidence_sha256: Optional[str] = None,
     document_content_type: str = "application/pdf",
-    verification_notes: Optional[str] = None
+    verification_notes: Optional[str] = None,
+    auth_token: Optional[str] = None
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Rigorously validates a manual statutory auditor verification review with durable audit recording.
+    Requires server-side authenticated reviewer identity and active organization role.
     """
     if not auditor_id or not membership_no:
         return False, "INVALID_INPUT: auditor_id and membership_no are mandatory.", {}
 
-    # 1. Reviewer Session Authentication & Authorization Context
-    if not reviewer_context or not isinstance(reviewer_context, dict):
-        return False, "UNAUTHENTICATED_REVIEWER: Reviewer authentication session context is missing or unverified.", {}
+    # Mandatory database session requirement
+    if db is None:
+        return False, "DATABASE_UNAVAILABLE: Active database session required for reviewer authentication and verification.", {}
 
-    reviewer_id = str(reviewer_context.get("user_id") or reviewer_context.get("sub") or "").strip()
-    if not reviewer_id:
-        return False, "INVALID_REVIEWER_IDENTITY: Reviewer session lacks validated user identifier.", {}
+    # 1. Extract Bearer access token from auth_token or reviewer_context
+    raw_token = auth_token
+    if not raw_token and isinstance(reviewer_context, dict):
+        raw_token = (
+            reviewer_context.get("access_token")
+            or reviewer_context.get("token")
+            or reviewer_context.get("bearer_token")
+            or reviewer_context.get("auth_token")
+        )
 
-    # Database-backed session validation: verify reviewer user exists in global_users if db is available
-    if db is not None:
-        email = str(reviewer_context.get("email") or "").strip()
-        is_uuid = _is_valid_uuid(reviewer_id)
-        if is_uuid or (email and "@" in email):
-            try:
-                savepoint = db.begin_nested() if hasattr(db, "begin_nested") else None
-                try:
-                    if is_uuid:
-                        user_stmt = text("SELECT id, email, is_active FROM public.global_users WHERE id = :uid;")
-                        user_row = db.execute(user_stmt, {"uid": reviewer_id}).fetchone()
-                    else:
-                        user_stmt = text("SELECT id, email, is_active FROM public.global_users WHERE email = :email;")
-                        user_row = db.execute(user_stmt, {"email": email}).fetchone()
+    if not raw_token or not isinstance(raw_token, str) or not raw_token.strip():
+        return False, "UNAUTHENTICATED_REVIEWER: Valid bearer access token is required for reviewer authentication.", {}
 
-                    if user_row:
-                        u_map = user_row._mapping
-                        if u_map.get("is_active") is False:
-                            return False, f"INACTIVE_REVIEWER: Reviewer account '{reviewer_id}' is inactive in database.", {}
-                except Exception:
-                    if savepoint:
-                        savepoint.rollback()
-            except Exception:
-                pass
+    clean_token = raw_token.strip()
 
-    reviewer_role = str(reviewer_context.get("role") or "").strip().upper()
-    roles_list = [str(r).strip().upper() for r in reviewer_context.get("roles", []) if isinstance(r, (str, bytes))]
-    has_perm = bool(reviewer_context.get("can_verify_statutory_auditors"))
-    is_auth_role = has_perm or (reviewer_role in AUTHORIZED_REVIEWER_ROLES) or any(r in AUTHORIZED_REVIEWER_ROLES for r in roles_list)
-    if not is_auth_role:
-        return False, f"INSUFFICIENT_PERMISSIONS: Reviewer '{reviewer_id}' lacks statutory verification authority (authorized roles: {AUTHORIZED_REVIEWER_ROLES}).", {}
+    # 2. Cryptographically validate access token against server SECRET_KEY
+    try:
+        claims = decode_access_token(clean_token)
+    except ValueError as ex:
+        return False, f"INVALID_REVIEWER_SESSION: Access token validation failed: {ex}", {}
+    except Exception as ex:
+        return False, f"INVALID_REVIEWER_SESSION: Token decode error: {ex}", {}
 
-    if reviewer_context.get("is_active") is False:
-        return False, f"INACTIVE_REVIEWER: Reviewer account '{reviewer_id}' is inactive or suspended.", {}
+    reviewer_user_id = str(claims.get("sub") or "").strip()
+    reviewer_org_id = str(claims.get("org_id") or "").strip()
 
-    # Check session expiration
-    session_exp = reviewer_context.get("exp")
-    if session_exp:
-        exp_dt = datetime.fromtimestamp(session_exp, tz=timezone.utc) if isinstance(session_exp, (int, float)) else session_exp
-        if datetime.now(timezone.utc) > exp_dt:
-            return False, "EXPIRED_SESSION: Reviewer authentication session has expired.", {}
+    if not reviewer_user_id or not _is_valid_uuid(reviewer_user_id):
+        return False, "INVALID_REVIEWER_IDENTITY: Reviewer token subject is not a valid UUID.", {}
 
-    session_ref = str(reviewer_context.get("session_id") or reviewer_context.get("session_ref") or f"SESSION-{reviewer_id[:8]}").strip()
+    if not reviewer_org_id or not _is_valid_uuid(reviewer_org_id):
+        return False, "INVALID_REVIEWER_IDENTITY: Reviewer token org_id is not a valid UUID.", {}
 
-    # 2. Separation of Duties (Maker-Checker): Reviewer cannot approve their own submitted evidence
-    if uploader_id and str(uploader_id).strip() == reviewer_id:
-        return False, "MAKER_CHECKER_VIOLATION: Reviewer cannot approve their own submitted auditor evidence (self-approval prohibited).", {}
+    u_uuid = _py_uuid.UUID(reviewer_user_id)
+    o_uuid = _py_uuid.UUID(reviewer_org_id)
 
-    # 3. Documentary Evidence Validation
+    # 3. Authoritative database user verification (global_users)
+    try:
+        user_stmt = text("SELECT id, email, full_name, is_active FROM public.global_users WHERE id = :uid;")
+        user_row = db.execute(user_stmt, {"uid": u_uuid}).fetchone()
+    except Exception as ex:
+        if hasattr(db, "rollback"):
+            db.rollback()
+        return False, f"DATABASE_ERROR: Failed to query global_users: {ex}", {}
+
+    if not user_row:
+        return False, f"UNREGISTERED_REVIEWER: Reviewer user '{reviewer_user_id}' does not exist in global_users.", {}
+
+    u_map = user_row._mapping
+    if u_map.get("is_active") is not True:
+        return False, f"INACTIVE_REVIEWER: Reviewer account '{reviewer_user_id}' is inactive or suspended in global_users.", {}
+
+    reviewer_email = str(u_map.get("email") or "").strip()
+    reviewer_name = str(u_map.get("full_name") or "").strip()
+
+    # 4. Authoritative server-side role lookup in organization_memberships
+    # NEVER trust caller-supplied roles, is_active, can_verify_statutory_auditors, or approved_by!
+    try:
+        mem_stmt = text("""
+            SELECT role, status FROM public.organization_memberships 
+            WHERE user_id = :uid AND org_id = :oid;
+        """)
+        mem_row = db.execute(mem_stmt, {"uid": u_uuid, "oid": o_uuid}).fetchone()
+    except Exception as ex:
+        if hasattr(db, "rollback"):
+            db.rollback()
+        return False, f"DATABASE_ERROR: Failed to query organization_memberships: {ex}", {}
+
+    if not mem_row:
+        return False, f"INSUFFICIENT_PERMISSIONS: Reviewer '{reviewer_user_id}' has no membership in organization '{reviewer_org_id}'.", {}
+
+    m_map = mem_row._mapping
+    if str(m_map.get("status") or "").strip().lower() != "active":
+        return False, f"INACTIVE_REVIEWER_MEMBERSHIP: Reviewer membership status is '{m_map.get('status')}'; must be active.", {}
+
+    auth_role = str(m_map.get("role") or "").strip().lower()
+    if auth_role not in AUTHORIZED_ORGANIZATION_ROLES:
+        return False, f"UNAUTHORIZED_REVIEWER_ROLE: Role '{auth_role}' is not authorized to verify statutory auditors (requires admin or owner).", {}
+
+    # 5. Session reference derived directly from validated token
+    session_ref = str(claims.get("jti") or f"TOKEN-SESS:{hashlib.sha256(clean_token.encode()).hexdigest()[:16]}").strip()
+
+    # 6. Separation of Duties (Maker-Checker): Reviewer cannot approve their own submitted evidence
+    if uploader_id:
+        clean_uploader = str(uploader_id).strip().lower()
+        if clean_uploader in (reviewer_user_id.lower(), reviewer_email.lower()):
+            return False, "MAKER_CHECKER_VIOLATION: Reviewer cannot approve their own submitted auditor evidence (self-approval prohibited).", {}
+
+    # 7. Documentary Evidence Validation
     if not document_bytes or not isinstance(document_bytes, (bytes, bytearray)):
         return False, "MISSING_DOCUMENT_BYTES: Actual uploaded documentary evidence bytes are required for manual verification.", {}
 
@@ -144,7 +182,7 @@ def verify_manual_evidence_review(
         if cleaned_claimed != server_sha256:
             return False, f"EVIDENCE_INTEGRITY_MISMATCH: Server-computed hash '{server_sha256}' does not match claimed hash '{cleaned_claimed}'.", {}
 
-    # 4. COP Credential Validation
+    # 8. COP Credential Validation
     clean_cop_status = str(cop_status or "").strip().upper()
     if clean_cop_status != "ACTIVE":
         return False, f"INACTIVE_COP: Certificate of Practice status is '{clean_cop_status}'; must be ACTIVE.", {}
@@ -158,11 +196,9 @@ def verify_manual_evidence_review(
 
     now_utc = datetime.now(timezone.utc)
     evidence_ref = f"MANUAL-EVIDENCE-SHA256:{server_sha256[:16].upper()}"
+    authoritative_approved_by = reviewer_email or reviewer_user_id
 
-    # 5. Durable Evidence Recording into statutory_auditor_verification_events (Fail Closed on DB error)
-    if db is None:
-        return False, "DATABASE_UNAVAILABLE: Active database session required for durable manual review verification.", {}
-
+    # 9. Durable Evidence Recording into statutory_auditor_verification_events (Fail Closed on DB error)
     try:
         event_stmt = text("""
             INSERT INTO public.statutory_auditor_verification_events (
@@ -180,13 +216,11 @@ def verify_manual_evidence_review(
             "mem": membership_no.strip(),
             "eref": evidence_ref,
             "esha": server_sha256,
-            "rid": reviewer_id,
+            "rid": reviewer_user_id,
             "sref": session_ref,
-            "reason": verification_notes or "Authenticated manual documentary verification approved",
+            "reason": verification_notes or f"Authenticated manual documentary verification approved by {authoritative_approved_by}",
             "now": now_utc
         })
-        if hasattr(db, "commit"):
-            db.commit()
     except Exception as ex:
         if hasattr(db, "rollback"):
             db.rollback()
@@ -198,8 +232,9 @@ def verify_manual_evidence_review(
         "cop_valid_until": c_until,
         "evidence_ref": evidence_ref,
         "evidence_sha256": server_sha256,
-        "reviewer_id": reviewer_id,
+        "reviewer_id": reviewer_user_id,
         "reviewer_session_ref": session_ref,
+        "approved_by": authoritative_approved_by,
         "verified_at": now_utc,
         "verification_source": "MANUAL_EVIDENCE_REVIEW",
         "verification_status": "MANUAL_DOCUMENT_REVIEWED",
@@ -208,4 +243,4 @@ def verify_manual_evidence_review(
         "is_human_reviewed": True
     }
 
-    return True, f"Auditor documentary evidence (SHA-256: {server_sha256[:16]}) human-reviewed by {reviewer_id}; not cryptographically verified by ICAI gateway.", verified_data
+    return True, f"Auditor documentary evidence (SHA-256: {server_sha256[:16]}) human-reviewed by {authoritative_approved_by}; not cryptographically verified by ICAI gateway.", verified_data
