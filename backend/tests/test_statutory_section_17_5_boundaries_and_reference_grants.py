@@ -620,6 +620,14 @@ def test_multi_line_invoice_exception_and_blocked_catering():
          routes to REVIEW_REQUIRED with risk_reversal_amount = Decimal("0.00").
     6. Scenario C3: Completely Missing Line Breakdown:
        - Missing line-level tax and taxable values route to REVIEW_REQUIRED with 0.00 reversal.
+    7. Scenario D1: Document-Level Rate without Verified Uniformity Gate:
+       - Multi-line invoice cannot inherit document rate without is_uniform_rate_verified.
+    8. Scenario D2: Non-Statutory Rate on Line Items:
+       - Blended / arbitrary rate (e.g. 13.67%) rejected as invalid statutory rate.
+    9. Scenario D3: Document-Level Rate WITH Verified Uniformity Gate:
+       - is_uniform_rate_verified allows valid statutory rate across lines.
+    10. Scenario D4: Dynamic Rounding Tolerance (N * 0.01) Exceeded:
+        - Discrepancy exceeding tolerance routes to REVIEW_REQUIRED with 0.00 reversal.
     """
     from datetime import date
     from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
@@ -897,3 +905,172 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     assert food_eval_missing.risk_reversal_amount == Decimal("0.00")
     assert food_eval_missing.potential_itc == Decimal("5000.00")
     assert "mixed statutory treatments" in food_eval_missing.findings_explanation
+
+    # 7. Scenario D1: Document-Level Rate (e.g. 13.67%) without Verified Uniformity Gate
+    # Multi-line invoice cannot inherit document-level rate without explicit uniform rate verification
+    p_doc_doc_level_unverified = {
+        "id": "p_multi_line_doc_rate_unverified",
+        "document_number": "INV-MULTI-004A",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2050.00"),
+        "sgst_amount": Decimal("2050.00"),
+        "total_invoice_value": Decimal("34100.00"),
+        "gst_rate": Decimal("13.67"),  # Arbitrary / unverified blended rate on header
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00")
+            }
+        ]
+    }
+    evals_doc_unverified = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_doc_level_unverified,
+        gstr2b_doc=g_doc_rate_aware,
+        evaluation_date=today
+    )
+    food_eval_doc_unverified = next(e for e in evals_doc_unverified if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_doc_unverified.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_doc_unverified.risk_reversal_amount == Decimal("0.00")
+
+    # 8. Scenario D2: Non-Statutory Arbitrary Rate on Lines (e.g. 13.67%)
+    p_doc_non_statutory_line = {
+        "id": "p_multi_line_non_statutory",
+        "document_number": "INV-MULTI-004B",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2050.00"),
+        "sgst_amount": Decimal("2050.00"),
+        "total_invoice_value": Decimal("34100.00"),
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "gst_rate": Decimal("13.67"),  # Non-statutory rate
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00"),
+                "gst_rate": Decimal("13.67")
+            }
+        ]
+    }
+    evals_non_stat = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_non_statutory_line,
+        gstr2b_doc=g_doc_rate_aware,
+        evaluation_date=today
+    )
+    food_eval_non_stat = next(e for e in evals_non_stat if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_non_stat.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_non_stat.risk_reversal_amount == Decimal("0.00")
+
+    # 9. Scenario D3: Document-Level Rate (18.00%) WITH Verified Uniformity Gate
+    # When is_uniform_rate_verified is True, valid statutory header rate is applied across lines
+    p_doc_uniform_verified = {
+        "id": "p_multi_line_uniform_verified",
+        "document_number": "INV-MULTI-004C",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2700.00"),
+        "sgst_amount": Decimal("2700.00"),
+        "total_invoice_value": Decimal("35400.00"),
+        "gst_rate": Decimal("18.00"),
+        "is_uniform_rate_verified": True,
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00")
+            }
+        ]
+    }
+    g_doc_uniform = {
+        "id": "g_multi_uniform",
+        "section_name": "B2B",
+        "itc_availability": "available",
+        "central_tax": Decimal("2700.00"),
+        "state_ut_tax": Decimal("2700.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "document_number": "INV-MULTI-004C",
+        "document_date": "2026-11-01"
+    }
+    evals_uniform = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_uniform_verified,
+        gstr2b_doc=g_doc_uniform,
+        evaluation_date=today
+    )
+    food_eval_uniform = next(e for e in evals_uniform if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_uniform.eligibility_status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR
+    # Catering line tax = ₹10,000 * 18% = ₹1,800.00 reversed; vehicle repair ₹3,600 is exempt exception
+    assert food_eval_uniform.risk_reversal_amount == Decimal("1800.00")
+    assert food_eval_uniform.potential_itc == Decimal("1800.00")
+
+    # 10. Scenario D4: Dynamic Line Rounding Tolerance Exceeded
+    # 2 lines -> tolerance = 2 * 0.01 = 0.02.
+    # Total invoice tax is ₹4,100.05 while theoretical tax sum is ₹4,100.00 (diff = 0.05 > 0.02)
+    p_doc_tolerance_exceeded = {
+        "id": "p_multi_line_tol_exceeded",
+        "document_number": "INV-MULTI-004D",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2050.025"),  # Total tax = 4100.05
+        "sgst_amount": Decimal("2050.025"),
+        "total_invoice_value": Decimal("34100.05"),
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "gst_rate": Decimal("18.00"),  # 3600.00
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00"),
+                "gst_rate": Decimal("5.00")    # 500.00 -> theoretical sum = 4100.00 != 4100.05
+            }
+        ]
+    }
+    evals_tol = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_tolerance_exceeded,
+        gstr2b_doc=g_doc_rate_aware,
+        evaluation_date=today
+    )
+    food_eval_tol = next(e for e in evals_tol if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_tol.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_tol.risk_reversal_amount == Decimal("0.00")
+

@@ -162,12 +162,13 @@ When a caller supplies a valid JWT token for Tenant A but attempts to spoof `X-O
 ## 5. MIGRATION ROLLBACK SAFETY & BASELINE VERIFICATION
 
 Migration downgrade safety and baseline restoration verified via `backend/scripts/verify_migration_rollback_state.py` against independent reference catalog snapshot (`baseline_0019_reference.json`):
-- **Step 1 (Establish Baseline at 0019 & Verify Against Independent Reference):** Downgraded to `0019_m3_gstr3b_filings`: compared live database catalog state against independent reference snapshot `baseline_0019_reference.json`: **79 role_table_grants** for `app_service_user`, **88 policies** in `pg_policies`, and **41 tables** (100% exact match).
-- **Step 2 (Upgrade to Head 0021):** Upgraded to `0021_enforce_tenant_force_rls`: **105 grants**, **96 policies**, and confirmed all 36 tenant tables have both `relrowsecurity = True` and `relforcerowsecurity = True`.
+- **Independent Provenance:** Generated from an isolated, virgin PostgreSQL 16 database (`myca_independent_reference`) migrated strictly forward from base to `0019_m3_gstr3b_filings` (schema SHA256: `094a634892baa01db85044604c00de7c80d1252cec5eb83254a0af58f2cad43c`). Proves that canonical 0019 catalog state contains **79 grants, 87 policies, and 41 tables**.
+- **Step 1 (Establish Baseline at 0019 & Verify Against Independent Reference):** Downgraded to `0019_m3_gstr3b_filings`: compared live database catalog state against independent reference snapshot `baseline_0019_reference.json`: **79 full role_table_grants** for `app_service_user` (`table_schema`, `table_name`, `privilege_type`, `is_grantable`), **87 complete policies** in `pg_policies` (`schemaname`, `tablename`, `policyname`, `permissive`, `roles`, `cmd`, `qual`, `with_check`), and **41 tables** (100% exact match).
+- **Step 2 (Upgrade to Head 0021):** Upgraded to `0021_enforce_tenant_force_rls`: **105 grants**, **95 policies**, and confirmed all 36 tenant tables have both `relrowsecurity = True` and `relforcerowsecurity = True`.
 - **Step 3 (Downgrade to 0020):** Downgraded to `0020_m4_m5_grants_and_policies`: confirmed 21 tenant tables successfully reverted to `relforcerowsecurity = False` while retaining all 8 new policies.
 - **Step 4 (Downgrade to 0019 & Baseline Comparison):** Downgraded to `0019_m3_gstr3b_filings`:
   - Confirmed all 8 policies from 0020 were cleanly dropped (0 leftover).
-  - Compared exact role table grants against baseline: **0 missing grants, 0 extra grants (100% exact match)**.
-  - Compared exact policies against baseline: **0 missing policies, 0 extra policies (100% exact match)**.
+  - Compared exact role table grant definitions against baseline: **0 missing grants, 0 extra grants (100% exact match)**.
+  - Compared exact complete policy definitions against baseline: **0 missing policies, 0 extra policies (100% exact match)**.
   - Compared table RLS and FORCE RLS flags: **100% exact match**.
-- **Step 5 (Re-Upgrade to Head 0021):** Re-upgraded to `0021_enforce_tenant_force_rls`, fully restoring head state with 105 grants and 96 policies.
+- **Step 5 (Re-Upgrade to Head 0021):** Re-upgraded to `0021_enforce_tenant_force_rls`, fully restoring head state with 105 grants, 95 policies, and 36 forced RLS tenant tables.

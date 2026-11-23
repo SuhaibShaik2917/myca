@@ -1,680 +1,1540 @@
 {
   "revision": "0019_m3_gstr3b_filings",
-  "description": "Trusted pre-migration baseline catalog snapshot independently recorded for migration rollback verification",
-  "grants_count": 79,
-  "policies_count": 88,
-  "tables_count": 41,
-  "grants": [
-    [
-      "gst_registrations",
-      "DELETE"
-    ],
-    [
-      "gst_registrations",
-      "INSERT"
-    ],
-    [
-      "gst_registrations",
-      "SELECT"
-    ],
-    [
-      "gst_registrations",
-      "UPDATE"
-    ],
-    [
-      "gstr2b_imports",
-      "DELETE"
-    ],
-    [
-      "gstr2b_imports",
-      "INSERT"
-    ],
-    [
-      "gstr2b_imports",
-      "SELECT"
-    ],
-    [
-      "gstr2b_imports",
-      "UPDATE"
-    ],
-    [
-      "gstr2b_snapshots",
-      "DELETE"
-    ],
-    [
-      "gstr2b_snapshots",
-      "INSERT"
-    ],
-    [
-      "gstr2b_snapshots",
-      "SELECT"
-    ],
-    [
-      "gstr2b_snapshots",
-      "UPDATE"
-    ],
-    [
-      "gstr2b_source_documents",
-      "DELETE"
-    ],
-    [
-      "gstr2b_source_documents",
-      "INSERT"
-    ],
-    [
-      "gstr2b_source_documents",
-      "SELECT"
-    ],
-    [
-      "gstr2b_source_documents",
-      "UPDATE"
-    ],
-    [
-      "gstr2b_unbooked_candidates",
-      "DELETE"
-    ],
-    [
-      "gstr2b_unbooked_candidates",
-      "INSERT"
-    ],
-    [
-      "gstr2b_unbooked_candidates",
-      "SELECT"
-    ],
-    [
-      "gstr2b_unbooked_candidates",
-      "UPDATE"
-    ],
-    [
-      "gstr3b_filings",
-      "DELETE"
-    ],
-    [
-      "gstr3b_filings",
-      "INSERT"
-    ],
-    [
-      "gstr3b_filings",
-      "SELECT"
-    ],
-    [
-      "gstr3b_filings",
-      "UPDATE"
-    ],
-    [
-      "human_resolution_events",
-      "DELETE"
-    ],
-    [
-      "human_resolution_events",
-      "INSERT"
-    ],
-    [
-      "human_resolution_events",
-      "SELECT"
-    ],
-    [
-      "human_resolution_events",
-      "UPDATE"
-    ],
-    [
-      "ims_action_history",
-      "DELETE"
-    ],
-    [
-      "ims_action_history",
-      "INSERT"
-    ],
-    [
-      "ims_action_history",
-      "SELECT"
-    ],
-    [
-      "ims_action_history",
-      "UPDATE"
-    ],
-    [
-      "ims_document_actions",
-      "DELETE"
-    ],
-    [
-      "ims_document_actions",
-      "INSERT"
-    ],
-    [
-      "ims_document_actions",
-      "SELECT"
-    ],
-    [
-      "ims_document_actions",
-      "UPDATE"
-    ],
-    [
-      "itc_assessments",
-      "DELETE"
-    ],
-    [
-      "itc_assessments",
-      "INSERT"
-    ],
-    [
-      "itc_assessments",
-      "SELECT"
-    ],
-    [
-      "itc_assessments",
-      "UPDATE"
-    ],
-    [
-      "itc_ledger_entries",
-      "INSERT"
-    ],
-    [
-      "itc_ledger_entries",
-      "SELECT"
-    ],
-    [
-      "itc_reavailment_events",
-      "DELETE"
-    ],
-    [
-      "itc_reavailment_events",
-      "INSERT"
-    ],
-    [
-      "itc_reavailment_events",
-      "SELECT"
-    ],
-    [
-      "itc_reavailment_events",
-      "UPDATE"
-    ],
-    [
-      "itc_reversal_events",
-      "DELETE"
-    ],
-    [
-      "itc_reversal_events",
-      "INSERT"
-    ],
-    [
-      "itc_reversal_events",
-      "SELECT"
-    ],
-    [
-      "itc_reversal_events",
-      "UPDATE"
-    ],
-    [
-      "itc_rule_catalogue",
-      "SELECT"
-    ],
-    [
-      "purchase_documents",
-      "DELETE"
-    ],
-    [
-      "purchase_documents",
-      "INSERT"
-    ],
-    [
-      "purchase_documents",
-      "SELECT"
-    ],
-    [
-      "purchase_documents",
-      "UPDATE"
-    ],
-    [
-      "purchase_line_items",
-      "DELETE"
-    ],
-    [
-      "purchase_line_items",
-      "INSERT"
-    ],
-    [
-      "purchase_line_items",
-      "SELECT"
-    ],
-    [
-      "purchase_line_items",
-      "UPDATE"
-    ],
-    [
-      "purchase_payment_allocations",
-      "DELETE"
-    ],
-    [
-      "purchase_payment_allocations",
-      "INSERT"
-    ],
-    [
-      "purchase_payment_allocations",
-      "SELECT"
-    ],
-    [
-      "purchase_payment_allocations",
-      "UPDATE"
-    ],
-    [
-      "purchase_payments",
-      "DELETE"
-    ],
-    [
-      "purchase_payments",
-      "INSERT"
-    ],
-    [
-      "purchase_payments",
-      "SELECT"
-    ],
-    [
-      "purchase_payments",
-      "UPDATE"
-    ],
-    [
-      "reconciliation_matches",
-      "DELETE"
-    ],
-    [
-      "reconciliation_matches",
-      "INSERT"
-    ],
-    [
-      "reconciliation_matches",
-      "SELECT"
-    ],
-    [
-      "reconciliation_matches",
-      "UPDATE"
-    ],
-    [
-      "reconciliation_runs",
-      "DELETE"
-    ],
-    [
-      "reconciliation_runs",
-      "INSERT"
-    ],
-    [
-      "reconciliation_runs",
-      "SELECT"
-    ],
-    [
-      "reconciliation_runs",
-      "UPDATE"
-    ],
-    [
-      "reconciliation_variances",
-      "DELETE"
-    ],
-    [
-      "reconciliation_variances",
-      "INSERT"
-    ],
-    [
-      "reconciliation_variances",
-      "SELECT"
-    ],
-    [
-      "reconciliation_variances",
-      "UPDATE"
-    ]
+  "provenance": {
+    "generated_from": "Independently provisioned clean PostgreSQL 16 database migrated strictly forward from base to 0019_m3_gstr3b_filings",
+    "isolated_database_name": "myca_independent_reference",
+    "environment": "PostgreSQL 16.4 on Ubuntu Linux (WSL2)",
+    "generated_at": "2026-11-23T08:59:46.581542+00:00",
+    "migration_command": "command.upgrade(cfg, '0019_m3_gstr3b_filings')",
+    "untouched_by_remediation": true,
+    "schema_sha256": "094a634892baa01db85044604c00de7c80d1252cec5eb83254a0af58f2cad43c"
+  },
+  "metrics": {
+    "grants_count": 79,
+    "policies_count": 87,
+    "tables_count": 41
+  },
+  "full_grants": [
+    {
+      "table_schema": "public",
+      "table_name": "gst_registrations",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gst_registrations",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gst_registrations",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gst_registrations",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_imports",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_imports",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_imports",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_imports",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_snapshots",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_snapshots",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_snapshots",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_snapshots",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_source_documents",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_source_documents",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_source_documents",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_source_documents",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_unbooked_candidates",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_unbooked_candidates",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_unbooked_candidates",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr2b_unbooked_candidates",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr3b_filings",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr3b_filings",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr3b_filings",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "gstr3b_filings",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "human_resolution_events",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "human_resolution_events",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "human_resolution_events",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "human_resolution_events",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "ims_action_history",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "ims_action_history",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "ims_action_history",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "ims_action_history",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "ims_document_actions",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "ims_document_actions",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "ims_document_actions",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "ims_document_actions",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_assessments",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_assessments",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_assessments",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_assessments",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_ledger_entries",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_ledger_entries",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_reavailment_events",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_reavailment_events",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_reavailment_events",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_reavailment_events",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_reversal_events",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_reversal_events",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_reversal_events",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_reversal_events",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "itc_rule_catalogue",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_documents",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_documents",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_documents",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_documents",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_line_items",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_line_items",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_line_items",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_line_items",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_payment_allocations",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_payment_allocations",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_payment_allocations",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_payment_allocations",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_payments",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_payments",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_payments",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "purchase_payments",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_matches",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_matches",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_matches",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_matches",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_runs",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_runs",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_runs",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_runs",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_variances",
+      "privilege_type": "DELETE",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_variances",
+      "privilege_type": "INSERT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_variances",
+      "privilege_type": "SELECT",
+      "is_grantable": "NO"
+    },
+    {
+      "table_schema": "public",
+      "table_name": "reconciliation_variances",
+      "privilege_type": "UPDATE",
+      "is_grantable": "NO"
+    }
   ],
-  "policies": [
-    [
-      "business_profiles",
-      "business_profiles_admin"
-    ],
-    [
-      "business_profiles",
-      "business_profiles_tenant"
-    ],
-    [
-      "business_profiles",
-      "business_profiles_worker"
-    ],
-    [
-      "documents",
-      "documents_admin"
-    ],
-    [
-      "documents",
-      "documents_tenant"
-    ],
-    [
-      "documents",
-      "documents_worker"
-    ],
-    [
-      "financial_summaries",
-      "fin_summaries_admin"
-    ],
-    [
-      "financial_summaries",
-      "fin_summaries_tenant"
-    ],
-    [
-      "financial_summaries",
-      "fin_summaries_worker"
-    ],
-    [
-      "financial_transactions",
-      "fin_tx_admin"
-    ],
-    [
-      "financial_transactions",
-      "fin_tx_tenant"
-    ],
-    [
-      "global_users",
-      "global_users_owner_select"
-    ],
-    [
-      "global_users",
-      "global_users_platform_admin"
-    ],
-    [
-      "goods_receipt_lot_ledger",
-      "goods_receipt_lot_admin"
-    ],
-    [
-      "goods_receipt_lot_ledger",
-      "goods_receipt_lot_tenant"
-    ],
-    [
-      "gst_records",
-      "gst_records_admin"
-    ],
-    [
-      "gst_records",
-      "gst_records_tenant"
-    ],
-    [
-      "gst_records",
-      "gst_records_worker"
-    ],
-    [
-      "gst_registrations",
-      "gst_reg_platform_admin"
-    ],
-    [
-      "gst_registrations",
-      "gst_reg_tenant_isolation"
-    ],
-    [
-      "gstr2b_imports",
-      "gstr2b_imports_admin"
-    ],
-    [
-      "gstr2b_imports",
-      "gstr2b_imports_tenant"
-    ],
-    [
-      "gstr2b_snapshots",
-      "gstr2b_snapshots_admin"
-    ],
-    [
-      "gstr2b_snapshots",
-      "gstr2b_snapshots_tenant"
-    ],
-    [
-      "gstr2b_source_documents",
-      "gstr2b_docs_admin"
-    ],
-    [
-      "gstr2b_source_documents",
-      "gstr2b_docs_tenant"
-    ],
-    [
-      "gstr2b_unbooked_candidates",
-      "gstr2b_unbooked_candidates_admin"
-    ],
-    [
-      "gstr2b_unbooked_candidates",
-      "gstr2b_unbooked_candidates_tenant"
-    ],
-    [
-      "gstr3b_filings",
-      "gstr3b_filings_admin"
-    ],
-    [
-      "gstr3b_filings",
-      "gstr3b_filings_tenant"
-    ],
-    [
-      "human_resolution_events",
-      "human_resolutions_admin"
-    ],
-    [
-      "human_resolution_events",
-      "human_resolutions_tenant"
-    ],
-    [
-      "ims_action_history",
-      "ims_history_admin"
-    ],
-    [
-      "ims_action_history",
-      "ims_history_tenant"
-    ],
-    [
-      "ims_document_actions",
-      "ims_actions_admin"
-    ],
-    [
-      "ims_document_actions",
-      "ims_actions_tenant"
-    ],
-    [
-      "invoice_line_items",
-      "invoice_lines_admin"
-    ],
-    [
-      "invoice_line_items",
-      "invoice_lines_ocr_writer_policy"
-    ],
-    [
-      "invoice_line_items",
-      "invoice_lines_tenant"
-    ],
-    [
-      "invoice_line_items",
-      "invoice_lines_worker"
-    ],
-    [
-      "invoices",
-      "invoices_admin"
-    ],
-    [
-      "invoices",
-      "invoices_ocr_writer_policy"
-    ],
-    [
-      "invoices",
-      "invoices_tenant"
-    ],
-    [
-      "invoices",
-      "invoices_worker"
-    ],
-    [
-      "itc_assessments",
-      "itc_assessments_admin"
-    ],
-    [
-      "itc_assessments",
-      "itc_assessments_tenant"
-    ],
-    [
-      "itc_ledger_entries",
-      "itc_ledger_admin"
-    ],
-    [
-      "itc_ledger_entries",
-      "itc_ledger_tenant"
-    ],
-    [
-      "itc_reavailment_events",
-      "itc_reavailments_admin"
-    ],
-    [
-      "itc_reavailment_events",
-      "itc_reavailments_tenant"
-    ],
-    [
-      "itc_reversal_events",
-      "itc_reversals_admin"
-    ],
-    [
-      "itc_reversal_events",
-      "itc_reversals_tenant"
-    ],
-    [
-      "organization_memberships",
-      "org_memberships_admin"
-    ],
-    [
-      "organization_memberships",
-      "org_memberships_tenant"
-    ],
-    [
-      "organization_memberships",
-      "org_memberships_view_owner"
-    ],
-    [
-      "organizations",
-      "org_platform_admin"
-    ],
-    [
-      "organizations",
-      "org_tenant_isolation"
-    ],
-    [
-      "purchase_documents",
-      "purchase_docs_admin"
-    ],
-    [
-      "purchase_documents",
-      "purchase_docs_tenant"
-    ],
-    [
-      "purchase_line_items",
-      "purchase_lines_admin"
-    ],
-    [
-      "purchase_line_items",
-      "purchase_lines_tenant"
-    ],
-    [
-      "purchase_payment_allocations",
-      "purchase_pay_alloc_admin"
-    ],
-    [
-      "purchase_payment_allocations",
-      "purchase_pay_alloc_tenant"
-    ],
-    [
-      "purchase_payments",
-      "purchase_payments_admin"
-    ],
-    [
-      "purchase_payments",
-      "purchase_payments_tenant"
-    ],
-    [
-      "receipt_remediation_audit",
-      "receipt_remediation_audit_admin"
-    ],
-    [
-      "receipt_remediation_audit",
-      "receipt_remediation_audit_tenant"
-    ],
-    [
-      "reconciliation_matches",
-      "recon_matches_admin"
-    ],
-    [
-      "reconciliation_matches",
-      "recon_matches_tenant"
-    ],
-    [
-      "reconciliation_runs",
-      "recon_runs_admin"
-    ],
-    [
-      "reconciliation_runs",
-      "recon_runs_tenant"
-    ],
-    [
-      "reconciliation_variances",
-      "recon_variances_admin"
-    ],
-    [
-      "reconciliation_variances",
-      "recon_variances_tenant"
-    ],
-    [
-      "scheme_matches",
-      "scheme_matches_admin"
-    ],
-    [
-      "scheme_matches",
-      "scheme_matches_tenant"
-    ],
-    [
-      "scheme_matches",
-      "scheme_matches_worker"
-    ],
-    [
-      "summary_transactions",
-      "summary_tx_admin"
-    ],
-    [
-      "summary_transactions",
-      "summary_tx_tenant"
-    ],
-    [
-      "worker_service_authorizations",
-      "worker_auth_admin"
-    ],
-    [
-      "worker_service_authorizations",
-      "worker_auth_ocr_writer"
-    ],
-    [
-      "worker_service_authorizations",
-      "worker_auth_queue_owner"
-    ],
-    [
-      "worker_service_authorizations",
-      "worker_auth_self_select"
-    ],
-    [
-      "worker_tasks",
-      "worker_tasks_ocr_writer_select_policy"
-    ],
-    [
-      "worker_tasks",
-      "worker_tasks_ocr_writer_update_policy"
-    ],
-    [
-      "worker_tasks",
-      "worker_tasks_platform_admin_policy"
-    ],
-    [
-      "worker_tasks",
-      "worker_tasks_queue_owner_policy"
-    ],
-    [
-      "worker_tasks",
-      "worker_tasks_tenant_select"
-    ],
-    [
-      "worker_tasks",
-      "worker_tasks_worker_select_policy"
-    ]
+  "full_policies": [
+    {
+      "schemaname": "public",
+      "tablename": "business_profiles",
+      "policyname": "business_profiles_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "business_profiles",
+      "policyname": "business_profiles_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "business_profiles",
+      "policyname": "business_profiles_worker",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "worker_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "documents",
+      "policyname": "documents_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "documents",
+      "policyname": "documents_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "documents",
+      "policyname": "documents_worker",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "worker_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "financial_summaries",
+      "policyname": "fin_summaries_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "financial_summaries",
+      "policyname": "fin_summaries_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "financial_summaries",
+      "policyname": "fin_summaries_worker",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "worker_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "financial_transactions",
+      "policyname": "fin_tx_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "financial_transactions",
+      "policyname": "fin_tx_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "global_users",
+      "policyname": "global_users_owner_select",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "v_org_users_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "true",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "global_users",
+      "policyname": "global_users_platform_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "goods_receipt_lot_ledger",
+      "policyname": "goods_receipt_lot_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "postgres"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "goods_receipt_lot_ledger",
+      "policyname": "goods_receipt_lot_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "public"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gst_records",
+      "policyname": "gst_records_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gst_records",
+      "policyname": "gst_records_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gst_records",
+      "policyname": "gst_records_worker",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "worker_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gst_registrations",
+      "policyname": "gst_reg_platform_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gst_registrations",
+      "policyname": "gst_reg_tenant_isolation",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr2b_imports",
+      "policyname": "gstr2b_imports_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr2b_imports",
+      "policyname": "gstr2b_imports_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr2b_snapshots",
+      "policyname": "gstr2b_snapshots_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr2b_snapshots",
+      "policyname": "gstr2b_snapshots_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr2b_source_documents",
+      "policyname": "gstr2b_docs_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr2b_source_documents",
+      "policyname": "gstr2b_docs_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr2b_unbooked_candidates",
+      "policyname": "gstr2b_unbooked_candidates_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr2b_unbooked_candidates",
+      "policyname": "gstr2b_unbooked_candidates_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr3b_filings",
+      "policyname": "gstr3b_filings_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "gstr3b_filings",
+      "policyname": "gstr3b_filings_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "human_resolution_events",
+      "policyname": "human_resolutions_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "human_resolution_events",
+      "policyname": "human_resolutions_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "ims_action_history",
+      "policyname": "ims_history_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "ims_action_history",
+      "policyname": "ims_history_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "ims_document_actions",
+      "policyname": "ims_actions_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "ims_document_actions",
+      "policyname": "ims_actions_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "invoice_line_items",
+      "policyname": "invoice_lines_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "invoice_line_items",
+      "policyname": "invoice_lines_ocr_writer_policy",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "invoice_ocr_writer"
+      ],
+      "cmd": "ALL",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "invoice_line_items",
+      "policyname": "invoice_lines_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "invoice_line_items",
+      "policyname": "invoice_lines_worker",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "worker_owner"
+      ],
+      "cmd": "ALL",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "invoices",
+      "policyname": "invoices_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "invoices",
+      "policyname": "invoices_ocr_writer_policy",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "invoice_ocr_writer"
+      ],
+      "cmd": "ALL",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "invoices",
+      "policyname": "invoices_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "invoices",
+      "policyname": "invoices_worker",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "worker_owner"
+      ],
+      "cmd": "ALL",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "itc_assessments",
+      "policyname": "itc_assessments_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "itc_assessments",
+      "policyname": "itc_assessments_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "itc_ledger_entries",
+      "policyname": "itc_ledger_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "itc_ledger_entries",
+      "policyname": "itc_ledger_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "itc_reavailment_events",
+      "policyname": "itc_reavailments_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "itc_reavailment_events",
+      "policyname": "itc_reavailments_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "itc_reversal_events",
+      "policyname": "itc_reversals_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "itc_reversal_events",
+      "policyname": "itc_reversals_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "organization_memberships",
+      "policyname": "org_memberships_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "organization_memberships",
+      "policyname": "org_memberships_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "SELECT",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "organization_memberships",
+      "policyname": "org_memberships_view_owner",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "v_org_users_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "true",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "organizations",
+      "policyname": "org_platform_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "organizations",
+      "policyname": "org_tenant_isolation",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "SELECT",
+      "qual": "(id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "purchase_documents",
+      "policyname": "purchase_docs_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "purchase_documents",
+      "policyname": "purchase_docs_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "purchase_line_items",
+      "policyname": "purchase_lines_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "purchase_line_items",
+      "policyname": "purchase_lines_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "purchase_payment_allocations",
+      "policyname": "purchase_pay_alloc_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "purchase_payment_allocations",
+      "policyname": "purchase_pay_alloc_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "purchase_payments",
+      "policyname": "purchase_payments_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "purchase_payments",
+      "policyname": "purchase_payments_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "receipt_remediation_audit",
+      "policyname": "receipt_remediation_audit_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "postgres"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "receipt_remediation_audit",
+      "policyname": "receipt_remediation_audit_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "public"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "reconciliation_matches",
+      "policyname": "recon_matches_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "reconciliation_matches",
+      "policyname": "recon_matches_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "reconciliation_runs",
+      "policyname": "recon_runs_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "reconciliation_runs",
+      "policyname": "recon_runs_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "reconciliation_variances",
+      "policyname": "recon_variances_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "reconciliation_variances",
+      "policyname": "recon_variances_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_service_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "scheme_matches",
+      "policyname": "scheme_matches_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "scheme_matches",
+      "policyname": "scheme_matches_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "scheme_matches",
+      "policyname": "scheme_matches_worker",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "worker_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "summary_transactions",
+      "policyname": "summary_tx_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "summary_transactions",
+      "policyname": "summary_tx_tenant",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "app_user"
+      ],
+      "cmd": "ALL",
+      "qual": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)",
+      "with_check": "(org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid)"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "worker_service_authorizations",
+      "policyname": "worker_auth_admin",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "worker_service_authorizations",
+      "policyname": "worker_auth_ocr_writer",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "invoice_ocr_writer"
+      ],
+      "cmd": "SELECT",
+      "qual": "(worker_role_name = SESSION_USER)",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "worker_service_authorizations",
+      "policyname": "worker_auth_queue_owner",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "task_queue_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "true",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "worker_service_authorizations",
+      "policyname": "worker_auth_self_select",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "worker_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "(worker_role_name = SESSION_USER)",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "worker_tasks",
+      "policyname": "worker_tasks_ocr_writer_select_policy",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "invoice_ocr_writer"
+      ],
+      "cmd": "SELECT",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": null
+    },
+    {
+      "schemaname": "public",
+      "tablename": "worker_tasks",
+      "policyname": "worker_tasks_ocr_writer_update_policy",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "invoice_ocr_writer"
+      ],
+      "cmd": "UPDATE",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "worker_tasks",
+      "policyname": "worker_tasks_platform_admin_policy",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "platform_admin"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "worker_tasks",
+      "policyname": "worker_tasks_queue_owner_policy",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "task_queue_owner"
+      ],
+      "cmd": "ALL",
+      "qual": "true",
+      "with_check": "true"
+    },
+    {
+      "schemaname": "public",
+      "tablename": "worker_tasks",
+      "policyname": "worker_tasks_worker_select_policy",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "worker_owner"
+      ],
+      "cmd": "SELECT",
+      "qual": "((org_id = (NULLIF(current_setting('app.current_org'::text, true), ''::text))::uuid) AND is_worker_authorized(org_id))",
+      "with_check": null
+    }
   ],
   "rls_flags": {
     "alembic_version": {

@@ -1,7 +1,7 @@
 # MyCA — FINAL QA & TEST SUITE VERIFICATION EVIDENCE
 
 **Audit Date:** November 23, 2026  
-**Environment:** Windows 11 / Python 3.14.4 / PostgreSQL 16.4 / Node.js v20.x  
+**Environment:** Linux (WSL Ubuntu 24.04 / Python 3.12.3 / PostgreSQL 16.11 / Node.js v24.14)  
 **Branch:** `remediation/audit-findings-phase3` (Merging to `master`)  
 **Git Checkpoints:** Baseline `9f97516`, Audit Phase 1 `d421f0e`, Phase 2 Baseline `9961014`, Remediation Head (Phase 3)  
 
@@ -10,60 +10,61 @@
 ## 1. REPRODUCIBLE TEST RUN LOG
 
 ### Exact Command
-```powershell
-cd C:\Users\notyo\.gemini\antigravity\scratch\myca\backend
-python -m pytest tests/ -v --tb=short
+```bash
+cd backend
+PYTHONPATH=. /opt/myca-venv/bin/pytest tests/ -v --tb=short
 ```
 
 ### Complete Test Run Summary
 ```text
 ============================= test session starts ==============================
-platform win32 -- Python 3.14.4, pytest-9.1.1, pluggy-1.6.0
-rootdir: C:\Users\notyo\.gemini\antigravity\scratch\myca\backend
-plugins: anyio-4.13.0, asyncio-1.4.0
+platform linux -- Python 3.12.3, pytest-9.2.0, pluggy-1.7.0 -- /opt/myca-venv/bin/python3
+cachedir: .pytest_cache
+rootdir: /mnt/c/Users/notyo/.gemini/antigravity/scratch/myca/backend
+plugins: anyio-4.16.0, asyncio-1.5.0
 asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
 collected 259 items
 
-tests\test_ai_assistant.py ...                                           [  1%]
-tests\test_auth_token.py .......                                         [  3%]
-tests\test_invoice_brain.py .......                                      [  6%]
-tests\test_migration_security_baseline.py .....................          [ 14%]
-tests\test_milestone1_security_closure.py .............................. [ 26%]
+tests/test_ai_assistant.py ...                                           [  1%]
+tests/test_auth_token.py .......                                         [  3%]
+tests/test_invoice_brain.py .......                                      [  6%]
+tests/test_migration_security_baseline.py .....................          [ 14%]
+tests/test_milestone1_security_closure.py .............................. [ 26%]
 .........                                                                [ 29%]
-tests\test_milestone2_1_statutory_corrections.py .......                 [ 32%]
-tests\test_milestone2_2_itc_ledger.py .....                              [ 34%]
-tests\test_milestone2_3_itc_reconciliation.py .....                      [ 36%]
-tests\test_milestone2_4_source_reconciliation.py ....                    [ 37%]
-tests\test_milestone2_5_tax_heads_and_receipt_gate.py ....               [ 39%]
-tests\test_milestone2_6_receipt_gate_and_reversal.py .........           [ 42%]
-tests\test_milestone2_7_1_statutory_integrity.py .........               [ 46%]
-tests\test_milestone2_7_2_10_consolidated_defect_remediation.py ........ [ 49%]
+tests/test_milestone2_1_statutory_corrections.py .......                 [ 32%]
+tests/test_milestone2_2_itc_ledger.py .....                              [ 34%]
+tests/test_milestone2_3_itc_reconciliation.py .....                      [ 36%]
+tests/test_milestone2_4_source_reconciliation.py ....                    [ 37%]
+tests/test_milestone2_5_tax_heads_and_receipt_gate.py ....               [ 39%]
+tests/test_milestone2_6_receipt_gate_and_reversal.py .........           [ 42%]
+tests/test_milestone2_7_1_statutory_integrity.py .........               [ 46%]
+tests/test_milestone2_7_2_10_consolidated_defect_remediation.py ........ [ 49%]
 .....                                                                    [ 51%]
-tests\test_milestone2_7_2_11_audit_corrections_and_evidence_validation.py . [ 51%]
+tests/test_milestone2_7_2_11_audit_corrections_and_evidence_validation.py . [ 51%]
 .......                                                                  [ 54%]
-tests\test_milestone2_7_2_12_filing_eligibility_and_statutory_audit.py . [ 54%]
+tests/test_milestone2_7_2_12_filing_eligibility_and_statutory_audit.py . [ 54%]
 .......                                                                  [ 57%]
-tests\test_milestone2_7_2_13_period_chronology_and_reversal_lineage.py . [ 57%]
+tests/test_milestone2_7_2_13_period_chronology_and_reversal_lineage.py . [ 57%]
 .....                                                                    [ 59%]
-tests\test_milestone2_7_2_14_rule37_37a_separation.py ...............    [ 65%]
-tests\test_milestone2_7_2_financial_reconciliation_closure.py .......... [ 69%]
+tests/test_milestone2_7_2_14_rule37_37a_separation.py ...............    [ 65%]
+tests/test_milestone2_7_2_financial_reconciliation_closure.py .......... [ 69%]
 ..........................................                               [ 85%]
-tests\test_milestone2_7_inward_accounting_workflow.py ......             [ 88%]
-tests\test_milestone2_reconciliation.py ..........                       [ 91%]
-tests\test_milestone3_gstr3b_offset_and_filing.py .....                  [ 93%]
-tests\test_milestone4_credit_builder.py .....                            [ 95%]
-tests\test_milestone5_scheme_navigator.py .....                          [ 97%]
-tests\test_statutory_section_17_5_boundaries_and_reference_grants.py ... [ 98%]
+tests/test_milestone2_7_inward_accounting_workflow.py ......             [ 88%]
+tests/test_milestone2_reconciliation.py ..........                       [ 91%]
+tests/test_milestone3_gstr3b_offset_and_filing.py .....                  [ 93%]
+tests/test_milestone4_credit_builder.py .....                            [ 95%]
+tests/test_milestone5_scheme_navigator.py .....                          [ 97%]
+tests/test_statutory_section_17_5_boundaries_and_reference_grants.py ... [ 98%]
 ...                                                                      [100%]
 
-============================ 259 passed in 31.66s =============================
+============================ 259 passed in 47.97s =============================
 ```
 
 - **Total Test Items:** 259
 - **Passed:** 259
 - **Failed:** 0
 - **Errors:** 0
-- **Duration:** 31.66 seconds
+- **Duration:** 47.97 seconds
 - **Pass Rate:** 100.0%
 
 ---
@@ -98,28 +99,26 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
    - **Proviso (ii)(II) Insurer Negative Tests:**
      - Verified IRDAI license + vehicle insured by taxpayer &rarr; `ELIGIBLE_STATUTORY_EXCEPTION`.
      - Vehicle NOT insured by taxpayer (missing policy evidence) &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
-      - Vehicle NOT insured by taxpayer (third-party policy document where `policy_issuer_is_taxpayer: False`) &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
-      - Generic policy document present without verified insurance by taxpayer &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
-     - Insurer license unverified &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
-     - Factual context unverified &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
-     - Commercial business repairing company car with policy attached &rarr; strictly evaluates seating capacity (5 seats &le; 13 blocked under Section 17(5)(a)/(ab)), avoiding false insurer exception routing.
+     - Context unverified &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
+     - Commercial business having car repaired with policy &rarr; evaluated on seating capacity (not insurer).
+     - Third-party policy issuer &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
+     - Policy document verified alone without proof vehicle is insured by taxpayer &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
 5. `test_review_required_preservation_in_itc_engine_and_gstr3b`:
-   - Evaluates vehicle invoice with unverified facts (`is_factual_context_verified: False`).
-   - Asserts engine produces `eligibility_status = ITCEligibilityEnum.REVIEW_REQUIRED`.
-   - Asserts `risk_reversal_amount = Decimal("0.00")` (not confirmed statutory reversal).
-   - Asserts `potential_itc = Decimal("28000.00")`.
-   - Feeds assessment into downstream `generate_gstr3b_table4_summary`:
-     - Asserts `ineligible_sec_17_5_blocked = Decimal("0.00")`.
-     - Asserts `total_itc_reversed = Decimal("0.00")`.
-     - Asserts `net_itc_available = Decimal("28000.00")` (preserved for CA adjudication).
+   - Items pending factual review receive status `REVIEW_REQUIRED` (not `BLOCKED_CREDIT_INDICATOR`).
+   - Risk reversal amount is strictly ₹0.00 (not confirmed reversal).
+   - In GSTR-3B Table 4(B)(1), permanent reversals are ₹0.00; Net ITC in 4(C) retains the full amount until CA confirms block.
 6. `test_multi_line_invoice_exception_and_blocked_catering`:
-    - Evaluates multi-line invoices across 6 comprehensive statutory scenarios:
-      - Scenario A (Explicit Line Tax): ₹2,000 catering reversed out of ₹5,000 total invoice tax, preserving ₹3,000 eligible repair credit.
-      - Scenario B1 (Rate-Aware Proportional Allocation): Vehicle repair at 18% (₹20,000 -> ₹3,600 tax) and catering at 5% (₹10,000 -> ₹500 tax), total tax ₹4,100; catering reversed at exactly ₹500.00, NOT ₹1,366.67 from an unweighted ratio.
-      - Scenario B2 (Explicit Line Tax Discrepancy Gate): Line taxes (₹3,000 + ₹1,500 = ₹4,500) fail to reconcile to invoice tax (₹5,000); routes to `REVIEW_REQUIRED` with `risk_reversal_amount = Decimal("0.00")`.
-      - Scenario C1 (Missing Rates on Mixed Lines): Line taxable values provided without GST rates; routes to `REVIEW_REQUIRED` with `0.00` reversal.
-      - Scenario C2 (Disallowed GST-Inclusive Total Amount Basis): Only `total_amount`/`line_total` provided without pure `taxable_value`; routes to `REVIEW_REQUIRED` with `0.00` reversal.
-      - Scenario C3 (Completely Missing Line Data): Invoices without line-level itemization route to `REVIEW_REQUIRED` with `0.00` reversal.
+   - Evaluates multi-line invoices across 10 comprehensive statutory scenarios:
+     - Scenario A (Explicit Line Tax): ₹2,000 catering reversed out of ₹5,000 total invoice tax, preserving ₹3,000 eligible repair credit.
+     - Scenario B1 (Rate-Aware Proportional Allocation): Vehicle repair at 18% (₹20,000 -> ₹3,600 tax) and catering at 5% (₹10,000 -> ₹500 tax), total tax ₹4,100; catering reversed at exactly ₹500.00, NOT ₹1,366.67 from an unweighted ratio.
+     - Scenario B2 (Explicit Line Tax Discrepancy Gate): Line taxes (₹3,000 + ₹1,500 = ₹4,500) fail to reconcile to invoice tax (₹5,000); routes to `REVIEW_REQUIRED` with `risk_reversal_amount = Decimal("0.00")`.
+     - Scenario C1 (Missing Rates on Mixed Lines): Line taxable values provided without GST rates; routes to `REVIEW_REQUIRED` with `0.00` reversal.
+     - Scenario C2 (Disallowed GST-Inclusive Total Amount Basis): Only `total_amount`/`line_total` provided without pure `taxable_value`; routes to `REVIEW_REQUIRED` with `0.00` reversal.
+     - Scenario C3 (Completely Missing Line Data): Invoices without line-level itemization route to `REVIEW_REQUIRED` with `0.00` reversal.
+     - Scenario D1 (Document-Level Rate without Uniformity Gate): Multi-line invoice cannot inherit document rate without `is_uniform_rate_verified`; routes to `REVIEW_REQUIRED` with `0.00` reversal.
+     - Scenario D2 (Non-Statutory Rate on Line Items): Blended/composite rate (13.67%) rejected under statutory rate whitelist; routes to `REVIEW_REQUIRED` with `0.00` reversal.
+     - Scenario D3 (Document-Level Rate WITH Uniformity Gate): `is_uniform_rate_verified: True` allows valid statutory rate (18%) across lines, correctly reversing ₹1,800 catering and granting ₹3,600 repair.
+     - Scenario D4 (Dynamic Rounding Tolerance Exceeded): Derived tolerance $N \times 0.01$ (₹0.02 for 2 lines) exceeded by ₹0.05 discrepancy routes to `REVIEW_REQUIRED` with `0.00` reversal.
 
 ---
 
@@ -127,31 +126,35 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
 
 ### Verification Script: `backend/scripts/verify_migration_rollback_state.py`
 Executed:
-```powershell
-python scripts/verify_migration_rollback_state.py
+```bash
+cd backend
+PYTHONPATH=. /opt/myca-venv/bin/python3 scripts/verify_migration_rollback_state.py
 ```
 
 **Log Output:**
 ```text
-Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json:
-  79 grants, 88 policies, 41 tables.
+=== Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json ===
+  Provenance Origin: Independently provisioned clean PostgreSQL 16 database migrated strictly forward from base to 0019_m3_gstr3b_filings
+  Clean Reference DB: myca_independent_reference
+  Schema SHA256: 094a634892baa01db85044604c00de7c80d1252cec5eb83254a0af58f2cad43c
+  Complete Definitions: 79 grants, 87 policies, 41 tables.
 
 === Step 1: Establish Baseline at 0019 & Verify Against Independent Reference ===
-  Captured 0019 Database State: 79 grants, 88 policies, 41 tables.
-  PASS: Initial downgrade to 0019 matches independent trusted reference snapshot 100% (79 grants, 88 policies, 41 tables).
+  Captured 0019 Database State: 79 grants, 87 policies, 41 tables.
+  PASS: Initial downgrade to 0019 matches independent trusted reference snapshot 100% on full definitions (79 grants, 87 policies, 41 tables).
 
 === Step 2: Upgrade to Head (0021_enforce_tenant_force_rls) ===
-  Head State (0021): 105 grants, 96 policies.
+  Head State (0021): 105 grants, 95 policies.
 PASS: Head state (0021) completely verified.
 
 === Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===
-  State at 0020: 105 grants, 96 policies.
+  State at 0020: 105 grants, 95 policies.
 PASS: Downgrade to 0020 completely verified.
 
 === Step 4: Downgrade to 0019_m3_gstr3b_filings & Assert Exact Baseline Match ===
   PASS: All 8 policies from 0020 were cleanly dropped.
-  PASS: Exact match on all 79 role_table_grants against independent reference.
-  PASS: Exact match on all 88 policies against independent reference.
+  PASS: Exact match on all 79 full grant definitions against independent reference.
+  PASS: Exact match on all 87 complete policy definitions (including cmd, roles, qual, with_check) against independent reference.
   PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.
 
 === Step 5: Re-Upgrade to Head (0021_enforce_tenant_force_rls) ===
@@ -183,7 +186,7 @@ computing gzip size...
 dist/index.html                   0.48 kB │ gzip:   0.33 kB
 dist/assets/index-CXHqnTlf.css   29.39 kB │ gzip:   5.62 kB
 dist/assets/index-DBkuh5Fw.js   420.23 kB │ gzip: 107.43 kB
-✓ built in 3.48s
+✓ built in 9.88s
 ```
 - TypeScript: 0 errors
-- Vite: 1,583 modules transformed in 3.48s
+- Vite: 1,583 modules transformed in 9.88s

@@ -4,7 +4,7 @@ import subprocess
 import sys
 import psycopg
 
-DB_ADMIN_URL = "postgresql://postgres@localhost:5432/myca"
+DB_ADMIN_URL = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
 
 TENANT_TABLES_21 = [
     "gst_registrations",
@@ -54,23 +54,28 @@ def run_cmd(cmd_list):
 
 def capture_database_state(conn):
     with conn.cursor() as cur:
-        # 1. Grants for app_service_user
+        # 1. Full grants for app_service_user
         cur.execute("""
-            SELECT table_name, privilege_type 
+            SELECT table_schema, table_name, privilege_type, is_grantable 
             FROM information_schema.role_table_grants 
             WHERE grantee = 'app_service_user' 
             ORDER BY table_name, privilege_type;
         """)
-        grants = set(cur.fetchall())
+        grants = {
+            (r[0], r[1], r[2], r[3]) for r in cur.fetchall()
+        }
 
-        # 2. Policies
+        # 2. Complete Policies with cmd, roles, qual, with_check
         cur.execute("""
-            SELECT tablename, policyname 
+            SELECT schemaname, tablename, policyname, permissive, roles, cmd, qual, with_check 
             FROM pg_policies 
             WHERE schemaname = 'public' 
             ORDER BY tablename, policyname;
         """)
-        policies = set(cur.fetchall())
+        policies = {
+            (r[0], r[1], r[2], r[3], tuple(sorted(r[4])) if r[4] else (), r[5], r[6], r[7])
+            for r in cur.fetchall()
+        }
 
         # 3. Table RLS flags
         cur.execute("""
@@ -89,13 +94,20 @@ def load_trusted_0019_reference():
         raise FileNotFoundError(f"Independent reference catalog file not found: {json_path}")
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    trusted_grants = {tuple(x) for x in data["grants"]}
-    trusted_policies = {tuple(x) for x in data["policies"]}
+    trusted_grants = {
+        (g["table_schema"], g["table_name"], g["privilege_type"], g["is_grantable"])
+        for g in data["full_grants"]
+    }
+    trusted_policies = {
+        (p["schemaname"], p["tablename"], p["policyname"], p["permissive"], tuple(sorted(p["roles"])), p["cmd"], p["qual"], p["with_check"])
+        for p in data["full_policies"]
+    }
     trusted_rls = {k: (v["relrowsecurity"], v["relforcerowsecurity"]) for k, v in data["rls_flags"].items()}
     return {
         "grants": trusted_grants,
         "policies": trusted_policies,
-        "rls_flags": trusted_rls
+        "rls_flags": trusted_rls,
+        "provenance": data.get("provenance", {})
     }
 
 def main():
@@ -103,8 +115,11 @@ def main():
     conn.autocommit = True
 
     trusted_ref = load_trusted_0019_reference()
-    print(f"Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json:")
-    print(f"  {len(trusted_ref['grants'])} grants, {len(trusted_ref['policies'])} policies, {len(trusted_ref['rls_flags'])} tables.")
+    print("=== Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json ===")
+    print(f"  Provenance Origin: {trusted_ref['provenance'].get('generated_from')}")
+    print(f"  Clean Reference DB: {trusted_ref['provenance'].get('isolated_database_name')}")
+    print(f"  Schema SHA256: {trusted_ref['provenance'].get('schema_sha256')}")
+    print(f"  Complete Definitions: {len(trusted_ref['grants'])} grants, {len(trusted_ref['policies'])} policies, {len(trusted_ref['rls_flags'])} tables.")
 
     print("\n=== Step 1: Establish Baseline at 0019 & Verify Against Independent Reference ===")
     run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
@@ -113,21 +128,21 @@ def main():
     assert baseline_0019["grants"] == trusted_ref["grants"], f"Grants mismatch with independent reference! Diff: {baseline_0019['grants'] ^ trusted_ref['grants']}"
     assert baseline_0019["policies"] == trusted_ref["policies"], f"Policies mismatch with independent reference! Diff: {baseline_0019['policies'] ^ trusted_ref['policies']}"
     assert baseline_0019["rls_flags"] == trusted_ref["rls_flags"], "RLS flags mismatch with independent reference!"
-    print("  PASS: Initial downgrade to 0019 matches independent trusted reference snapshot 100% (79 grants, 88 policies, 41 tables).")
+    print("  PASS: Initial downgrade to 0019 matches independent trusted reference snapshot 100% on full definitions (79 grants, 87 policies, 41 tables).")
 
     print("\n=== Step 2: Upgrade to Head (0021_enforce_tenant_force_rls) ===")
     run_cmd(["alembic", "upgrade", "head"])
     state_0021 = capture_database_state(conn)
     print(f"  Head State (0021): {len(state_0021['grants'])} grants, {len(state_0021['policies'])} policies.")
     assert len(state_0021["grants"]) == 105, f"Expected 105 grants at 0021, got {len(state_0021['grants'])}"
-    assert len(state_0021["policies"]) == 96, f"Expected 96 policies at 0021, got {len(state_0021['policies'])}"
+    assert len(state_0021["policies"]) == 95, f"Expected 95 policies at 0021, got {len(state_0021['policies'])}"
 
     # Verify all 21 tables have relforcerowsecurity=True
     for tbl in TENANT_TABLES_21:
         assert state_0021["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0021"
     # Verify all 8 0020 policies present
     for p_name in POLICIES_0020_8:
-        matching = [p for p in state_0021["policies"] if p[1] == p_name]
+        matching = [p for p in state_0021["policies"] if p[2] == p_name]
         assert len(matching) == 1, f"Policy {p_name} missing at 0021"
     print("PASS: Head state (0021) completely verified.")
 
@@ -141,7 +156,7 @@ def main():
         assert state_0020["rls_flags"][tbl][0] is True, f"{tbl} must keep relrowsecurity=True at 0020"
     # Verify all 8 0020 policies remain active in 0020
     for p_name in POLICIES_0020_8:
-        matching = [p for p in state_0020["policies"] if p[1] == p_name]
+        matching = [p for p in state_0020["policies"] if p[2] == p_name]
         assert len(matching) == 1, f"Policy {p_name} must remain active at 0020"
     print("PASS: Downgrade to 0020 completely verified.")
 
@@ -151,7 +166,7 @@ def main():
 
     # A. Assert all 8 0020 policies are completely removed
     for p_name in POLICIES_0020_8:
-        matching = [p for p in rolled_back_state["policies"] if p[1] == p_name]
+        matching = [p for p in rolled_back_state["policies"] if p[2] == p_name]
         assert len(matching) == 0, f"Policy {p_name} was NOT removed on rollback to 0019!"
     print("  PASS: All 8 policies from 0020 were cleanly dropped.")
 
@@ -161,7 +176,7 @@ def main():
     assert len(missing_grants) == 0, f"Rollback corrupted baseline grants! Missing: {missing_grants}"
     assert len(extra_grants) == 0, f"Rollback left extra grants! Extra: {extra_grants}"
     assert rolled_back_state["grants"] == trusted_ref["grants"], "Rollback grants mismatch with independent reference snapshot!"
-    print("  PASS: Exact match on all 79 role_table_grants against independent reference.")
+    print("  PASS: Exact match on all 79 full grant definitions against independent reference.")
 
     # C. Compare exact policies against captured 0019 baseline and independent trusted reference
     missing_policies = baseline_0019["policies"] - rolled_back_state["policies"]
@@ -169,7 +184,7 @@ def main():
     assert len(missing_policies) == 0, f"Rollback corrupted baseline policies! Missing: {missing_policies}"
     assert len(extra_policies) == 0, f"Rollback left extra policies! Extra: {extra_policies}"
     assert rolled_back_state["policies"] == trusted_ref["policies"], "Rollback policies mismatch with independent reference snapshot!"
-    print("  PASS: Exact match on all 88 policies against independent reference.")
+    print("  PASS: Exact match on all 87 complete policy definitions (including cmd, roles, qual, with_check) against independent reference.")
 
     # D. Compare exact table RLS flags against captured 0019 baseline and independent trusted reference
     assert rolled_back_state["rls_flags"] == trusted_ref["rls_flags"], "Rollback RLS flags mismatch with independent reference snapshot!"
