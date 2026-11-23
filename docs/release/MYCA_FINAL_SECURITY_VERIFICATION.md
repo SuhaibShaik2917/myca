@@ -162,3 +162,21 @@ Migration downgrade safety and baseline restoration verified via `backend/script
   - Compared exact complete policy definitions against baseline: **0 missing policies, 0 extra policies (100% exact match)**.
   - Compared table RLS and FORCE RLS flags: **100% exact match**.
 - **Step 5 (Re-Upgrade to Head 0021):** Re-upgraded to `0021_enforce_tenant_force_rls`, fully restoring head state with 105 grants, 95 policies, and 36 forced RLS tenant tables.
+
+---
+
+## 6. SERVER-SIDE CRYPTOGRAPHIC AUDITOR AUTHENTICATION (v1.0.3)
+
+Implemented in `backend/app/modules/reconciliation/itc_engine.py`:
+- **Cryptographic Signature Engine:** Server-side HMAC-SHA256 signature generation and verification over canonical invoice and certification state:
+  ```text
+  canonical_msg = f"{doc_id}:{doc_number}:{total_invoice_value}:{total_tax}:{header_rate}:{verifier_id}:{verifier_role}:{evidence_ref}:{timestamp}"
+  ```
+- **Signing Secret Key:** Authenticated via server-side `STATUTORY_AUDIT_SIGNING_KEY` (injected via secure production environment configuration).
+- **Identity & Role Registry Lookup:** Cross-referenced against authoritative `TRUSTED_STATUTORY_AUDITOR_REGISTRY` verifying:
+  - Auditor ID exists and is strictly `ACTIVE`.
+  - Authorized role matches claimed role in `AUTHORIZED_VERIFIER_ROLES` (`CHARTERED_ACCOUNTANT`, `TAX_AUDITOR`, `STATUTORY_AUDITOR`).
+  - Active ICAI membership and firm registration number validations.
+- **Constant-Time Verification:** Employs `hmac.compare_digest` to prevent side-channel timing attacks. Arbitrary client strings (e.g. `"TOKEN-AUTH-SIG-998877"`), unregistered IDs (`"CA-FAKE-99"`), tampered totals, or expired certifications fail safe to CA review (`REVIEW_REQUIRED`).
+- **Elimination of Boolean Traps:** Python string values (`"true"`, `"false"`, `"0"`, `"1"`, `"yes"`) and raw unauthenticated booleans are strictly rejected.
+

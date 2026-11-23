@@ -1,4 +1,7 @@
 import logging
+import os
+import hmac
+import hashlib
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Any, Optional
 from datetime import date, datetime
@@ -1150,7 +1153,8 @@ def _extract_pure_taxable_value(line: dict) -> Optional[Decimal]:
     return None
 
 
-VALID_STATUTORY_GST_RATES = {
+# Total applicable statutory GST rates (IGST or CGST + SGST combined)
+VALID_TOTAL_STATUTORY_GST_RATES = {
     Decimal("0.00"),
     Decimal("0.10"),
     Decimal("0.25"),
@@ -1159,12 +1163,13 @@ VALID_STATUTORY_GST_RATES = {
     Decimal("5.00"),
     Decimal("6.00"),
     Decimal("12.00"),
-    Decimal("14.00"),
     Decimal("18.00"),
-    Decimal("20.00"),
     Decimal("28.00"),
     Decimal("40.00"),
 }
+
+# Retain backward-compatible alias for any internal imports
+VALID_STATUTORY_GST_RATES = VALID_TOTAL_STATUTORY_GST_RATES
 
 # Authorized roles permitted to certify uniform multi-line rates
 AUTHORIZED_VERIFIER_ROLES = {
@@ -1173,49 +1178,130 @@ AUTHORIZED_VERIFIER_ROLES = {
     "STATUTORY_AUDITOR",
 }
 
-# Statutory HSN/SAC rate schedule catalogue indexed by HSN/SAC code or prefix
-# Reference: Notification No. 1/2017-Integrated Tax (Rate), Notification No. 9/2025-Integrated Tax (Rate),
-# Notification No. 19/2025-Integrated Tax (Rate), and corresponding Central Tax (Rate) notifications.
+# Server-side signing secret for statutory audit tokens
+STATUTORY_AUDIT_SIGNING_KEY = os.environ.get(
+    "STATUTORY_AUDIT_SIGNING_KEY",
+    "MYCA_PROD_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.3_SECURE_2026"
+).encode("utf-8")
+
+# Trusted server-side registry of authorized statutory auditors
+TRUSTED_STATUTORY_AUDITOR_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "CA-AUDITOR-01": {
+        "name": "CA Rajesh Kumar",
+        "membership_no": "ICAI-M-098765",
+        "firm_registration_no": "100234W",
+        "authorized_role": "CHARTERED_ACCOUNTANT",
+        "status": "ACTIVE"
+    },
+    "TAX-AUDITOR-02": {
+        "name": "CA Priya Sharma",
+        "membership_no": "ICAI-M-112233",
+        "firm_registration_no": "200567S",
+        "authorized_role": "TAX_AUDITOR",
+        "status": "ACTIVE"
+    },
+    "STAT-AUDITOR-03": {
+        "name": "S. Mehta & Associates",
+        "membership_no": "ICAI-M-554433",
+        "firm_registration_no": "300890E",
+        "authorized_role": "STATUTORY_AUDITOR",
+        "status": "ACTIVE"
+    }
+}
+
+
+def generate_auditor_verification_signature(
+    doc_id: str,
+    doc_number: str,
+    total_invoice_value: Decimal,
+    total_tax: Decimal,
+    header_rate: Decimal,
+    verifier_id: str,
+    verifier_role: str,
+    evidence_ref: str,
+    timestamp: str
+) -> str:
+    """
+    Computes authentic HMAC-SHA256 signature for statutory uniform-rate certification.
+    """
+    canonical_msg = (
+        f"{str(doc_id).strip()}:"
+        f"{str(doc_number).strip()}:"
+        f"{Decimal(str(total_invoice_value or 0)).quantize(Decimal('0.01'))}:"
+        f"{Decimal(str(total_tax or 0)).quantize(Decimal('0.01'))}:"
+        f"{Decimal(str(header_rate or 0)).quantize(Decimal('0.01'))}:"
+        f"{str(verifier_id).strip()}:"
+        f"{str(verifier_role).strip().upper()}:"
+        f"{str(evidence_ref).strip()}:"
+        f"{str(timestamp).strip()}"
+    )
+    return hmac.new(STATUTORY_AUDIT_SIGNING_KEY, canonical_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+# Statutory HSN/SAC rate schedule catalogue indexed by exact tariff item or prefix
+# Incorporates Notification No. 1/2017-IT (Rate), Notification No. 19/2025-IT (Rate),
+# Notification No. 01/2026-IT (Rate), and corresponding Central Tax (Rate) notifications.
 STATUTORY_HSN_RATE_SCHEDULE: Dict[str, Dict[str, Any]] = {
     # Schedule V (0.25% - Precious stones, rough diamonds)
     "7102": {"rates": {Decimal("0.25")}, "schedule": "Schedule V", "description": "Diamonds, unworked or worked"},
     "7103": {"rates": {Decimal("0.25")}, "schedule": "Schedule V", "description": "Precious stones (other than diamonds)"},
     "7104": {"rates": {Decimal("0.25")}, "schedule": "Schedule V", "description": "Synthetic or reconstructed precious stones"},
     # Schedule VI (3% - Gold, silver, jewellery)
-    "7106": {"rates": {Decimal("3.00"), Decimal("1.50")}, "schedule": "Schedule VI", "description": "Silver unwrought or semi-manufactured"},
-    "7108": {"rates": {Decimal("3.00"), Decimal("1.50")}, "schedule": "Schedule VI", "description": "Gold unwrought or semi-manufactured"},
-    "7113": {"rates": {Decimal("3.00"), Decimal("1.50")}, "schedule": "Schedule VI", "description": "Articles of jewellery"},
-    # Schedule I & II (5%, 12% - Passenger transport, restaurant, essential goods)
+    "7106": {"rates": {Decimal("3.00")}, "schedule": "Schedule VI", "description": "Silver unwrought or semi-manufactured"},
+    "7108": {"rates": {Decimal("3.00")}, "schedule": "Schedule VI", "description": "Gold unwrought or semi-manufactured"},
+    "7113": {"rates": {Decimal("3.00")}, "schedule": "Schedule VI", "description": "Articles of jewellery"},
+    # Schedule I & II (5%, 12% - Passenger transport, essential services)
     "9964": {"rates": {Decimal("5.00"), Decimal("12.00")}, "schedule": "Schedule I / II", "description": "Passenger transport services"},
     "9963": {"rates": {Decimal("5.00"), Decimal("18.00")}, "schedule": "Schedule I / III", "description": "Accommodation, food and beverage services"},
-    # Schedule II (12% - Works contract, business class passenger transport)
+    # Schedule II (12% - Works contract, construction)
     "9954": {"rates": {Decimal("12.00"), Decimal("18.00")}, "schedule": "Schedule II / III", "description": "Construction and works contract services"},
     # Schedule III (18% - Standard rate for services, repair & maintenance)
     "9987": {"rates": {Decimal("18.00")}, "schedule": "Schedule III", "description": "Maintenance, repair and installation services"},
     "9971": {"rates": {Decimal("18.00")}, "schedule": "Schedule III", "description": "Financial and insurance services"},
-    # Schedule IV (28% - Motor cars, high luxury goods)
+    # Schedule IV (28% - Motor vehicles)
     "8702": {"rates": {Decimal("18.00"), Decimal("28.00")}, "schedule": "Schedule III / IV", "description": "Motor vehicles for transport >= 10 persons"},
     "8703": {"rates": {Decimal("18.00"), Decimal("28.00")}, "schedule": "Schedule III / IV", "description": "Motor cars and personal motor vehicles"},
-    # Specific Tariff item 2106 90 20 (Pan Masala) under Notification No. 9/2025-Integrated Tax (Rate)
-    "21069020": {"rates": {Decimal("40.00"), Decimal("20.00")}, "schedule": "Notification 9/2025", "description": "Pan masala (tariff item 2106 90 20)"},
-    # General heading 2106 (Food preparations not elsewhere specified, excluding 2106 90 20 Pan Masala)
-    "2106": {"rates": {Decimal("5.00"), Decimal("12.00"), Decimal("18.00"), Decimal("28.00")}, "schedule": "Schedule I / II / III", "description": "Food preparations other than pan masala"},
-    # Biris under tariff items 2403 19 21 and 2403 19 29 - Excluded from 40% rate; remain at 28%
-    "24031921": {"rates": {Decimal("28.00"), Decimal("14.00")}, "schedule": "Schedule IV", "description": "Other biris, other than handmade"},
-    "24031929": {"rates": {Decimal("28.00"), Decimal("14.00")}, "schedule": "Schedule IV", "description": "Handmade biris"},
+    "8704": {"rates": {Decimal("18.00"), Decimal("28.00")}, "schedule": "Schedule III / IV", "description": "Goods transport motor vehicles"},
+    "8711": {"rates": {Decimal("18.00"), Decimal("28.00")}, "schedule": "Schedule III / IV", "description": "Motorcycles and cycles with auxiliary motor"},
+    # Heading 2401 (Unmanufactured tobacco; tobacco refuse)
+    "24013000": {"schedule": "Notification 19/2025", "description": "Tobacco refuse"},
+    "2401": {"rates": {Decimal("5.00")}, "schedule": "Schedule I", "description": "Tobacco leaves (raw)"},
+    # Specific Tariff item 2106 90 20 (Pan Masala) under Notification No. 19/2025-IT (Rate)
+    "21069020": {"schedule": "Notification 19/2025", "description": "Pan masala (tariff item 2106 90 20)"},
+    # General heading 2106 (Food preparations other than pan masala)
+    "2106": {"schedule": "Schedule I / II / III", "description": "Food preparations other than pan masala"},
+    # Biris under tariff items 2403 19 21 and 2403 19 29 (Moved to 18% from 01.02.2026 under Notif 19/2025)
+    "24031921": {"schedule": "Notification 19/2025", "description": "Other biris, other than handmade"},
+    "24031929": {"schedule": "Notification 19/2025", "description": "Handmade biris"},
     # General heading 2403 (Other manufactured tobacco, excluding biris)
-    "2403": {"rates": {Decimal("28.00"), Decimal("40.00"), Decimal("20.00"), Decimal("14.00")}, "schedule": "Schedule IV / Notif 9/2025", "description": "Other manufactured tobacco excluding biris"},
+    "2403": {"schedule": "Schedule IV / Notif 19/2025", "description": "Other manufactured tobacco excluding biris"},
     # Heading 2402 (Cigars, cheroots, cigarillos and cigarettes)
-    "2402": {"rates": {Decimal("28.00"), Decimal("40.00"), Decimal("20.00"), Decimal("14.00")}, "schedule": "Schedule IV / Notif 9/2025", "description": "Cigars, cheroots, cigarillos and cigarettes"},
-    # Heading 2202 (Aerated waters with added sugar / sweetening matter) - Date-dependent 40% effective 1 May 2026
-    "2202": {"rates": {Decimal("28.00"), Decimal("40.00"), Decimal("20.00"), Decimal("18.00"), Decimal("14.00"), Decimal("12.00")}, "schedule": "Schedule IV / Notif 9/2025", "description": "Aerated waters containing added sugar or sweetening matter"}
+    "2402": {"schedule": "Schedule IV / Notif 19/2025", "description": "Cigars, cheroots, cigarillos and cigarettes"},
+    # Heading 2404 (Products containing tobacco, nicotine, substitutes for inhalation)
+    "2404": {"schedule": "Notification 19/2025", "description": "Novel tobacco and nicotine products"},
+    # Heading 2202 Subheadings (Granular tariff items under Notif 01/2026)
+    # Aerated & caffeinated waters (28% pre-May 2026; 40% effective 1 May 2026)
+    "22021010": {"schedule": "Notif 01/2026", "description": "Aerated waters containing added sugar"},
+    "22021020": {"schedule": "Notif 01/2026", "description": "Lemonade"},
+    "22021090": {"schedule": "Notif 01/2026", "description": "Other aerated waters with sugar or flavour"},
+    "220210": {"schedule": "Notif 01/2026", "description": "Waters, including mineral waters and aerated waters, containing added sugar"},
+    "22029920": {"schedule": "Notif 01/2026", "description": "Caffeinated beverages"},
+    # Fruit juice based drinks, soya milk drinks, tender coconut water (5% or 12% strictly)
+    "22029010": {"rates": {Decimal("5.00"), Decimal("12.00")}, "schedule": "Notif 01/2026", "description": "Soya milk drinks"},
+    "22029020": {"rates": {Decimal("5.00"), Decimal("12.00")}, "schedule": "Notif 01/2026", "description": "Fruit pulp or fruit juice based drinks"},
+    "22029030": {"rates": {Decimal("5.00"), Decimal("12.00")}, "schedule": "Notif 01/2026", "description": "Beverages containing milk"},
+    "22029910": {"rates": {Decimal("5.00"), Decimal("12.00")}, "schedule": "Notif 01/2026", "description": "Soya milk drinks (2020+)"},
+    "22029930": {"rates": {Decimal("5.00"), Decimal("12.00")}, "schedule": "Notif 01/2026", "description": "Beverages containing milk (2020+)"},
+    "22029990": {"rates": {Decimal("5.00"), Decimal("12.00")}, "schedule": "Notif 01/2026", "description": "Other fruit/plant based beverages"},
+    "220290": {"rates": {Decimal("5.00"), Decimal("12.00")}, "schedule": "Notif 01/2026", "description": "Other non-alcoholic beverages (fruit/milk)"},
+    "220299": {"rates": {Decimal("5.00"), Decimal("12.00")}, "schedule": "Notif 01/2026", "description": "Other non-alcoholic beverages (fruit/milk)"}
 }
 
 
 def _is_valid_statutory_gst_rate(rate: Optional[Decimal]) -> bool:
     if rate is None:
         return False
-    return rate in VALID_STATUTORY_GST_RATES
+    return rate in VALID_TOTAL_STATUTORY_GST_RATES
 
 
 def validate_hsn_statutory_rate(
@@ -1225,97 +1311,189 @@ def validate_hsn_statutory_rate(
 ) -> tuple[bool, str]:
     """
     Rigorously validates whether a proposed GST rate conforms to statutory tariff schedules:
-    1. Rate must be in VALID_STATUTORY_GST_RATES.
-    2. If HSN/SAC is provided, evaluates against STATUTORY_HSN_RATE_SCHEDULE with date-aware rules:
-       - 2106: 40% applies strictly to tariff item 2106 90 20 (Pan Masala under Notification No. 9/2025-IT (Rate)),
-         and is rejected for broad heading 2106 (which is 18%, 12%, 5%, or 28% pre-omission).
-       - 2403: 40% applies to tobacco preparations but strictly EXCLUDES biris (2403 19 21 and 2403 19 29),
-         which statutorily remain at 28%.
-       - 2202: Aerated waters / caffeinated beverages: 40% rate is effective from 1 May 2026 (2026-05-01).
-         Prior to 2026-05-01, 40% is rejected and 28% applies.
-       - 28% Schedule VII omission: Under Notification No. 19/2025-IT (Rate), 28% is omitted effective
-         1 February 2026 for relevant transitioned categories.
-       - Services (9963, 9987, 9954, 9971, 9964): Rates strictly validated to 5%, 12%, 18%; non-service rates
-         (e.g. 40%, 0.25%) are rejected.
-       - Diamonds & precious stones (7102, 7103, 7104): 0.25% strictly validated.
+    Statutory Invariants & Zero-Trust Fail-Safe Rules:
+    1. Rejects excess decimal precision beyond 2 decimal places (silent rounding prohibited).
+    2. Rate must be in VALID_TOTAL_STATUTORY_GST_RATES.
+    3. Zero-Trust Classification: Missing or unknown HSN/SAC codes FAIL SAFE to review
+       (never defaults to True against general whitelist).
+    4. Date-Aware Tariff Schedules:
+       - 2106 90 20 (Pan Masala under Notif 19/2025): 28% before 01.02.2026; 40% on/after 01.02.2026.
+       - 2106 (Other food preparations): 40% strictly prohibited. 5%, 12%, 18% (28% only pre-01.02.2026).
+       - 2403 19 21 / 2403 19 29 (Biris under Notif 19/2025): 28% before 01.02.2026; 18% on/after 01.02.2026.
+       - 2403 (Other manufactured tobacco): 28% before 01.02.2026; 40% on/after 01.02.2026 (28% omitted).
+       - 2402 (Cigarettes): 28% before 01.02.2026; 40% on/after 01.02.2026 (28% omitted).
+       - 2401 30 00 / 2404: 28% before 01.02.2026; 40% on/after 01.02.2026.
+       - 2202 Subheadings (Notification 01/2026-IT (Rate)):
+         * 2202 10 / 2202 10 10 / 2202 99 20 (Aerated/caffeinated): 28% before 01.05.2026; 40% on/after 01.05.2026.
+         * 2202 90 / 2202 99 10 (Fruit/milk beverages): 5% or 12% strictly (40% and 28% prohibited).
+         * Broad unspecified '2202' without subheading: fails safe to review.
     """
     try:
-        r = Decimal(str(rate)).quantize(Decimal("0.01"))
+        r_str = str(rate).strip().rstrip("%")
+        r_dec = Decimal(r_str)
+        # Check excess precision: silent rounding prohibited!
+        if r_dec != r_dec.quantize(Decimal("0.01")):
+            return False, f"EXCESS_PRECISION: Rate {r_str} exceeds statutory 2 decimal places (silent rounding prohibited)."
+        r = r_dec.quantize(Decimal("0.01"))
     except Exception:
         return False, f"Invalid rate format: {rate}"
 
-    if r not in VALID_STATUTORY_GST_RATES:
-        return False, f"Rate {r}% is not a valid statutory GST rate in India."
+    if r not in VALID_TOTAL_STATUTORY_GST_RATES:
+        return False, f"Rate {r}% is not a valid total statutory GST rate in India."
 
+    # Zero-Trust: Missing HSN fails safe to CA review
     if not hsn_sac:
-        return True, f"Rate {r}% is a valid statutory rate (general schedule, no HSN provided)."
+        return False, "MISSING_HSN: Missing HSN/SAC code prevents statutory tariff verification; routes to CA review."
 
     clean_hsn = "".join(c for c in str(hsn_sac).strip() if c.isalnum())
     if not clean_hsn:
-        return True, f"Rate {r}% is a valid statutory rate."
+        return False, "MISSING_HSN: Empty HSN/SAC code prevents statutory tariff verification; routes to CA review."
 
     doc_dt = document_date or date.today()
 
     # 1. Exact match checks for specific 8-digit tariff items
+    # Pan Masala (2106 90 20) under Notification No. 19/2025-IT (Rate)
     if clean_hsn == "21069020":
-        # Pan Masala under Notification No. 9/2025-IT (Rate): 40% IGST or 20% CGST/SGST
-        allowed = {Decimal("40.00"), Decimal("20.00")}
-        if r in allowed:
-            return True, f"Rate {r}% is valid for Pan Masala (tariff item 2106 90 20) under Notification No. 9/2025."
-        return False, f"Rate {r}% is not permitted for tariff item 2106 90 20 (allowed: 40%, 20%)."
+        if doc_dt >= date(2026, 2, 1):
+            if r == Decimal("40.00"):
+                return True, f"Rate {r}% is valid for Pan Masala (tariff item 2106 90 20) effective from 1 February 2026 under Notification No. 19/2025."
+            return False, f"Rate {r}% is not permitted for tariff item 2106 90 20 on/after 01.02.2026 (statutory rate is 40%, 28% omitted)."
+        else:
+            if r == Decimal("28.00"):
+                return True, f"Rate {r}% is valid for Pan Masala (tariff item 2106 90 20) prior to 1 February 2026."
+            return False, f"Rate {r}% is not permitted for tariff item 2106 90 20 prior to 01.02.2026 (prevailing rate was 28%, 40% not yet in force)."
 
+    # Biris (2403 19 21 and 2403 19 29) under Notification No. 19/2025-IT (Rate)
     if clean_hsn in ("24031921", "24031929"):
-        # Biris: strictly excluded from 40%; remains at 28% IGST or 14% CGST/SGST
-        allowed = {Decimal("28.00"), Decimal("14.00")}
-        if r in allowed:
-            return True, f"Rate {r}% is valid for biris (tariff item {clean_hsn}) at 28%."
-        return False, f"Rate {r}% is not permitted for biris under tariff item {clean_hsn} (biris remain at 28%/14%, excluded from 40%)."
+        if doc_dt >= date(2026, 2, 1):
+            if r == Decimal("18.00"):
+                return True, f"Rate {r}% is valid for biris (tariff item {clean_hsn}) effective from 1 February 2026 (moved to 18% schedule under Notif 19/2025)."
+            return False, f"Rate {r}% is not permitted for biris under tariff item {clean_hsn} on/after 01.02.2026 (statutory rate is 18%, 28%/40% prohibited)."
+        else:
+            if r == Decimal("28.00"):
+                return True, f"Rate {r}% is valid for biris (tariff item {clean_hsn}) prior to 1 February 2026."
+            return False, f"Rate {r}% is not permitted for biris prior to 01.02.2026 (prevailing rate was 28%)."
+
+    # Tobacco refuse (2401 30 00)
+    if clean_hsn == "24013000":
+        if doc_dt >= date(2026, 2, 1):
+            if r == Decimal("40.00"):
+                return True, f"Rate {r}% is valid for tobacco refuse post-01.02.2026 under Notif 19/2025."
+            return False, f"Rate {r}% is not permitted for tobacco refuse on/after 01.02.2026 (statutory rate is 40%)."
+        else:
+            if r == Decimal("28.00"):
+                return True, f"Rate {r}% is valid for tobacco refuse pre-01.02.2026."
+            return False, f"Rate {r}% is not permitted for tobacco refuse pre-01.02.2026 (prevailing rate was 28%)."
 
     # 2. Heading 2106 (excluding 2106 90 20)
     if clean_hsn.startswith("2106"):
-        # Broad heading 2106 food preparations: 40% is NOT permitted!
-        if r in (Decimal("40.00"), Decimal("20.00")):
-            return False, f"Rate {r}% is restricted to tariff item 2106 90 20 (Pan Masala) and cannot be applied to broad heading 2106 food preparations."
-        # Notification No. 19/2025-IT (Rate) omitting 28% effective 1 February 2026
+        # Broad heading 2106 food preparations: 40% is strictly prohibited!
+        if r == Decimal("40.00"):
+            return False, f"Rate 40.00% is restricted to tariff item 2106 90 20 (Pan Masala) and cannot be applied to broad heading 2106 food preparations."
         if doc_dt >= date(2026, 2, 1):
             allowed = {Decimal("5.00"), Decimal("12.00"), Decimal("18.00")}
             if r in allowed:
-                return True, f"Rate {r}% is valid for heading 2106 post-1 Feb 2026 (Schedule VII 28% omitted)."
-            return False, f"Rate {r}% is not permitted for heading 2106 on {doc_dt} (28% omitted from 01.02.2026 under Notif 19/2025)."
+                return True, f"Rate {r}% is valid for heading 2106 post-1 Feb 2026 (Schedule VII 28% omitted under Notif 19/2025)."
+            return False, f"Rate {r}% is not permitted for heading 2106 on {doc_dt} (28% omitted from 01.02.2026; allowed: 5%, 12%, 18%)."
         else:
             allowed = {Decimal("5.00"), Decimal("12.00"), Decimal("18.00"), Decimal("28.00")}
             if r in allowed:
-                return True, f"Rate {r}% is valid for heading 2106."
-            return False, f"Rate {r}% is not permitted for heading 2106."
+                return True, f"Rate {r}% is valid for heading 2106 pre-01.02.2026."
+            return False, f"Rate {r}% is not permitted for heading 2106 pre-01.02.2026 (allowed: 5%, 12%, 18%, 28%)."
 
-    # 3. Heading 2202: Aerated waters / caffeinated beverages
+    # 3. Heading 2202 Granular Subheadings (Notification 01/2026-IT (Rate))
     if clean_hsn.startswith("2202"):
-        if r in (Decimal("40.00"), Decimal("20.00")):
-            if doc_dt < date(2026, 5, 1):
-                return False, f"Rate {r}% for aerated waters (heading 2202) is only effective from 1 May 2026; on {doc_dt} the prevailing rate was 28%."
-            return True, f"Rate {r}% is valid for aerated waters under Notification No. 9/2025 effective from 1 May 2026."
-        allowed_standard = {Decimal("28.00"), Decimal("14.00"), Decimal("18.00"), Decimal("12.00")}
-        if r in allowed_standard:
-            return True, f"Rate {r}% is valid for heading 2202."
-        return False, f"Rate {r}% is not permitted for heading 2202."
+        # Check aerated and caffeinated water subheadings
+        if clean_hsn.startswith(("220210", "22029920")):
+            if doc_dt >= date(2026, 5, 1):
+                if r == Decimal("40.00"):
+                    return True, f"Rate {r}% is valid for aerated/caffeinated waters under heading {clean_hsn} effective from 1 May 2026 under Notif 01/2026."
+                return False, f"Rate {r}% is not permitted for aerated/caffeinated waters on/after 01.05.2026 (rate moved to 40%, 28% omitted)."
+            else:
+                if r == Decimal("28.00"):
+                    return True, f"Rate {r}% is valid for aerated/caffeinated waters under heading {clean_hsn} prior to 1 May 2026."
+                return False, f"Rate {r}% is not permitted for aerated/caffeinated waters prior to 01.05.2026 (prevailing rate was 28%, 40% not in force)."
+
+        # Check fruit juice based / soya / milk containing drinks
+        if clean_hsn.startswith(("220290", "22029910", "22029930", "22029990")):
+            allowed = {Decimal("5.00"), Decimal("12.00")}
+            if r in allowed:
+                return True, f"Rate {r}% is valid for fruit-based/milk-containing beverage under heading {clean_hsn} (5%/12% retained under Notif 01/2026)."
+            return False, f"Rate {r}% is not permitted for fruit/milk beverage under heading {clean_hsn} (statutory rate is 5% or 12%; 40% and 28% are prohibited)."
+
+        # Unspecified 4-digit code '2202' without subheading is ambiguous
+        return False, "AMBIGUOUS_TARIFF: Heading 2202 requires specific tariff subheading (e.g. 2202 10 for aerated waters vs 2202 99 10 for fruit drinks) to determine statutory rate; routes to CA review."
 
     # 4. Heading 2403 (Other manufactured tobacco, non-biri)
     if clean_hsn.startswith("2403"):
-        allowed = {Decimal("40.00"), Decimal("20.00"), Decimal("28.00"), Decimal("14.00")}
-        if r in allowed:
-            return True, f"Rate {r}% is valid for manufactured tobacco under heading 2403."
-        return False, f"Rate {r}% is not permitted for heading 2403."
+        if doc_dt >= date(2026, 2, 1):
+            if r == Decimal("40.00"):
+                return True, f"Rate {r}% is valid for manufactured tobacco under heading 2403 on/after 01.02.2026 under Notif 19/2025."
+            return False, f"Rate {r}% is not permitted for manufactured tobacco on/after 01.02.2026 (statutory rate is 40%, 28% omitted)."
+        else:
+            if r == Decimal("28.00"):
+                return True, f"Rate {r}% is valid for manufactured tobacco under heading 2403 prior to 01.02.2026."
+            return False, f"Rate {r}% is not permitted for manufactured tobacco prior to 01.02.2026 (prevailing rate was 28%)."
 
-    # 5. General prefix match in catalogue
-    for prefix in [clean_hsn[:6], clean_hsn[:4], clean_hsn[:2]]:
+    # 5. Heading 2402 (Cigars, cheroots, cigarettes)
+    if clean_hsn.startswith("2402"):
+        if doc_dt >= date(2026, 2, 1):
+            if r == Decimal("40.00"):
+                return True, f"Rate {r}% is valid for cigarettes/cigars under heading 2402 on/after 01.02.2026 under Notif 19/2025."
+            return False, f"Rate {r}% is not permitted for cigarettes/cigars on/after 01.02.2026 (statutory rate is 40%, 28% omitted)."
+        else:
+            if r == Decimal("28.00"):
+                return True, f"Rate {r}% is valid for cigarettes/cigars under heading 2402 prior to 01.02.2026."
+            return False, f"Rate {r}% is not permitted for cigarettes/cigars prior to 01.02.2026 (prevailing rate was 28%)."
+
+    # 6. Heading 2404 (Novel tobacco and nicotine products)
+    if clean_hsn.startswith("2404"):
+        if doc_dt >= date(2026, 2, 1):
+            if r == Decimal("40.00"):
+                return True, f"Rate {r}% is valid for nicotine/tobacco products under heading 2404 on/after 01.02.2026 under Notif 19/2025."
+            return False, f"Rate {r}% is not permitted for heading 2404 on/after 01.02.2026 (statutory rate is 40%, 28% omitted)."
+        else:
+            if r == Decimal("28.00"):
+                return True, f"Rate {r}% is valid for heading 2404 prior to 01.02.2026."
+            return False, f"Rate {r}% is not permitted for heading 2404 prior to 01.02.2026 (prevailing rate was 28%)."
+
+    # 7. General catalogue matching by prefix (8-digit, 6-digit, 4-digit, 2-digit)
+    for prefix in [clean_hsn, clean_hsn[:6], clean_hsn[:4], clean_hsn[:2]]:
         if prefix in STATUTORY_HSN_RATE_SCHEDULE:
             entry = STATUTORY_HSN_RATE_SCHEDULE[prefix]
-            if r in entry["rates"]:
-                return True, f"Rate {r}% is valid for HSN/SAC {clean_hsn} under {entry.get('schedule', 'catalogue')}."
-            allowed_list = sorted([str(x) for x in entry["rates"]])
-            return False, f"Rate {r}% is not permitted for HSN/SAC {clean_hsn} (allowed: {allowed_list})."
+            if "rates" in entry:
+                if r in entry["rates"]:
+                    return True, f"Rate {r}% is valid for HSN/SAC {clean_hsn} under {entry.get('schedule', 'catalogue')}."
+                allowed_list = sorted([str(x) for x in entry["rates"]])
+                return False, f"Rate {r}% is not permitted for HSN/SAC {clean_hsn} (allowed: {allowed_list})."
 
-    return True, f"Rate {r}% is a valid statutory rate (general schedule)."
+    # Zero-Trust: If not found in catalogue, FAIL SAFE to CA review
+    return False, f"UNKNOWN_HSN: Tariff item {clean_hsn} is not catalogued in statutory schedule; cannot verify rate eligibility; routes to CA review."
+
+
+def _extract_header_rate(purchase_doc: Dict[str, Any]) -> Optional[Decimal]:
+    """
+    Extracts and validates document-level header GST rate from purchase document.
+    Enforces strict precision (rejecting excess decimals) and membership in
+    VALID_TOTAL_STATUTORY_GST_RATES.
+    (Statutory HSN tariff schedule matching is performed when applied to each line item).
+    """
+    if not isinstance(purchase_doc, dict):
+        return None
+    for r_key in ["rate_pct", "gst_rate", "tax_rate", "rate", "tax_percentage", "gst_pct"]:
+        if purchase_doc.get(r_key) is not None:
+            raw = str(purchase_doc[r_key]).strip().rstrip("%")
+            try:
+                rate_dec = Decimal(raw)
+                if rate_dec != rate_dec.quantize(Decimal("0.01")):
+                    return None
+                rate_val = rate_dec.quantize(Decimal("0.01"))
+                if rate_val in VALID_TOTAL_STATUTORY_GST_RATES:
+                    return rate_val
+                return None
+            except Exception:
+                return None
+    return None
 
 
 def _extract_line_rate(
@@ -1325,17 +1503,51 @@ def _extract_line_rate(
     hsn_sac: Optional[str] = None
 ) -> Optional[Decimal]:
     """
-    Extracts and validates GST rate according to explicit rate representation contract:
-    1. Fractional inputs: Accepted only via dedicated fractional fields (rate_fraction, tax_fraction)
+    Extracts and validates GST rate according to strict statutory rate representation:
+    1. Precision Gate: Rejects excess precision beyond 2 decimal places (silent rounding prohibited).
+    2. Component Rate Aggregation: If cgst_rate and sgst_rate are provided on line, aggregates to total rate.
+       If igst_rate is provided, uses igst_rate.
+    3. Fractional inputs: Accepted only via dedicated fractional fields (rate_fraction, tax_fraction)
        or when explicit representation: 'fraction' is declared. Values are scaled (*100) and validated.
-    2. Primary percentage point contract: Evaluated from standard rate fields (gst_rate, tax_rate, rate,
-       tax_percentage, gst_pct, rate_pct). Values must directly represent statutory percentage points
-       (e.g. 0.10, 0.25, 1.50, 3.00, 5.00, 6.00, 12.00, 14.00, 18.00, 20.00, 28.00, 40.00).
-       Ambiguous unscaled decimals (e.g. 0.18 in a percentage field) are REJECTED, eliminating guessing heuristics.
-    3. HSN/SAC Statutory Schedule: All rates are actively validated against validate_hsn_statutory_rate().
-    4. Fallback Header Rate: Applied only if valid under statutory HSN schedule.
+    4. Primary percentage point contract: Evaluated from standard rate fields. Must be in
+       VALID_TOTAL_STATUTORY_GST_RATES. Ambiguous unscaled decimals (e.g. 0.18 in a percentage field)
+       are REJECTED.
+    5. HSN/SAC Statutory Schedule: All rates are actively validated against validate_hsn_statutory_rate().
+       Missing or unknown HSN/SAC fails safe (returns None, triggering CA review).
+    6. Fallback Header Rate: Applied only if verified uniform and valid under statutory HSN schedule.
     """
     line_hsn = line.get("hsn_sac_code") or hsn_sac
+
+    # Case 0: Explicit line component rates (cgst_rate + sgst_rate or igst_rate)
+    if line.get("cgst_rate") is not None and line.get("sgst_rate") is not None:
+        try:
+            c_str = str(line["cgst_rate"]).strip().rstrip("%")
+            s_str = str(line["sgst_rate"]).strip().rstrip("%")
+            c_dec = Decimal(c_str)
+            s_dec = Decimal(s_str)
+            if c_dec != c_dec.quantize(Decimal("0.01")) or s_dec != s_dec.quantize(Decimal("0.01")):
+                return None
+            comb_rate = (c_dec + s_dec).quantize(Decimal("0.01"))
+            is_valid, _ = validate_hsn_statutory_rate(comb_rate, line_hsn, document_date)
+            if is_valid:
+                return comb_rate
+            return None
+        except Exception:
+            return None
+
+    if line.get("igst_rate") is not None:
+        try:
+            i_str = str(line["igst_rate"]).strip().rstrip("%")
+            i_dec = Decimal(i_str)
+            if i_dec != i_dec.quantize(Decimal("0.01")):
+                return None
+            igst_rate = i_dec.quantize(Decimal("0.01"))
+            is_valid, _ = validate_hsn_statutory_rate(igst_rate, line_hsn, document_date)
+            if is_valid:
+                return igst_rate
+            return None
+        except Exception:
+            return None
 
     # Case 1: Dedicated explicit fractional fields
     for frac_key in ["rate_fraction", "tax_fraction"]:
@@ -1343,7 +1555,11 @@ def _extract_line_rate(
             raw = str(line[frac_key]).strip()
             try:
                 frac_val = Decimal(raw)
-                scaled_rate = (frac_val * Decimal("100")).quantize(Decimal("0.01"))
+                scaled_rate = frac_val * Decimal("100")
+                if scaled_rate != scaled_rate.quantize(Decimal("0.01")):
+                    # Reject excess precision in fractional input (e.g. 0.18004)
+                    return None
+                scaled_rate = scaled_rate.quantize(Decimal("0.01"))
                 is_valid, _ = validate_hsn_statutory_rate(scaled_rate, line_hsn, document_date)
                 if is_valid:
                     return scaled_rate
@@ -1362,7 +1578,10 @@ def _extract_line_rate(
                 raw = str(line[r_key]).strip().rstrip("%")
                 try:
                     frac_val = Decimal(raw)
-                    scaled_rate = (frac_val * Decimal("100")).quantize(Decimal("0.01"))
+                    scaled_rate = frac_val * Decimal("100")
+                    if scaled_rate != scaled_rate.quantize(Decimal("0.01")):
+                        return None
+                    scaled_rate = scaled_rate.quantize(Decimal("0.01"))
                     is_valid, _ = validate_hsn_statutory_rate(scaled_rate, line_hsn, document_date)
                     if is_valid:
                         return scaled_rate
@@ -1375,9 +1594,13 @@ def _extract_line_rate(
         if line.get(r_key) is not None:
             raw = str(line[r_key]).strip().rstrip("%")
             try:
-                rate_val = Decimal(raw).quantize(Decimal("0.01"))
+                rate_dec = Decimal(raw)
+                # Precision check: excess precision (e.g. 18.004, 0.254, 5.001) MUST NOT be silently rounded!
+                if rate_dec != rate_dec.quantize(Decimal("0.01")):
+                    return None
+                rate_val = rate_dec.quantize(Decimal("0.01"))
                 # Strict statutory whitelist check: rejects ambiguous decimals like 0.18 in percentage field
-                if rate_val not in VALID_STATUTORY_GST_RATES:
+                if rate_val not in VALID_TOTAL_STATUTORY_GST_RATES:
                     return None
                 is_valid, _ = validate_hsn_statutory_rate(rate_val, line_hsn, document_date)
                 if is_valid:
@@ -1388,7 +1611,7 @@ def _extract_line_rate(
                 return None
 
     # Case 4: Fallback header rate (if verified uniform and valid for HSN)
-    if fallback_header_rate is not None and fallback_header_rate in VALID_STATUTORY_GST_RATES:
+    if fallback_header_rate is not None and fallback_header_rate in VALID_TOTAL_STATUTORY_GST_RATES:
         is_valid, _ = validate_hsn_statutory_rate(fallback_header_rate, line_hsn, document_date)
         if is_valid:
             return fallback_header_rate
@@ -1399,27 +1622,26 @@ def _extract_line_rate(
 
 def _is_strictly_verified_uniform_rate(purchase_doc: Dict[str, Any]) -> bool:
     """
-    Rigorously validates authenticated uniform-rate multi-line gating.
-    Untrusted purchase documents cannot bypass line-level statutory rate
-    reconciliation with an unauthenticated client boolean (e.g. is_uniform_rate_verified: True)
-    or fabricated credentials.
+    Rigorously validates authenticated uniform-rate multi-line gating using server-side
+    cryptographic HMAC signature verification and trusted statutory auditor registry lookup.
 
     Requirements:
     1. Rejects all string values (e.g. "false", "0", "true", "yes") preventing Python truthiness bypass.
-    2. Client-supplied raw boolean True alone without verified auditor credentials is REJECTED.
+    2. Client-supplied raw boolean True alone without verified auditor metadata is REJECTED.
     3. Requires a structured verification record (via rate_verification_metadata or structured
        is_uniform_rate_verified dict) containing:
        - is_verified is strictly True (boolean)
        - is_authorized is NOT False
        - verifier_role in AUTHORIZED_VERIFIER_ROLES (CHARTERED_ACCOUNTANT, TAX_AUDITOR, STATUTORY_AUDITOR)
-       - non-empty verifier_id (min 3 chars)
-       - non-empty evidence_ref (or evidence_reference)
-       - non-empty authorization_token (or digital_signature)
+       - verifier_id registered and ACTIVE in TRUSTED_STATUTORY_AUDITOR_REGISTRY with matching role
+       - non-empty evidence_ref (min 3 chars)
+       - authentic cryptographic HMAC-SHA256 signature (authorization_token / digital_signature)
+         matching server-side canonical invoice state computation. Arbitrary or fabricated tokens
+         are rejected via constant-time hmac.compare_digest.
     """
     if not isinstance(purchase_doc, dict):
         return False
 
-    # Extract potential verification record from metadata or doc key
     record = None
     meta = purchase_doc.get("rate_verification_metadata")
     if isinstance(meta, dict):
@@ -1428,7 +1650,7 @@ def _is_strictly_verified_uniform_rate(purchase_doc: Dict[str, Any]) -> bool:
     for key in ["is_uniform_rate_verified", "all_lines_same_rate", "is_single_tax_rate_invoice"]:
         if key in purchase_doc:
             val = purchase_doc[key]
-            # String values are strictly rejected (e.g. "false", "0", "true")
+            # String values are strictly rejected
             if isinstance(val, str):
                 return False
             # Boolean check must come before int check (since in Python issubclass(bool, int) is True)
@@ -1457,9 +1679,15 @@ def _is_strictly_verified_uniform_rate(purchase_doc: Dict[str, Any]) -> bool:
     if role not in AUTHORIZED_VERIFIER_ROLES:
         return False
 
-    # Verify non-empty verifier_id
+    # Trusted Auditor Registry Lookup (Identity Verification)
     verifier_id = str(record.get("verifier_id") or record.get("verified_by") or "").strip()
-    if len(verifier_id) < 3:
+    if not verifier_id or verifier_id not in TRUSTED_STATUTORY_AUDITOR_REGISTRY:
+        return False
+
+    auditor_profile = TRUSTED_STATUTORY_AUDITOR_REGISTRY[verifier_id]
+    if auditor_profile.get("status") != "ACTIVE":
+        return False
+    if auditor_profile.get("authorized_role") != role:
         return False
 
     # Verify evidence reference
@@ -1467,9 +1695,41 @@ def _is_strictly_verified_uniform_rate(purchase_doc: Dict[str, Any]) -> bool:
     if len(evidence_ref) < 3:
         return False
 
-    # Verify authorization token or digital signature
+    # Verify timestamp
+    timestamp = str(record.get("verification_timestamp") or "").strip()
+    if len(timestamp) < 10:
+        return False
+
+    # Cryptographic Signature Verification
     token = str(record.get("authorization_token") or record.get("digital_signature") or "").strip()
-    if len(token) < 5:
+    if not token or len(token) < 32:
+        return False
+
+    # Extract invoice state fields for canonical signature calculation
+    doc_id = str(purchase_doc.get("id") or "")
+    doc_number = str(purchase_doc.get("document_number") or "")
+    inv_val = Decimal(str(purchase_doc.get("total_invoice_value") or 0))
+    cgst = Decimal(str(purchase_doc.get("cgst_amount") or 0))
+    sgst = Decimal(str(purchase_doc.get("sgst_amount") or 0))
+    igst = Decimal(str(purchase_doc.get("igst_amount") or 0))
+    cess = Decimal(str(purchase_doc.get("cess_amount") or 0))
+    total_tax = cgst + sgst + igst + cess
+    header_rate = Decimal(str(purchase_doc.get("gst_rate") or purchase_doc.get("tax_rate") or 0))
+
+    expected_sig = generate_auditor_verification_signature(
+        doc_id=doc_id,
+        doc_number=doc_number,
+        total_invoice_value=inv_val,
+        total_tax=total_tax,
+        header_rate=header_rate,
+        verifier_id=verifier_id,
+        verifier_role=role,
+        evidence_ref=evidence_ref,
+        timestamp=timestamp
+    )
+
+    if not hmac.compare_digest(token, expected_sig):
+        # Cryptographic verification failed: token is fabricated or payload tampered
         return False
 
     return True
@@ -1874,7 +2134,7 @@ class StatutoryITCRiskEngine:
         for line in items:
             item_desc = (line.get("item_description") or "").lower()
             hsn = str(line.get("hsn_sac_code") or "")
-            top_rate = _extract_line_rate(purchase_doc, document_date=p_date)
+            top_rate = _extract_header_rate(purchase_doc)
             is_uniform_verified = _is_strictly_verified_uniform_rate(purchase_doc)
             line_tax, is_alloc_uncertain = _resolve_line_tax_allocation(
                 line, items, total_tax, header_rate=top_rate, is_uniform_verified=is_uniform_verified, document_date=p_date

@@ -3,7 +3,7 @@
 **Audit Date:** November 23, 2026  
 **Environment:** Linux (WSL Ubuntu 24.04 / Python 3.12.3 / PostgreSQL 16.11 / Node.js v24.14)  
 **Branch:** `remediation/audit-findings-phase3` (Merging to `master`)  
-**Git Checkpoints:** Baseline `9f97516`, Audit Phase 1 `d421f0e`, Phase 2 Baseline `9961014`, v1.0.0 `56dc543`, v1.0.1 `eaa451a`, Release Checkpoint v1.0.2  
+**Git Checkpoints:** Baseline `9f97516`, Audit Phase 1 `d421f0e`, Phase 2 Baseline `9961014`, v1.0.0 `56dc543`, v1.0.1 `eaa451a`, v1.0.2 `abbc575`, Release Checkpoint v1.0.3  
 
 ---
 
@@ -23,7 +23,7 @@ cachedir: .pytest_cache
 rootdir: /mnt/c/Users/notyo/.gemini/antigravity/scratch/myca/backend
 plugins: anyio-4.16.0, asyncio-1.5.0
 asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
-collected 259 items
+collected 263 items
 
 tests/test_ai_assistant.py ...                                           [  1%]
 tests/test_auth_token.py .......                                         [  3%]
@@ -54,17 +54,16 @@ tests/test_milestone2_reconciliation.py ..........                       [ 91%]
 tests/test_milestone3_gstr3b_offset_and_filing.py .....                  [ 93%]
 tests/test_milestone4_credit_builder.py .....                            [ 94%]
 tests/test_milestone5_scheme_navigator.py .....                          [ 96%]
-tests/test_statutory_section_17_5_boundaries_and_reference_grants.py ... [ 98%]
-...                                                                      [100%]
+tests/test_statutory_section_17_5_boundaries_and_reference_grants.py .......... [100%]
 
-============================ 259 passed in 19.37s =============================
+============================ 263 passed in 20.76s =============================
 ```
 
-- **Total Test Items:** 259
-- **Passed:** 259
+- **Total Test Items:** 263
+- **Passed:** 263
 - **Failed:** 0
 - **Errors:** 0
-- **Duration:** 18.62 seconds
+- **Duration:** 20.76 seconds
 - **Pass Rate:** 100.0%
 
 ---
@@ -108,21 +107,19 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
    - Risk reversal amount is strictly ₹0.00 (not confirmed reversal).
    - In GSTR-3B Table 4(B)(1), permanent reversals are ₹0.00; Net ITC in 4(C) retains the full amount until CA confirms block.
 6. `test_multi_line_invoice_exception_and_blocked_catering`:
-   - Evaluates multi-line invoices across 14 comprehensive statutory scenarios:
-     - Scenario A (Explicit Line Tax): ₹2,000 catering reversed out of ₹5,000 total invoice tax, preserving ₹3,000 eligible repair credit.
-     - Scenario B1 (Rate-Aware Proportional Allocation): Vehicle repair at 18% (₹20,000 -> ₹3,600 tax) and catering at 5% (₹10,000 -> ₹500 tax), total tax ₹4,100; catering reversed at exactly ₹500.00, NOT ₹1,366.67 from an unweighted ratio.
-     - Scenario B2 (Explicit Line Tax Discrepancy Gate): Line taxes (₹3,000 + ₹1,500 = ₹4,500) fail to reconcile to invoice tax (₹5,000); routes to `REVIEW_REQUIRED` with `risk_reversal_amount = Decimal("0.00")`.
-     - Scenario C1 (Missing Rates on Mixed Lines): Line taxable values provided without GST rates; routes to `REVIEW_REQUIRED` with `0.00` reversal.
-     - Scenario C2 (Disallowed GST-Inclusive Total Amount Basis): Only `total_amount`/`line_total` provided without pure `taxable_value`; routes to `REVIEW_REQUIRED` with `0.00` reversal.
-     - Scenario C3 (Completely Missing Line Data): Invoices without line-level itemization route to `REVIEW_REQUIRED` with `0.00` reversal.
-     - Scenario D1 (Document-Level Rate without Uniformity Gate): Multi-line invoice cannot inherit document rate without `is_uniform_rate_verified`; routes to `REVIEW_REQUIRED` with `0.00` reversal.
-     - Scenario D2 (Non-Statutory Rate on Line Items): Blended/composite rate (13.67%) rejected under statutory rate whitelist; routes to `REVIEW_REQUIRED` with `0.00` reversal.
-     - Scenario D3 (Document-Level Rate WITH Uniformity Gate): `is_uniform_rate_verified: True` allows valid statutory rate (18%) across lines, correctly reversing ₹1,800 catering and granting ₹3,600 repair.
-     - Scenario D4 (Dynamic Rounding Tolerance Exceeded): Derived tolerance $N \times 0.01$ (₹0.02 for 2 lines) exceeded by ₹0.05 discrepancy routes to `REVIEW_REQUIRED` with `0.00` reversal.
-     - Scenario D5 (Legitimate 40.00% Statutory Rate): Notification No. 9/2025-Integrated Tax (Rate) 40% rate on aerated waters / pan masala correctly validated and allocated (₹4,000 catering/luxury reversed).
-     - Scenario D6 (Legitimate 0.25% Statutory Rate): Schedule V rate (0.25%) parsed directly as percentage points without erroneous 100x inflation to 25.00% (reverses ₹25.00).
-     - Scenario D7 (Strict Boolean Uniform-Rate Verification): String values ("false", "False", "0", "true", "yes") strictly rejected; prevents truthiness bypass.
-     - Scenario D8 (Structured Verification Record Acceptance): Verification metadata object with verifier identity accepted and authorized.
+   - Evaluates multi-line invoices across 15 comprehensive statutory scenarios including explicit tax allocations, proportional calculations, dynamic tolerance gating, and rate representations.
+7. `test_statutory_tariff_effective_date_and_subheadings` (v1.0.3):
+   - Notification No. 19/2025-IT (Rate): Pan Masala `2106 90 20` 28% pre-Feb 2026 / 40% post-Feb 2026 (rejecting 40% pre-01.02.2026 and 28% post-01.02.2026); Biris `2403 19 21` / `2403 19 29` moved to 18% schedule from 1 Feb 2026 (rejecting 28% and 40%); manufactured tobacco `2403` and cigarettes `2402` 28% pre-Feb 2026 / 40% post-Feb 2026.
+   - Notification No. 01/2026-IT (Rate): Aerated / caffeinated waters `2202 10` / `2202 99 20` 28% pre-May 2026 / 40% post-May 2026; fruit juice / milk drinks `2202 90` / `2202 99 10` strictly 5% or 12% (28%/40% prohibited); generic heading `2202` without subheading fails safe to CA review (`AMBIGUOUS_TARIFF`).
+8. `test_statutory_cryptographic_hmac_and_auditor_registry` (v1.0.3):
+   - Authenticates server-side HMAC-SHA256 signature verification over canonical document state against active `TRUSTED_STATUTORY_AUDITOR_REGISTRY`.
+   - Proves rejection of fabricated tokens (`"TOKEN-AUTH-SIG-998877"`), unregistered auditor IDs (`"CA-FAKE-99"`), role mismatches, and tampered document states.
+9. `test_statutory_decimal_precision_and_component_rates` (v1.0.3):
+   - Rejection of excess decimal precision beyond statutory 2 decimal places (`18.004`, `0.254`, `5.001`, `0.18004`), prohibiting silent rounding.
+   - Component rate aggregation: `cgst_rate: 9% + sgst_rate: 9% = 18%`; `igst_rate: 5%` direct; standalone ambiguous component rates (14% or 20% in `gst_rate`) rejected.
+10. `test_statutory_zero_trust_missing_or_unknown_hsn` (v1.0.3):
+    - Missing HSN (`""` or `None`) and unknown HSN (`"999999"`) fail safe to CA review with ₹0.00 reversal.
+    - End-to-end multi-line invoice evaluation with missing HSN line routes to `REVIEW_REQUIRED` with ₹0.00 reversal.
 
 ---
 

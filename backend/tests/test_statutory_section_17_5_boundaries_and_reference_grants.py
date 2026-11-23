@@ -522,7 +522,10 @@ def test_review_required_preservation_in_itc_engine_and_gstr3b():
     3. GSTR-3B preparation does NOT reverse REVIEW_REQUIRED items in Table 4(B)(1).
     """
     from datetime import date
-    from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
+    from app.modules.reconciliation.itc_engine import (
+        StatutoryITCRiskEngine,
+        generate_auditor_verification_signature,
+    )
     from app.modules.reconciliation.schemas import ITCEligibilityEnum
     from app.modules.reconciliation.gstr3b_itc import generate_gstr3b_table4_summary
 
@@ -641,7 +644,10 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         - Percentage points primary (e.g. 0.25%, 18.00%); dedicated rate_fraction accepted; ambiguous 0.18 rejected.
     """
     from datetime import date
-    from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
+    from app.modules.reconciliation.itc_engine import (
+        StatutoryITCRiskEngine,
+        generate_auditor_verification_signature,
+    )
     from app.modules.reconciliation.schemas import ITCEligibilityEnum
 
     engine = StatutoryITCRiskEngine()
@@ -994,8 +1000,19 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     assert food_eval_non_stat.risk_reversal_amount == Decimal("0.00")
 
     # 9. Scenario D3: Document-Level Rate (18.00%) WITH Authenticated Verified Uniformity Gate
-    # When is_uniform_rate_verified is True AND certified by authorized verifier metadata,
-    # valid statutory header rate is applied across lines
+    # When is_uniform_rate_verified is True AND certified by authorized verifier metadata
+    # with an authentic cryptographic HMAC-SHA256 signature, valid statutory header rate is applied
+    d3_sig = generate_auditor_verification_signature(
+        doc_id="p_multi_line_uniform_verified",
+        doc_number="INV-MULTI-004C",
+        total_invoice_value=Decimal("35400.00"),
+        total_tax=Decimal("5400.00"),
+        header_rate=Decimal("18.00"),
+        verifier_id="CA-AUDITOR-01",
+        verifier_role="CHARTERED_ACCOUNTANT",
+        evidence_ref="DOC-RATE-AUDIT-2026-11",
+        timestamp="2026-11-23T10:00:00Z"
+    )
     p_doc_uniform_verified = {
         "id": "p_multi_line_uniform_verified",
         "document_number": "INV-MULTI-004C",
@@ -1010,7 +1027,7 @@ def test_multi_line_invoice_exception_and_blocked_catering():
             "verifier_role": "CHARTERED_ACCOUNTANT",
             "verifier_id": "CA-AUDITOR-01",
             "evidence_ref": "DOC-RATE-AUDIT-2026-11",
-            "authorization_token": "TOKEN-AUTH-SIG-998877",
+            "authorization_token": d3_sig,
             "verification_timestamp": "2026-11-23T10:00:00Z"
         },
         "line_items": [
@@ -1362,6 +1379,17 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     assert food_eval_hsn_mismatch.risk_reversal_amount == Decimal("0.00")
 
     # 14. Scenario D8: Structured Verification Record Acceptance
+    d8_sig = generate_auditor_verification_signature(
+        doc_id="p_multi_structured_verified",
+        doc_number="INV-STRUCTURED-VERIFIED",
+        total_invoice_value=Decimal("35400.00"),
+        total_tax=Decimal("5400.00"),
+        header_rate=Decimal("18.00"),
+        verifier_id="CA-AUDITOR-01",
+        verifier_role="CHARTERED_ACCOUNTANT",
+        evidence_ref="DOC-RATE-AUDIT-2026-11",
+        timestamp="2026-11-23T10:00:00Z"
+    )
     p_doc_structured_verified = {
         "id": "p_multi_structured_verified",
         "document_number": "INV-STRUCTURED-VERIFIED",
@@ -1375,7 +1403,7 @@ def test_multi_line_invoice_exception_and_blocked_catering():
             "verifier_role": "CHARTERED_ACCOUNTANT",
             "verifier_id": "CA-AUDITOR-01",
             "evidence_ref": "DOC-RATE-AUDIT-2026-11",
-            "authorization_token": "TOKEN-AUTH-SIG-998877",
+            "authorization_token": d8_sig,
             "verification_timestamp": "2026-11-23T10:00:00Z"
         },
         "line_items": [
@@ -1485,5 +1513,372 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         "Ambiguous decimal 0.18 in standard percentage field should be rejected without guessing!"
     )
     assert food_eval_ambiguous.risk_reversal_amount == Decimal("0.00")
+
+
+# ============================================================================
+# 7. STATUTORY TARIFF SCHEDULES, NOTIFICATIONS 19/2025 & 01/2026, DATE BOUNDARIES
+# ============================================================================
+
+def test_statutory_tariff_effective_date_and_subheadings():
+    """
+    Validates exact statutory dates and tariff classifications under:
+    - Notification No. 19/2025-Integrated Tax (Rate) & Central Tax (Rate)
+    - Notification No. 01/2026-Integrated Tax (Rate) & Central Tax (Rate)
+    """
+    from datetime import date
+    from app.modules.reconciliation.itc_engine import validate_hsn_statutory_rate
+
+    pre_feb_2026 = date(2026, 1, 15)
+    post_feb_2026 = date(2026, 2, 15)
+    pre_may_2026 = date(2026, 4, 15)
+    post_may_2026 = date(2026, 5, 15)
+
+    # 1. Pan Masala (2106 90 20)
+    # Pre-01.02.2026: 28% valid, 40% rejected
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "21069020", pre_feb_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "21069020", pre_feb_2026)
+    assert valid is False
+    assert "prior to 01.02.2026" in msg and "40% not yet in force" in msg
+
+    # Post-01.02.2026: 40% valid, 28% rejected (Schedule VII omission)
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "21069020", post_feb_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("28.00"), "21069020", post_feb_2026)
+    assert valid is False
+    assert "28% omitted" in msg
+
+    # General food preparations under heading 2106: 40% strictly rejected
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "2106", post_feb_2026)
+    assert valid is False
+    assert "restricted to tariff item 2106 90 20" in msg
+
+    # 2. Biris (2403 19 21 / 2403 19 29)
+    # Pre-01.02.2026: 28% valid, 18% and 40% rejected
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "24031921", pre_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("18.00"), "24031921", pre_feb_2026)
+    assert valid is False
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "24031921", pre_feb_2026)
+    assert valid is False
+
+    # Post-01.02.2026: moved to 18% schedule. 28% and 40% strictly rejected.
+    valid, _ = validate_hsn_statutory_rate(Decimal("18.00"), "24031921", post_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("18.00"), "24031929", post_feb_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "24031921", post_feb_2026)
+    assert valid is False
+    assert "statutory rate is 18%" in msg
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "24031921", post_feb_2026)
+    assert valid is False
+
+    # 3. Manufactured Tobacco (2403, non-biri) & Cigarettes (2402)
+    # Post-01.02.2026: 40% valid, 28% rejected
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "240399", post_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "240399", post_feb_2026)
+    assert valid is False
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "240220", post_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "240220", post_feb_2026)
+    assert valid is False
+
+    # 4. Beverages (2202 Subheadings under Notification No. 01/2026-IT (Rate))
+    # Aerated / Caffeinated waters (2202 10 10, 2202 99 20):
+    # Pre-01.05.2026: 28% valid, 40% rejected
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22021010", pre_may_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "22021010", pre_may_2026)
+    assert valid is False
+    assert "prior to 01.05.2026" in msg and "40% not in force" in msg
+
+    # Post-01.05.2026: 40% valid, 28% rejected
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "22021010", post_may_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "22029920", post_may_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22021010", post_may_2026)
+    assert valid is False
+
+    # Fruit juice / milk-based beverages (2202 90, 2202 99 10):
+    # Strictly 5% or 12%; 28% and 40% strictly rejected
+    valid, _ = validate_hsn_statutory_rate(Decimal("5.00"), "22029910", post_may_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("12.00"), "22029910", post_may_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "22029910", post_may_2026)
+    assert valid is False
+    assert "statutory rate is 5% or 12%" in msg
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22029910", post_may_2026)
+    assert valid is False
+
+    # Broad heading 2202 without subheading: fails safe to review
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "2202", post_may_2026)
+    assert valid is False
+    assert "AMBIGUOUS_TARIFF" in msg
+
+
+# ============================================================================
+# 8. SERVER-SIDE CRYPTOGRAPHIC HMAC-SHA256 & AUDITOR REGISTRY AUTHENTICATION
+# ============================================================================
+
+def test_statutory_cryptographic_hmac_and_auditor_registry():
+    """
+    Validates server-side cryptographic HMAC-SHA256 signature verification
+    and trusted statutory auditor registry lookup for uniform-rate multi-line gating.
+    """
+    from app.modules.reconciliation.itc_engine import (
+        _is_strictly_verified_uniform_rate,
+        generate_auditor_verification_signature,
+        TRUSTED_STATUTORY_AUDITOR_REGISTRY,
+    )
+
+    doc_id = "INV-DOC-AUTH-001"
+    doc_number = "INV/2026/001"
+    inv_val = Decimal("118000.00")
+    cgst = Decimal("9000.00")
+    sgst = Decimal("9000.00")
+    total_tax = cgst + sgst
+    header_rate = Decimal("18.00")
+    verifier_id = "CA-AUDITOR-01"
+    verifier_role = "CHARTERED_ACCOUNTANT"
+    evidence_ref = "AUDIT-CERT-2026-99"
+    ts = "2026-11-23T11:00:00Z"
+
+    valid_sig = generate_auditor_verification_signature(
+        doc_id=doc_id,
+        doc_number=doc_number,
+        total_invoice_value=inv_val,
+        total_tax=total_tax,
+        header_rate=header_rate,
+        verifier_id=verifier_id,
+        verifier_role=verifier_role,
+        evidence_ref=evidence_ref,
+        timestamp=ts,
+    )
+
+    base_doc = {
+        "id": doc_id,
+        "document_number": doc_number,
+        "total_invoice_value": inv_val,
+        "cgst_amount": cgst,
+        "sgst_amount": sgst,
+        "gst_rate": header_rate,
+        "is_uniform_rate_verified": True,
+        "rate_verification_metadata": {
+            "is_verified": True,
+            "verifier_role": verifier_role,
+            "verifier_id": verifier_id,
+            "evidence_ref": evidence_ref,
+            "verification_timestamp": ts,
+            "authorization_token": valid_sig,
+        },
+    }
+
+    # 1. Valid authentic signature and registered active CA -> Accepted
+    assert _is_strictly_verified_uniform_rate(base_doc) is True
+
+    # 2. Fabricated signature token -> Rejected
+    fake_sig_doc = dict(base_doc)
+    fake_sig_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+    fake_sig_doc["rate_verification_metadata"]["authorization_token"] = "TOKEN-AUTH-SIG-998877665544332211"
+    assert _is_strictly_verified_uniform_rate(fake_sig_doc) is False
+
+    # 3. Tampered invoice value (e.g. 118000 -> 120000) -> Signature mismatch -> Rejected
+    tampered_doc = dict(base_doc)
+    tampered_doc["total_invoice_value"] = Decimal("120000.00")
+    assert _is_strictly_verified_uniform_rate(tampered_doc) is False
+
+    # 4. Unregistered auditor ID (not in TRUSTED_STATUTORY_AUDITOR_REGISTRY) -> Rejected
+    unreg_doc = dict(base_doc)
+    unreg_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+    unreg_doc["rate_verification_metadata"]["verifier_id"] = "CA-FAKE-99"
+    # Even if they sign with the key, unregistered ID is rejected
+    unreg_sig = generate_auditor_verification_signature(
+        doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
+        total_tax=total_tax, header_rate=header_rate, verifier_id="CA-FAKE-99",
+        verifier_role=verifier_role, evidence_ref=evidence_ref, timestamp=ts
+    )
+    unreg_doc["rate_verification_metadata"]["authorization_token"] = unreg_sig
+    assert _is_strictly_verified_uniform_rate(unreg_doc) is False
+
+    # 5. Role mismatch (auditor is CHARTERED_ACCOUNTANT but claims STATUTORY_AUDITOR) -> Rejected
+    role_mismatch_doc = dict(base_doc)
+    role_mismatch_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+    role_mismatch_doc["rate_verification_metadata"]["verifier_role"] = "STATUTORY_AUDITOR"
+    assert _is_strictly_verified_uniform_rate(role_mismatch_doc) is False
+
+    # 6. Raw client boolean True alone without metadata -> Rejected
+    raw_bool_doc = {
+        "id": doc_id,
+        "is_uniform_rate_verified": True,
+    }
+    assert _is_strictly_verified_uniform_rate(raw_bool_doc) is False
+
+    # 7. String values ("false", "true", "0", "1") -> Rejected
+    for str_val in ["false", "true", "0", "1", "yes"]:
+        str_trap_doc = {
+            "id": doc_id,
+            "is_uniform_rate_verified": str_val,
+            "rate_verification_metadata": base_doc["rate_verification_metadata"],
+        }
+        assert _is_strictly_verified_uniform_rate(str_trap_doc) is False
+
+
+# ============================================================================
+# 9. STRICT DECIMAL PRECISION AND EXPLICIT COMPONENT RATE CONTRACT
+# ============================================================================
+
+def test_statutory_decimal_precision_and_component_rates():
+    """
+    Validates:
+    - Excess decimal precision beyond 2 decimal places is rejected (no silent rounding).
+    - Fractional inputs with excess precision are rejected.
+    - Explicit component rates (cgst_rate + sgst_rate or igst_rate) aggregate to total GST rate.
+    - Standalone ambiguous component rates (14% or 20% in gst_rate) are rejected.
+    """
+    from datetime import date
+    from app.modules.reconciliation.itc_engine import (
+        _extract_line_rate,
+        validate_hsn_statutory_rate,
+    )
+
+    eval_date = date(2026, 11, 23)
+
+    # 1. Excess precision in percentage point inputs: rejected
+    for excess_rate in [Decimal("18.004"), Decimal("0.254"), Decimal("5.001"), Decimal("12.0001")]:
+        valid, msg = validate_hsn_statutory_rate(excess_rate, "998729", eval_date)
+        assert valid is False
+        assert "EXCESS_PRECISION" in msg
+
+        line_excess = {"gst_rate": excess_rate, "hsn_sac_code": "998729"}
+        assert _extract_line_rate(line_excess, document_date=eval_date) is None
+
+    # 2. Excess precision in fractional inputs: rejected
+    line_frac_excess = {"rate_fraction": Decimal("0.18004"), "hsn_sac_code": "998729"}
+    assert _extract_line_rate(line_frac_excess, document_date=eval_date) is None
+
+    # 3. Valid precision percentage point and fractional inputs: accepted
+    line_valid_pct = {"gst_rate": Decimal("18.00"), "hsn_sac_code": "998729"}
+    assert _extract_line_rate(line_valid_pct, document_date=eval_date) == Decimal("18.00")
+
+    line_valid_frac = {"rate_fraction": Decimal("0.18"), "hsn_sac_code": "998729"}
+    assert _extract_line_rate(line_valid_frac, document_date=eval_date) == Decimal("18.00")
+
+    # 4. Component Rate Aggregation:
+    # cgst_rate (9.00) + sgst_rate (9.00) aggregates to 18.00%
+    line_component = {
+        "cgst_rate": Decimal("9.00"),
+        "sgst_rate": Decimal("9.00"),
+        "hsn_sac_code": "998729",
+    }
+    assert _extract_line_rate(line_component, document_date=eval_date) == Decimal("18.00")
+
+    # igst_rate (5.00) used directly
+    line_igst = {
+        "igst_rate": Decimal("5.00"),
+        "hsn_sac_code": "996331",
+    }
+    assert _extract_line_rate(line_igst, document_date=eval_date) == Decimal("5.00")
+
+    # 5. Standalone ambiguous component rates (14% or 20% in gst_rate) rejected
+    for amb_rate in [Decimal("14.00"), Decimal("20.00")]:
+        line_amb = {"gst_rate": amb_rate, "hsn_sac_code": "998729"}
+        assert _extract_line_rate(line_amb, document_date=eval_date) is None
+
+
+# ============================================================================
+# 10. ZERO-TRUST FAIL-SAFE CLASSIFICATION (MISSING OR UNKNOWN HSN)
+# ============================================================================
+
+def test_statutory_zero_trust_missing_or_unknown_hsn():
+    """
+    Validates zero-trust classification:
+    - Missing HSN ("" or None) fails safe to CA review with 0.00 risk reversal.
+    - Unknown / uncatalogued HSN ("999999") fails safe to CA review with 0.00 risk reversal.
+    - Multi-line invoice with missing HSN line cannot allocate tax deterministically,
+      routing to REVIEW_REQUIRED with 0.00 reversal.
+    """
+    from datetime import date
+    from app.modules.reconciliation.itc_engine import (
+        StatutoryITCRiskEngine,
+        validate_hsn_statutory_rate,
+        _extract_line_rate,
+    )
+    from app.modules.reconciliation.schemas import ITCEligibilityEnum
+
+    engine = StatutoryITCRiskEngine()
+    today = date(2026, 11, 23)
+
+    # 1. validate_hsn_statutory_rate fails safe on missing or unknown HSN
+    valid, msg = validate_hsn_statutory_rate(Decimal("18.00"), hsn_sac=None)
+    assert valid is False
+    assert "MISSING_HSN" in msg
+
+    valid, msg = validate_hsn_statutory_rate(Decimal("18.00"), hsn_sac="")
+    assert valid is False
+    assert "MISSING_HSN" in msg
+
+    valid, msg = validate_hsn_statutory_rate(Decimal("18.00"), hsn_sac="999999")
+    assert valid is False
+    assert "UNKNOWN_HSN" in msg
+
+    # 2. _extract_line_rate fails safe on missing or unknown HSN
+    line_missing_hsn = {"gst_rate": Decimal("18.00"), "hsn_sac_code": ""}
+    assert _extract_line_rate(line_missing_hsn, document_date=today) is None
+
+    line_unknown_hsn = {"gst_rate": Decimal("18.00"), "hsn_sac_code": "999999"}
+    assert _extract_line_rate(line_unknown_hsn, document_date=today) is None
+
+    # 3. End-to-end multi-line invoice evaluation with missing HSN line
+    p_doc_missing_hsn = {
+        "id": "p_multi_missing_hsn",
+        "document_number": "INV-MISSING-HSN",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2050.00"),
+        "sgst_amount": Decimal("2050.00"),
+        "total_invoice_value": Decimal("34100.00"),
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "gst_rate": Decimal("18.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True,
+                },
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "",  # MISSING HSN!
+                "taxable_value": Decimal("10000.00"),
+                "gst_rate": Decimal("5.00"),
+            },
+        ],
+    }
+    g_doc = {
+        "id": "g_multi_missing_hsn",
+        "section_name": "B2B",
+        "itc_availability": "available",
+        "central_tax": Decimal("2050.00"),
+        "state_ut_tax": Decimal("2050.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "document_number": "INV-MISSING-HSN",
+        "document_date": "2026-11-01",
+    }
+    evals = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_missing_hsn,
+        gstr2b_doc=g_doc,
+        evaluation_date=today,
+    )
+    food_eval = next(e for e in evals if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval.risk_reversal_amount == Decimal("0.00")
+
 
 
