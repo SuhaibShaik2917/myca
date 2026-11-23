@@ -478,6 +478,37 @@ def test_section_17_5_ab_vehicle_repair_lineage():
     assert res_commercial_with_policy["status"] == "BLOCKED_CREDIT_CONFIRMED"
     assert "NOT MORE THAN 13 persons" in res_commercial_with_policy["statutory_citation"]
 
+    # 6f. Insurer negative: Valid insurer with verified policy document that does NOT establish vehicle was insured by this taxpayer
+    res_ins_third_party_policy = evaluate_section_17_5_vehicle_and_repair_eligibility(
+        category_or_desc="Vehicle Repair Expense",
+        hsn_sac="998729",
+        facts={
+            "is_general_insurer": True,
+            "general_insurance_license": True,
+            "insurance_policy_verified": True,
+            "policy_issuer_is_taxpayer": False,
+            "is_factual_context_verified": True
+        }
+    )
+    assert res_ins_third_party_policy["is_blocked"] is None
+    assert res_ins_third_party_policy["status"] == "REVIEW_REQUIRED_FACTS_PENDING"
+    assert "evidence that the motor vehicle is insured by the taxpayer is missing" in res_ins_third_party_policy["statutory_citation"]
+
+    # 6g. Insurer negative: Generic policy document verified alone without confirming vehicle is insured by taxpayer
+    res_ins_policy_only = evaluate_section_17_5_vehicle_and_repair_eligibility(
+        category_or_desc="Vehicle Repair Expense",
+        hsn_sac="998729",
+        facts={
+            "is_general_insurer": True,
+            "general_insurance_license": True,
+            "insurance_policy_verified": True,
+            "is_factual_context_verified": True
+        }
+    )
+    assert res_ins_policy_only["is_blocked"] is None
+    assert res_ins_policy_only["status"] == "REVIEW_REQUIRED_FACTS_PENDING"
+    assert "evidence that the motor vehicle is insured by the taxpayer is missing" in res_ins_policy_only["statutory_citation"]
+
 
 # ============================================================================
 # 5. DOWNSTREAM REVIEW STATUS PRESERVATION IN ENGINE & GSTR-3B FLOW
@@ -569,17 +600,25 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     Edge Case: Multi-line purchase document containing:
     - Line 1: Vehicle repair qualifying for Section 17(5)(ab) manufacturer exception (is_blocked = False).
     - Line 2: Food & catering service (HSN 9963) blocked under Section 17(5)(b).
-    Verifies that an exempt first line does NOT terminate line item evaluation,
-    and subsequent ineligible lines are properly assessed and blocked.
+
+    Verifies:
+    1. Line-level tax allocation: When explicit line tax is provided, only the blocked line's
+       tax (₹2,000) is reversed, preserving the eligible line's tax (₹3,000).
+    2. Proportional allocation: When taxable values are provided, tax is allocated proportionally.
+    3. Missing data fallback: When multi-line invoice lacks line tax breakdown or itemized values,
+       calculation routes to REVIEW_REQUIRED with risk_reversal_amount = 0.00 rather than assuming
+       the entire invoice tax belongs to the blocked line.
     """
     from datetime import date
     from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
+    from app.modules.reconciliation.schemas import ITCEligibilityEnum
 
     engine = StatutoryITCRiskEngine()
     today = date(2026, 11, 23)
 
-    p_doc = {
-        "id": "p_multi_line_1",
+    # 1. Scenario A: Explicit Line-Level Tax Allocation
+    p_doc_explicit = {
+        "id": "p_multi_line_explicit",
         "document_number": "INV-MULTI-001",
         "document_date": "2026-11-01",
         "cgst_amount": Decimal("2500.00"),
@@ -589,6 +628,117 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         "total_invoice_value": Decimal("30000.00"),
         "goods_receipt_date": "2026-11-02",
         "goods_receipt_note_ref": "GRN-MULTI",
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "tax_amount": Decimal("3000.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "tax_amount": Decimal("2000.00")
+            }
+        ]
+    }
+
+    g_doc_explicit = {
+        "id": "g_multi_1",
+        "section_name": "B2B",
+        "itc_availability": "available",
+        "central_tax": Decimal("2500.00"),
+        "state_ut_tax": Decimal("2500.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "document_number": "INV-MULTI-001",
+        "document_date": "2026-11-01"
+    }
+
+    evals_explicit = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_explicit,
+        gstr2b_doc=g_doc_explicit,
+        evaluation_date=today
+    )
+
+    food_eval = next(e for e in evals_explicit if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval.eligibility_status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR
+    # Crucial assertion: Line-level reversal is ₹2,000, NOT the entire invoice tax ₹5,000!
+    assert food_eval.risk_reversal_amount == Decimal("2000.00")
+    assert food_eval.potential_itc == Decimal("2000.00")
+
+    # 2. Scenario B: Proportional Tax Allocation via Itemized Taxable Values
+    p_doc_prop = {
+        "id": "p_multi_line_prop",
+        "document_number": "INV-MULTI-002",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("3000.00"),
+        "sgst_amount": Decimal("3000.00"),
+        "igst_amount": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "total_invoice_value": Decimal("36000.00"),
+        "goods_receipt_date": "2026-11-02",
+        "goods_receipt_note_ref": "GRN-MULTI-2",
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00")
+            }
+        ]
+    }
+
+    g_doc_prop = {
+        "id": "g_multi_2",
+        "section_name": "B2B",
+        "itc_availability": "available",
+        "central_tax": Decimal("3000.00"),
+        "state_ut_tax": Decimal("3000.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "document_number": "INV-MULTI-002",
+        "document_date": "2026-11-01"
+    }
+
+    evals_prop = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_prop,
+        gstr2b_doc=g_doc_prop,
+        evaluation_date=today
+    )
+
+    food_eval_prop = next(e for e in evals_prop if e.rule_code == "SEC_17_5_FOOD")
+    # Proportional calculation: 6000 * 10000 / 30000 = 2000.00
+    assert food_eval_prop.risk_reversal_amount == Decimal("2000.00")
+    assert food_eval_prop.potential_itc == Decimal("2000.00")
+
+    # 3. Scenario C: Missing Line-Level Data Fallback (Uncertain Allocation -> Review Required)
+    p_doc_missing = {
+        "id": "p_multi_line_missing",
+        "document_number": "INV-MULTI-003",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2500.00"),
+        "sgst_amount": Decimal("2500.00"),
+        "igst_amount": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "total_invoice_value": Decimal("30000.00"),
+        "goods_receipt_date": "2026-11-02",
+        "goods_receipt_note_ref": "GRN-MULTI-3",
         "line_items": [
             {
                 "item_description": "Factory vehicle test track repair",
@@ -603,31 +753,20 @@ def test_multi_line_invoice_exception_and_blocked_catering():
             {
                 "item_description": "Executive corporate catering dinner",
                 "hsn_sac_code": "996331"
+                # Neither tax_amount nor taxable_value provided
             }
         ]
     }
 
-    g_doc = {
-        "id": "g_multi_1",
-        "section_name": "B2B",
-        "itc_availability": "available",
-        "central_tax": Decimal("2500.00"),
-        "state_ut_tax": Decimal("2500.00"),
-        "integrated_tax": Decimal("0.00"),
-        "cess_amount": Decimal("0.00"),
-        "document_number": "INV-MULTI-001",
-        "document_date": "2026-11-01"
-    }
-
-    evals = engine.evaluate_itc_eligibility(
-        purchase_doc=p_doc,
-        gstr2b_doc=g_doc,
+    evals_missing = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_missing,
+        gstr2b_doc=g_doc_explicit,
         evaluation_date=today
     )
 
-    rule_codes = [e.rule_code for e in evals]
-    assert "SEC_17_5_FOOD" in rule_codes, (
-        f"Expected SEC_17_5_FOOD to be assessed for catering line item, got {rule_codes}"
-    )
-    food_eval = next(e for e in evals if e.rule_code == "SEC_17_5_FOOD")
-    assert food_eval.risk_reversal_amount == Decimal("5000.00")
+    food_eval_missing = next(e for e in evals_missing if e.rule_code == "SEC_17_5_FOOD")
+    # Must NOT assume entire invoice tax is blocked; routes to REVIEW_REQUIRED with 0 reversal
+    assert food_eval_missing.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_missing.risk_reversal_amount == Decimal("0.00")
+    assert food_eval_missing.potential_itc == Decimal("5000.00")
+    assert "mixed statutory treatments" in food_eval_missing.findings_explanation

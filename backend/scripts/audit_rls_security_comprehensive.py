@@ -26,7 +26,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.database import SessionLocal, set_tenant_context
 
-DB_ADMIN = "postgresql:///myca?user=postgres"
+DB_ADMIN = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
 
 # All 36 tenant/security-scoped tables in the public schema
 ALL_36_TENANT_TABLES = [
@@ -382,11 +382,11 @@ def audit_m1_m5_cross_tenant_isolation():
                 else:
                     raise
 
-        # Step D: Cross-tenant Insert Attempts (inserting org_a record while authenticated as org_b)
+        # Step D: Cross-tenant Insert Attempts (inserting org_a record while authenticated as org_b across ALL 11 Domains)
         insert_tamper_targets = [
-            ("financial_summaries", """
-                INSERT INTO public.financial_summaries (id, org_id, summary_period, total_inflow, total_outflow, net_cash_flow)
-                VALUES (:id, :org_a, '112025', 0, 0, 0);
+            ("business_profiles", """
+                INSERT INTO public.business_profiles (id, org_id, business_type, industry_sector, turnover_bracket, annual_turnover)
+                VALUES (:id, :org_a, 'Private Limited', 'Automotive', 'under_5cr', 10000);
             """),
             ("invoices", """
                 INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_amount, status)
@@ -396,20 +396,62 @@ def audit_m1_m5_cross_tenant_isolation():
                 INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
                 VALUES (:id, :org_a, 'invoice', 'tamper.pdf', 10, 'application/pdf', '/tmp/t.pdf', '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
             """),
-            ("business_profiles", """
-                INSERT INTO public.business_profiles (id, org_id, business_type, industry_sector, turnover_bracket, annual_turnover)
-                VALUES (:id, :org_a, 'Private Limited', 'Automotive', 'under_5cr', 10000);
+            ("gst_registrations", """
+                INSERT INTO public.gst_registrations (id, org_id, gstin, legal_name, trade_name, state_code, registration_type, is_active)
+                VALUES (:id, :org_a, '27TAMPER0000A1Z5', 'Tamper Entity', 'Tamper Trade', '27', 'regular', true);
+            """),
+            ("purchase_documents", """
+                INSERT INTO public.purchase_documents (
+                    id, org_id, registration_id, document_type, document_number, document_date,
+                    financial_period, supplier_gstin, supplier_legal_name, recipient_gstin, place_of_supply, total_invoice_value
+                ) VALUES (
+                    :id, :org_a, :reg_a, 'tax_invoice', 'PUR-TAMPER', '2025-11-01',
+                    '112025', '27AAAAA0000A1Z5', 'Supplier Tamper', '27AAAAA0000A1ZT', '27', 1000
+                );
+            """),
+            ("itc_ledger_entries", """
+                INSERT INTO public.itc_ledger_entries (id, org_id, purchase_doc_id, event_type, tax_period, cgst_amount, sgst_amount, igst_amount, cess_amount, total_tax)
+                VALUES (:id, :org_a, :purch_a, 'AVAIL', '112025', 500, 500, 0, 0, 1000);
+            """),
+            ("gst_records", """
+                INSERT INTO public.gst_records (id, org_id, gstin, return_type, tax_period, filing_status, total_taxable_value, total_tax_paid)
+                VALUES (:id, :org_a, '27AAAAA0000A1ZT', 'GSTR-3B', '112025', 'pending', 1000, 100);
+            """),
+            ("financial_transactions", """
+                INSERT INTO public.financial_transactions (id, org_id, transaction_date, amount, transaction_type, category, counterparty)
+                VALUES (:id, :org_a, '2025-11-01', 1000, 'credit', 'sales', 'Tamper Client');
+            """),
+            ("gstr3b_filings", """
+                INSERT INTO public.gstr3b_filings (id, org_id, registration_id, tax_period, filing_status, maker_id)
+                VALUES (:id, :org_a, :reg_a, '112025', 'DRAFT', :user_b);
+            """),
+            ("financial_summaries", """
+                INSERT INTO public.financial_summaries (id, org_id, summary_period, total_inflow, total_outflow, net_cash_flow)
+                VALUES (:id, :org_a, '112025', 0, 0, 0);
+            """),
+            ("scheme_matches", """
+                INSERT INTO public.scheme_matches (id, org_id, scheme_id, match_score, status)
+                VALUES (:id, :org_a, :scheme_id, 80.0, 'recommended');
             """),
         ]
 
         for tbl, insert_sql in insert_tamper_targets:
             cross_insert_blocked = False
+            savepoint = db.begin_nested()
             try:
-                db.execute(text(insert_sql), {"id": str(uuid.uuid4()), "org_a": org_a, "prof_a": prof_id_a})
-                db.commit()
+                db.execute(text(insert_sql), {
+                    "id": str(uuid.uuid4()),
+                    "org_a": org_a,
+                    "prof_a": prof_id_a,
+                    "reg_a": reg_id_a,
+                    "purch_a": purch_id_a,
+                    "user_b": user_b,
+                    "scheme_id": scheme_id
+                })
+                savepoint.commit()
             except Exception:
                 cross_insert_blocked = True
-                db.rollback()
+                savepoint.rollback()
             assert cross_insert_blocked, f"CRITICAL RLS BREACH: Org B was able to insert records into Org A's {tbl}!"
             print(f"  [Cross-Tenant INSERT] PASS: Spoofed insert into {tbl} rejected by RLS WITH CHECK.")
 

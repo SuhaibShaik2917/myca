@@ -98,6 +98,8 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
    - **Proviso (ii)(II) Insurer Negative Tests:**
      - Verified IRDAI license + vehicle insured by taxpayer &rarr; `ELIGIBLE_STATUTORY_EXCEPTION`.
      - Vehicle NOT insured by taxpayer (missing policy evidence) &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
+      - Vehicle NOT insured by taxpayer (third-party policy document where `policy_issuer_is_taxpayer: False`) &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
+      - Generic policy document present without verified insurance by taxpayer &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
      - Insurer license unverified &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
      - Factual context unverified &rarr; `REVIEW_REQUIRED_FACTS_PENDING`.
      - Commercial business repairing company car with policy attached &rarr; strictly evaluates seating capacity (5 seats &le; 13 blocked under Section 17(5)(a)/(ab)), avoiding false insurer exception routing.
@@ -111,8 +113,10 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
      - Asserts `total_itc_reversed = Decimal("0.00")`.
      - Asserts `net_itc_available = Decimal("28000.00")` (preserved for CA adjudication).
 6. `test_multi_line_invoice_exception_and_blocked_catering`:
-   - Evaluates multi-line invoice containing exempt vehicle repair (Line 1) and corporate catering (Line 2).
-   - Proves exempt Line 1 continues iteration, allowing Line 2 to be assessed and blocked under `SEC_17_5_FOOD` (reversal = ₹5,000.00).
+    - Evaluates multi-line invoices across 3 statutory scenarios:
+      - Scenario A (Explicit Line Tax): ₹2,000 catering reversed out of ₹5,000 total invoice tax, preserving ₹3,000 eligible repair credit.
+      - Scenario B (Proportional Tax Allocation): ₹2,000 catering reversed out of ₹6,000 total invoice tax based on ₹10,000 / ₹30,000 taxable value.
+      - Scenario C (Missing Line-Level Data Fallback): Mixed invoice without line-level tax or taxable values routes to `REVIEW_REQUIRED` with `risk_reversal_amount = Decimal("0.00")` and flags missing breakdown for CA adjudication.
 
 ---
 

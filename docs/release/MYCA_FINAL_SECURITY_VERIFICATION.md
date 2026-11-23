@@ -132,8 +132,8 @@ Executed via `backend/scripts/audit_rls_security_comprehensive.py`:
 - While authenticated as `Tenant Beta`, DELETE attempts were executed on `Tenant Alpha`'s records across all tables:
   - `invoices`, `documents`, `gst_registrations`, `purchase_documents`, `gst_records`, `financial_transactions`, `gstr3b_filings`, `financial_summaries`, `business_profiles`, `scheme_matches`: **0 rows deleted** (RLS isolation enforced) [PASS]
   - `itc_ledger_entries`: blocked by **least-privilege grant denial** (immutable statutory ledger) [PASS]
-- Cross-tenant INSERT attempts with spoofed `org_id` were executed under `Tenant Beta`:
-  - Attempted inserts into `financial_summaries`, `invoices`, `documents`, and `business_profiles` were rejected by PostgreSQL RLS `WITH CHECK` constraints (`ProgrammingError`) [PASS]
+- Cross-tenant INSERT attempts with spoofed `org_id` were executed under `Tenant Beta` across all 11 core tenant domain tables:
+  - Attempted spoofed inserts into `business_profiles`, `invoices`, `documents`, `gst_registrations`, `purchase_documents`, `itc_ledger_entries`, `gst_records`, `financial_transactions`, `gstr3b_filings`, `financial_summaries`, and `scheme_matches` were rejected by PostgreSQL RLS `WITH CHECK` constraints (`ProgrammingError`) [PASS]
 
 ### 3.3 Null Context Leakage Protection
 - When tenant session variables (`app.current_org` and `app.current_user`) were cleared:

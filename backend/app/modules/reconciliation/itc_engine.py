@@ -1,5 +1,5 @@
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Any, Optional
 from datetime import date, datetime
 from .schemas import ITCEligibilityEnum, ITCAssessmentOut, Rule37PaymentCheck, Rule37AFilingCheck
@@ -952,7 +952,13 @@ def evaluate_section_17_5_vehicle_and_repair_eligibility(
         # Proviso (ii)(II): Supply of general insurance services in respect of motor vehicles insured by him
         has_ins_claim = bool(facts.get("is_general_insurer") or business_profile.get("is_general_insurer"))
         has_ins_license = bool(facts.get("general_insurance_license") or facts.get("is_general_insurer_license_verified") or facts.get("is_verified_general_insurer"))
-        vehicle_insured_by_taxpayer = bool(facts.get("is_vehicle_insured_by_taxpayer") or facts.get("insurance_policy_verified"))
+        # Must specifically verify that the vehicle is insured by this taxpayer, not simply that an insurance policy document exists
+        vehicle_insured_by_taxpayer = bool(
+            facts.get("is_vehicle_insured_by_taxpayer")
+            or facts.get("is_policy_issued_by_taxpayer")
+            or facts.get("is_taxpayer_policy_verified")
+            or (facts.get("insurance_policy_verified") and facts.get("policy_issuer_is_taxpayer") is True)
+        )
         if has_ins_claim or has_ins_license:
             if has_ins_claim and has_ins_license and vehicle_insured_by_taxpayer:
                 return {
@@ -1098,6 +1104,81 @@ def evaluate_section_17_5_vehicle_and_repair_eligibility(
         "statutory_citation": f"Section 17(5)(a) / 17(5)(ab): Motor vehicle seating capacity of {seating_capacity} persons is NOT MORE THAN 13 persons and no statutory exception applies.",
         "seating_capacity": seating_capacity
     }
+
+
+def _resolve_line_tax_allocation(line: dict, all_lines: list, total_invoice_tax: Decimal) -> tuple[Decimal, bool]:
+    """
+    Allocates tax to an individual line item from a purchase document.
+    Returns (allocated_tax, is_uncertain_allocation).
+
+    1. If there is only one line (or no itemization), allocated tax is total invoice tax (not uncertain).
+    2. If there are multiple lines and the line provides explicit tax amounts (e.g. tax_amount or cgst+sgst+igst),
+       use the explicit line tax (not uncertain).
+    3. If there are multiple lines and all lines provide taxable values (or line totals),
+       allocate proportionally: (total_invoice_tax * line_value / sum_of_line_values) (not uncertain).
+    4. If there are multiple lines with different statutory treatments but line-level tax and
+       proportional values are missing/zero, allocation cannot be deterministically resolved
+       without improperly reversing tax belonging to eligible lines -> returns (Decimal("0.00"), True).
+    """
+    if len(all_lines) <= 1:
+        return total_invoice_tax, False
+
+    # Check explicit line tax
+    for tax_key in ["tax_amount", "total_tax", "line_tax"]:
+        if line.get(tax_key) is not None:
+            try:
+                val = Decimal(str(line[tax_key]))
+                if val >= Decimal("0.00"):
+                    return val, False
+            except Exception:
+                pass
+
+    comp_keys = [
+        ("cgst_amount", "central_tax"),
+        ("sgst_amount", "state_ut_tax"),
+        ("igst_amount", "integrated_tax"),
+        ("cess_amount", "cess_tax")
+    ]
+    has_comp = False
+    comp_sum = Decimal("0.00")
+    for k1, k2 in comp_keys:
+        v = line.get(k1) if line.get(k1) is not None else line.get(k2)
+        if v is not None:
+            has_comp = True
+            try:
+                comp_sum += Decimal(str(v))
+            except Exception:
+                pass
+    if has_comp and comp_sum >= Decimal("0.00"):
+        return comp_sum, False
+
+    # Check proportional allocation using line taxable / total values
+    val_keys = ["taxable_value", "taxable_amount", "total_amount", "line_total", "total_value", "item_total"]
+    all_have_vals = True
+    line_val = None
+    total_val = Decimal("0.00")
+    for l in all_lines:
+        found_val = None
+        for vk in val_keys:
+            if l.get(vk) is not None:
+                try:
+                    found_val = Decimal(str(l[vk]))
+                    break
+                except Exception:
+                    pass
+        if found_val is None or found_val < Decimal("0.00"):
+            all_have_vals = False
+            break
+        total_val += found_val
+        if l is line:
+            line_val = found_val
+
+    if all_have_vals and line_val is not None and total_val > Decimal("0.00"):
+        allocated = (total_invoice_tax * line_val / total_val).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return allocated, False
+
+    # Multi-line item without line-level tax or taxable value -> uncertain
+    return Decimal("0.00"), True
 
 
 class StatutoryITCRiskEngine:
@@ -1384,6 +1465,7 @@ class StatutoryITCRiskEngine:
         for line in items:
             item_desc = (line.get("item_description") or "").lower()
             hsn = str(line.get("hsn_sac_code") or "")
+            line_tax, is_alloc_uncertain = _resolve_line_tax_allocation(line, items, total_tax)
 
             # Motor Vehicles 17(5)(a) & Repair/Maintenance 17(5)(ab)
             if (
@@ -1399,19 +1481,33 @@ class StatutoryITCRiskEngine:
                 )
                 if veh_res.get("applies"):
                     if veh_res.get("is_blocked") is True:
-                        assessments.append(ITCAssessmentOut(
-                            purchase_doc_id=p_id,
-                            gstr2b_doc_id=g_id,
-                            rule_code="SEC_17_5_MOTOR",
-                            statutory_section="Section 17(5)(a)" if not hsn.startswith(("9987", "9971")) else "Section 17(5)(ab)",
-                            eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
-                            potential_itc=total_tax,
-                            risk_reversal_amount=total_tax,
-                            findings_explanation=veh_res.get("statutory_citation", "Motor vehicle with seating capacity <= 13 persons is blocked under Section 17(5)(a)."),
-                            missing_evidence_required="Provide proof of passenger transport business permit, driving school, or seating capacity > 13 persons.",
-                            evaluation_date=str(eval_dt)
-                        ))
-                        break
+                        if is_alloc_uncertain:
+                            assessments.append(ITCAssessmentOut(
+                                purchase_doc_id=p_id,
+                                gstr2b_doc_id=g_id,
+                                rule_code="SEC_17_5_MOTOR",
+                                statutory_section="Section 17(5)(a)" if not hsn.startswith(("9987", "9971")) else "Section 17(5)(ab)",
+                                eligibility_status=ITCEligibilityEnum.REVIEW_REQUIRED,
+                                potential_itc=total_tax,
+                                risk_reversal_amount=Decimal("0.00"),
+                                findings_explanation=f"{veh_res.get('statutory_citation', 'Motor vehicle blocked under Section 17(5)(a).')} Multi-line invoice contains {len(items)} line items with mixed statutory treatments, but line-level tax amounts or itemized values are missing. Proportional tax allocation requires CA review.",
+                                missing_evidence_required="Provide line-level tax breakdown or itemized taxable values to allocate tax across multi-line items.",
+                                evaluation_date=str(eval_dt)
+                            ))
+                        else:
+                            assessments.append(ITCAssessmentOut(
+                                purchase_doc_id=p_id,
+                                gstr2b_doc_id=g_id,
+                                rule_code="SEC_17_5_MOTOR",
+                                statutory_section="Section 17(5)(a)" if not hsn.startswith(("9987", "9971")) else "Section 17(5)(ab)",
+                                eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
+                                potential_itc=line_tax,
+                                risk_reversal_amount=line_tax,
+                                findings_explanation=veh_res.get("statutory_citation", "Motor vehicle with seating capacity <= 13 persons is blocked under Section 17(5)(a).") + (f" (Line allocated tax: ₹{line_tax})" if len(items) > 1 else ""),
+                                missing_evidence_required="Provide proof of passenger transport business permit, driving school, or seating capacity > 13 persons.",
+                                evaluation_date=str(eval_dt)
+                            ))
+                        continue
                     elif veh_res.get("status") == "REVIEW_REQUIRED_FACTS_PENDING":
                         assessments.append(ITCAssessmentOut(
                             purchase_doc_id=p_id,
@@ -1419,64 +1515,106 @@ class StatutoryITCRiskEngine:
                             rule_code="SEC_17_5_MOTOR",
                             statutory_section="Section 17(5)(a)" if not hsn.startswith(("9987", "9971")) else "Section 17(5)(ab)",
                             eligibility_status=ITCEligibilityEnum.REVIEW_REQUIRED,
-                            potential_itc=total_tax,
+                            potential_itc=line_tax if not is_alloc_uncertain else total_tax,
                             risk_reversal_amount=Decimal("0.00"),
-                            findings_explanation=veh_res.get("statutory_citation", "Vehicle context and seating capacity unverified."),
+                            findings_explanation=veh_res.get("statutory_citation", "Vehicle context and seating capacity unverified.") + (f" (Line allocated tax: ₹{line_tax})" if len(items) > 1 and not is_alloc_uncertain else ""),
                             missing_evidence_required=veh_res.get("missing_evidence_required", "Provide verified RC copy confirming seating capacity and business end-use."),
                             evaluation_date=str(eval_dt)
                         ))
-                        break
+                        continue
                     elif veh_res.get("is_blocked") is False:
                         # Statutorily exempt from block (e.g. seating capacity > 13 or goods transport vehicle)
                         continue
 
             # Food & Beverages 17(5)(b) - HSN 9963
             elif hsn.startswith("9963") or "catering" in item_desc or "food" in item_desc:
-                assessments.append(ITCAssessmentOut(
-                    purchase_doc_id=p_id,
-                    gstr2b_doc_id=g_id,
-                    rule_code="SEC_17_5_FOOD",
-                    statutory_section="Section 17(5)(b)",
-                    eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
-                    potential_itc=total_tax,
-                    risk_reversal_amount=total_tax,
-                    findings_explanation="Food, beverages, and outdoor catering are blocked under Section 17(5)(b).",
-                    missing_evidence_required="Provide evidence of outward taxable supply of same category or employer statutory obligation.",
-                    evaluation_date=str(eval_dt)
-                ))
-                break
+                if is_alloc_uncertain:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="SEC_17_5_FOOD",
+                        statutory_section="Section 17(5)(b)",
+                        eligibility_status=ITCEligibilityEnum.REVIEW_REQUIRED,
+                        potential_itc=total_tax,
+                        risk_reversal_amount=Decimal("0.00"),
+                        findings_explanation=f"Food, beverages, and outdoor catering are blocked under Section 17(5)(b). Multi-line invoice contains {len(items)} line items with mixed statutory treatments, but line-level tax amounts or itemized values are missing. Proportional tax allocation requires CA review.",
+                        missing_evidence_required="Provide line-level tax breakdown or itemized taxable values to allocate tax across multi-line items.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                else:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="SEC_17_5_FOOD",
+                        statutory_section="Section 17(5)(b)",
+                        eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
+                        potential_itc=line_tax,
+                        risk_reversal_amount=line_tax,
+                        findings_explanation="Food, beverages, and outdoor catering are blocked under Section 17(5)(b)." + (f" (Line allocated tax: ₹{line_tax})" if len(items) > 1 else ""),
+                        missing_evidence_required="Provide evidence of outward taxable supply of same category or employer statutory obligation.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                continue
 
             # Works Contract 17(5)(c) - HSN 9954
             elif hsn.startswith("9954") or "works contract" in item_desc or "construction" in item_desc:
-                assessments.append(ITCAssessmentOut(
-                    purchase_doc_id=p_id,
-                    gstr2b_doc_id=g_id,
-                    rule_code="SEC_17_5_WORKS_CONTR",
-                    statutory_section="Section 17(5)(c)",
-                    eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
-                    potential_itc=total_tax,
-                    risk_reversal_amount=total_tax,
-                    findings_explanation="Works contract for construction of immovable property is blocked under Section 17(5)(c).",
-                    missing_evidence_required="Proof that supply is for plant and machinery or outward works contract supply.",
-                    evaluation_date=str(eval_dt)
-                ))
-                break
+                if is_alloc_uncertain:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="SEC_17_5_WORKS_CONTR",
+                        statutory_section="Section 17(5)(c)",
+                        eligibility_status=ITCEligibilityEnum.REVIEW_REQUIRED,
+                        potential_itc=total_tax,
+                        risk_reversal_amount=Decimal("0.00"),
+                        findings_explanation=f"Works contract for construction of immovable property is blocked under Section 17(5)(c). Multi-line invoice contains {len(items)} line items with mixed statutory treatments, but line-level tax amounts or itemized values are missing. Proportional tax allocation requires CA review.",
+                        missing_evidence_required="Provide line-level tax breakdown or itemized taxable values to allocate tax across multi-line items.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                else:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="SEC_17_5_WORKS_CONTR",
+                        statutory_section="Section 17(5)(c)",
+                        eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
+                        potential_itc=line_tax,
+                        risk_reversal_amount=line_tax,
+                        findings_explanation="Works contract for construction of immovable property is blocked under Section 17(5)(c)." + (f" (Line allocated tax: ₹{line_tax})" if len(items) > 1 else ""),
+                        missing_evidence_required="Proof that supply is for plant and machinery or outward works contract supply.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                continue
 
             # Personal Consumption 17(5)(g)
             elif "personal" in item_desc or "gift" in item_desc:
-                assessments.append(ITCAssessmentOut(
-                    purchase_doc_id=p_id,
-                    gstr2b_doc_id=g_id,
-                    rule_code="SEC_17_5_PERSONAL",
-                    statutory_section="Section 17(5)(g)",
-                    eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
-                    potential_itc=total_tax,
-                    risk_reversal_amount=total_tax,
-                    findings_explanation="Goods or services for personal consumption or gifts are blocked under Section 17(5)(g).",
-                    missing_evidence_required="Proof of direct business nexus.",
-                    evaluation_date=str(eval_dt)
-                ))
-                break
+                if is_alloc_uncertain:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="SEC_17_5_PERSONAL",
+                        statutory_section="Section 17(5)(g)",
+                        eligibility_status=ITCEligibilityEnum.REVIEW_REQUIRED,
+                        potential_itc=total_tax,
+                        risk_reversal_amount=Decimal("0.00"),
+                        findings_explanation=f"Goods or services for personal consumption or gifts are blocked under Section 17(5)(g). Multi-line invoice contains {len(items)} line items with mixed statutory treatments, but line-level tax amounts or itemized values are missing. Proportional tax allocation requires CA review.",
+                        missing_evidence_required="Provide line-level tax breakdown or itemized taxable values to allocate tax across multi-line items.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                else:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="SEC_17_5_PERSONAL",
+                        statutory_section="Section 17(5)(g)",
+                        eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
+                        potential_itc=line_tax,
+                        risk_reversal_amount=line_tax,
+                        findings_explanation="Goods or services for personal consumption or gifts are blocked under Section 17(5)(g)." + (f" (Line allocated tax: ₹{line_tax})" if len(items) > 1 else ""),
+                        missing_evidence_required="Proof of direct business nexus.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                continue
 
         # -------------------------------------------------------------
         # 7. Anti-Conflation Control: Rule 37 vs Rule 37A Duplicate Reversal Check
