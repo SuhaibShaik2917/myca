@@ -632,10 +632,13 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         - Notification No. 9/2025-Integrated Tax (Rate) 40% rate accepted on eligible items.
     12. Scenario D6: Legitimate 0.25% Statutory Rate:
         - Schedule V rate (0.25%) parsed accurately without multiplying by 100 to 25.00%.
-    13. Scenario D7: Strict Boolean Uniform-Rate Verification:
-        - String values ("false", "0", "true") rejected; prevents truthiness bypass.
+    13. Scenario D7: Rejection of Unauthenticated Booleans, String Traps, and Mismatched HSN Rates:
+        - String values ("false", "0", "true") and raw unauthenticated booleans rejected.
+        - Mismatched HSN rates (e.g. 40% on catering 9963, 40% on biris 24031921, 40% on general 2106) rejected.
     14. Scenario D8: Structured Verification Record Acceptance:
-        - Audit metadata object with verifier identity accepted.
+        - Audit metadata with authorized role, verifier identity, evidence ref, and authorization token accepted.
+    15. Scenario D9: Explicit Rate Representation Contract:
+        - Percentage points primary (e.g. 0.25%, 18.00%); dedicated rate_fraction accepted; ambiguous 0.18 rejected.
     """
     from datetime import date
     from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
@@ -990,8 +993,9 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     assert food_eval_non_stat.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
     assert food_eval_non_stat.risk_reversal_amount == Decimal("0.00")
 
-    # 9. Scenario D3: Document-Level Rate (18.00%) WITH Verified Uniformity Gate
-    # When is_uniform_rate_verified is True, valid statutory header rate is applied across lines
+    # 9. Scenario D3: Document-Level Rate (18.00%) WITH Authenticated Verified Uniformity Gate
+    # When is_uniform_rate_verified is True AND certified by authorized verifier metadata,
+    # valid statutory header rate is applied across lines
     p_doc_uniform_verified = {
         "id": "p_multi_line_uniform_verified",
         "document_number": "INV-MULTI-004C",
@@ -1001,6 +1005,14 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         "total_invoice_value": Decimal("35400.00"),
         "gst_rate": Decimal("18.00"),
         "is_uniform_rate_verified": True,
+        "rate_verification_metadata": {
+            "is_verified": True,
+            "verifier_role": "CHARTERED_ACCOUNTANT",
+            "verifier_id": "CA-AUDITOR-01",
+            "evidence_ref": "DOC-RATE-AUDIT-2026-11",
+            "authorization_token": "TOKEN-AUTH-SIG-998877",
+            "verification_timestamp": "2026-11-23T10:00:00Z"
+        },
         "line_items": [
             {
                 "item_description": "Factory vehicle test track repair",
@@ -1083,12 +1095,12 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     assert food_eval_tol.risk_reversal_amount == Decimal("0.00")
 
     # 11. Scenario D5: Legitimate 40.00% Statutory Rate (Notification No. 9/2025-Integrated Tax (Rate))
-    # E.g. Pan Masala / Aerated waters (HSN 2202 / 2106) taxed at 40% alongside 18% repair
+    # Authentic tariff item 2106 90 20 (Pan Masala) taxed at 40% alongside 18% repair
     p_doc_40_pct = {
         "id": "p_multi_line_40_pct",
         "document_number": "INV-MULTI-004E",
         "document_date": "2026-11-01",
-        "cgst_amount": Decimal("3800.00"),  # Total tax = 7600.00 (3600 repair + 4000 luxury goods)
+        "cgst_amount": Decimal("3800.00"),  # Total tax = 7600.00 (3600 repair + 4000 pan masala)
         "sgst_amount": Decimal("3800.00"),
         "total_invoice_value": Decimal("37600.00"),
         "line_items": [
@@ -1105,8 +1117,8 @@ def test_multi_line_invoice_exception_and_blocked_catering():
                 }
             },
             {
-                "item_description": "Executive corporate catering dinner",
-                "hsn_sac_code": "996331",
+                "item_description": "Pan masala executive refreshments",
+                "hsn_sac_code": "21069020",    # Authentic tariff item 2106 90 20
                 "taxable_value": Decimal("10000.00"),
                 "gst_rate": Decimal("40.00")   # Legitimate 40.00% rate under Notification 9/2025 -> 4000.00 tax
             }
@@ -1134,12 +1146,12 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     assert food_eval_40.potential_itc == Decimal("4000.00")
 
     # 12. Scenario D6: Legitimate 0.25% Statutory Rate (Schedule V - Diamonds/Precious Stones)
-    # Rate input '0.25%' or Decimal('0.25') must NOT be multiplied by 100 to 25.00%!
+    # Rate input '0.25%' on authentic HSN 7102 (Diamonds) must NOT be multiplied by 100 to 25.00%!
     p_doc_025_pct = {
         "id": "p_multi_line_025_pct",
         "document_number": "INV-MULTI-004F",
         "document_date": "2026-11-01",
-        "cgst_amount": Decimal("1812.50"),  # Total tax = 3625.00 (3600 repair + 25 catering/stones)
+        "cgst_amount": Decimal("1812.50"),  # Total tax = 3625.00 (3600 repair + 25 diamonds)
         "sgst_amount": Decimal("1812.50"),
         "total_invoice_value": Decimal("33625.00"),
         "line_items": [
@@ -1156,10 +1168,10 @@ def test_multi_line_invoice_exception_and_blocked_catering():
                 }
             },
             {
-                "item_description": "Executive corporate catering dinner",
-                "hsn_sac_code": "996331",
+                "item_description": "Cut and polished diamonds for corporate gift",
+                "hsn_sac_code": "7102",        # Authentic Schedule V HSN
                 "taxable_value": Decimal("10000.00"),
-                "gst_rate": "0.25%"  # Correctly recognized as 0.25% (₹25 tax), NOT 25.00%!
+                "gst_rate": "0.25%"            # Correctly recognized as 0.25% (₹25 tax), NOT 25.00%!
             }
         ]
     }
@@ -1179,13 +1191,13 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         gstr2b_doc=g_doc_025_pct,
         evaluation_date=today
     )
-    food_eval_025 = next(e for e in evals_025 if e.rule_code == "SEC_17_5_FOOD")
-    assert food_eval_025.eligibility_status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR
-    assert food_eval_025.risk_reversal_amount == Decimal("25.00")
-    assert food_eval_025.potential_itc == Decimal("25.00")
+    gift_eval_025 = next(e for e in evals_025 if e.rule_code == "SEC_17_5_PERSONAL")
+    assert gift_eval_025.eligibility_status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR
+    assert gift_eval_025.risk_reversal_amount == Decimal("25.00")
+    assert gift_eval_025.potential_itc == Decimal("25.00")
 
-    # 13. Scenario D7: Strict Boolean Uniform-Rate Verification - Rejection of String Values
-    # String "false", "False", "0", or unverified "true" MUST NOT activate uniform rate fallback
+    # 13. Scenario D7: Rejection of String Values, Raw Unauthenticated Booleans, and Mismatched HSN Rates
+    # A. String values ("false", "False", "0", "true", "yes") MUST NOT activate uniform rate fallback
     for false_str_val in ["false", "False", "0", "true", "yes"]:
         p_doc_string_trap = {
             "id": f"p_multi_trap_{false_str_val}",
@@ -1226,6 +1238,129 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         )
         assert food_eval_trap.risk_reversal_amount == Decimal("0.00")
 
+    # B. Raw unauthenticated boolean True alone without auditor metadata MUST be rejected
+    p_doc_raw_bool_unauthenticated = {
+        "id": "p_multi_raw_bool",
+        "document_number": "INV-RAW-BOOL",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2700.00"),
+        "sgst_amount": Decimal("2700.00"),
+        "total_invoice_value": Decimal("35400.00"),
+        "gst_rate": Decimal("18.00"),
+        "is_uniform_rate_verified": True,  # Raw boolean alone without auditor metadata!
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00")
+            }
+        ]
+    }
+    evals_raw_bool = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_raw_bool_unauthenticated,
+        gstr2b_doc=g_doc_uniform,
+        evaluation_date=today
+    )
+    food_eval_raw_bool = next(e for e in evals_raw_bool if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_raw_bool.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED, (
+        "Raw client boolean True alone should be rejected without verified auditor metadata!"
+    )
+    assert food_eval_raw_bool.risk_reversal_amount == Decimal("0.00")
+
+    # C. Fabricated verifier credentials (unauthorized role or missing auth token) MUST be rejected
+    p_doc_fake_credentials = {
+        "id": "p_multi_fake_cred",
+        "document_number": "INV-FAKE-CRED",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2700.00"),
+        "sgst_amount": Decimal("2700.00"),
+        "total_invoice_value": Decimal("35400.00"),
+        "gst_rate": Decimal("18.00"),
+        "rate_verification_metadata": {
+            "is_verified": True,
+            "verifier_role": "ACCOUNTANT",  # NOT in AUTHORIZED_VERIFIER_ROLES!
+            "verifier_id": "FAKE_ID",
+            "evidence_ref": "REF-01"
+            # Missing authorization_token!
+        },
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00")
+            }
+        ]
+    }
+    evals_fake_cred = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_fake_credentials,
+        gstr2b_doc=g_doc_uniform,
+        evaluation_date=today
+    )
+    food_eval_fake_cred = next(e for e in evals_fake_cred if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_fake_cred.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_fake_cred.risk_reversal_amount == Decimal("0.00")
+
+    # D. Mismatched HSN Rates MUST be rejected under statutory schedule
+    # E.g. 40% rate erroneously assigned to catering (HSN 996331) or biris (HSN 24031921)
+    p_doc_mismatched_hsn_rate = {
+        "id": "p_multi_hsn_mismatch",
+        "document_number": "INV-HSN-MISMATCH",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("3800.00"),
+        "sgst_amount": Decimal("3800.00"),
+        "total_invoice_value": Decimal("37600.00"),
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "gst_rate": Decimal("18.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00"),
+                "gst_rate": Decimal("40.00")   # INVALID: Catering is 5%/18%, NEVER 40%!
+            }
+        ]
+    }
+    evals_hsn_mismatch = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_mismatched_hsn_rate,
+        gstr2b_doc=g_doc_40_pct,
+        evaluation_date=today
+    )
+    food_eval_hsn_mismatch = next(e for e in evals_hsn_mismatch if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_hsn_mismatch.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_hsn_mismatch.risk_reversal_amount == Decimal("0.00")
+
     # 14. Scenario D8: Structured Verification Record Acceptance
     p_doc_structured_verified = {
         "id": "p_multi_structured_verified",
@@ -1237,7 +1372,10 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         "gst_rate": Decimal("18.00"),
         "is_uniform_rate_verified": {
             "is_verified": True,
+            "verifier_role": "CHARTERED_ACCOUNTANT",
             "verifier_id": "CA-AUDITOR-01",
+            "evidence_ref": "DOC-RATE-AUDIT-2026-11",
+            "authorization_token": "TOKEN-AUTH-SIG-998877",
             "verification_timestamp": "2026-11-23T10:00:00Z"
         },
         "line_items": [
@@ -1267,5 +1405,85 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     food_eval_struct = next(e for e in evals_struct if e.rule_code == "SEC_17_5_FOOD")
     assert food_eval_struct.eligibility_status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR
     assert food_eval_struct.risk_reversal_amount == Decimal("1800.00")
+
+    # 15. Scenario D9: Explicit Rate Representation Contract
+    # A. Dedicated explicit rate_fraction field (e.g. rate_fraction: 0.18 -> 18.00%)
+    p_doc_explicit_fraction = {
+        "id": "p_multi_rate_fraction",
+        "document_number": "INV-RATE-FRACTION",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2050.00"),
+        "sgst_amount": Decimal("2050.00"),
+        "total_invoice_value": Decimal("34100.00"),
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "rate_fraction": Decimal("0.18"),  # Explicit fractional representation -> 18.00%
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00"),
+                "rate_fraction": Decimal("0.05")   # Explicit fractional representation -> 5.00%
+            }
+        ]
+    }
+    evals_frac = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_explicit_fraction,
+        gstr2b_doc=g_doc_rate_aware,
+        evaluation_date=today
+    )
+    food_eval_frac = next(e for e in evals_frac if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_frac.eligibility_status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR
+    assert food_eval_frac.risk_reversal_amount == Decimal("500.00")
+
+    # B. Ambiguous unscaled decimal in standard percentage field (gst_rate: 0.18) MUST be rejected!
+    # Because 0.18% is not a statutory rate and guessing heuristics are eliminated
+    p_doc_ambiguous_decimal = {
+        "id": "p_multi_ambiguous_decimal",
+        "document_number": "INV-AMBIGUOUS-DECIMAL",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2050.00"),
+        "sgst_amount": Decimal("2050.00"),
+        "total_invoice_value": Decimal("34100.00"),
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "gst_rate": Decimal("0.18"),       # Ambiguous unscaled decimal in percentage field!
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00"),
+                "gst_rate": Decimal("5.00")
+            }
+        ]
+    }
+    evals_ambiguous = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_ambiguous_decimal,
+        gstr2b_doc=g_doc_rate_aware,
+        evaluation_date=today
+    )
+    food_eval_ambiguous = next(e for e in evals_ambiguous if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_ambiguous.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED, (
+        "Ambiguous decimal 0.18 in standard percentage field should be rejected without guessing!"
+    )
+    assert food_eval_ambiguous.risk_reversal_amount == Decimal("0.00")
 
 

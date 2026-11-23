@@ -89,6 +89,9 @@ def capture_database_state(conn):
 
         return {"grants": grants, "policies": policies, "rls_flags": rls_flags}
 
+# Immutable cryptographic code anchor for baseline revision 0019
+TRUSTED_BASELINE_0019_SCHEMA_SHA256 = "bfe3e3a342b56732d1d0cf43f8edfc50391df1020a2c487f22fb5834e9503373"
+
 def compute_canonical_catalog_sha256(data: dict) -> str:
     catalog_payload = {
         "revision": data["revision"],
@@ -107,13 +110,19 @@ def load_trusted_0019_reference():
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Independent Cryptographic Authentication of reference catalog payload
+    # Independent Cryptographic Authentication of reference catalog payload against immutable code anchor
     expected_hash = data.get("provenance", {}).get("schema_sha256")
     actual_hash = compute_canonical_catalog_sha256(data)
-    if not expected_hash or expected_hash != actual_hash:
+    
+    if expected_hash != TRUSTED_BASELINE_0019_SCHEMA_SHA256:
+        raise ValueError(
+            f"Provenance hash mismatch in baseline_0019_reference.json! "
+            f"Expected code anchor '{TRUSTED_BASELINE_0019_SCHEMA_SHA256}', but JSON declared '{expected_hash}'."
+        )
+    if actual_hash != TRUSTED_BASELINE_0019_SCHEMA_SHA256:
         raise ValueError(
             f"Cryptographic authentication failed for baseline_0019_reference.json! "
-            f"Expected schema_sha256='{expected_hash}', but computed '{actual_hash}'."
+            f"Expected code anchor '{TRUSTED_BASELINE_0019_SCHEMA_SHA256}', but computed '{actual_hash}'."
         )
 
     trusted_grants = {
