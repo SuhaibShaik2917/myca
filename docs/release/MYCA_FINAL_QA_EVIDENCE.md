@@ -3,7 +3,7 @@
 **Audit Date:** November 23, 2026  
 **Environment:** Linux (WSL Ubuntu 24.04 / Python 3.12.3 / PostgreSQL 16.11 / Node.js v24.14)  
 **Branch:** `remediation/audit-findings-phase3` (Merging to `master`)  
-**Git Checkpoints:** Baseline `9f97516`, Audit Phase 1 `d421f0e`, Phase 2 Baseline `9961014`, Remediation Head (Phase 3)  
+**Git Checkpoints:** Baseline `9f97516`, Audit Phase 1 `d421f0e`, Phase 2 Baseline `9961014`, Release Checkpoint v1.0.1  
 
 ---
 
@@ -57,14 +57,14 @@ tests/test_milestone5_scheme_navigator.py .....                          [ 97%]
 tests/test_statutory_section_17_5_boundaries_and_reference_grants.py ... [ 98%]
 ...                                                                      [100%]
 
-============================ 259 passed in 47.97s =============================
+============================ 259 passed in 18.62s =============================
 ```
 
 - **Total Test Items:** 259
 - **Passed:** 259
 - **Failed:** 0
 - **Errors:** 0
-- **Duration:** 47.97 seconds
+- **Duration:** 18.62 seconds
 - **Pass Rate:** 100.0%
 
 ---
@@ -108,7 +108,7 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
    - Risk reversal amount is strictly ₹0.00 (not confirmed reversal).
    - In GSTR-3B Table 4(B)(1), permanent reversals are ₹0.00; Net ITC in 4(C) retains the full amount until CA confirms block.
 6. `test_multi_line_invoice_exception_and_blocked_catering`:
-   - Evaluates multi-line invoices across 10 comprehensive statutory scenarios:
+   - Evaluates multi-line invoices across 14 comprehensive statutory scenarios:
      - Scenario A (Explicit Line Tax): ₹2,000 catering reversed out of ₹5,000 total invoice tax, preserving ₹3,000 eligible repair credit.
      - Scenario B1 (Rate-Aware Proportional Allocation): Vehicle repair at 18% (₹20,000 -> ₹3,600 tax) and catering at 5% (₹10,000 -> ₹500 tax), total tax ₹4,100; catering reversed at exactly ₹500.00, NOT ₹1,366.67 from an unweighted ratio.
      - Scenario B2 (Explicit Line Tax Discrepancy Gate): Line taxes (₹3,000 + ₹1,500 = ₹4,500) fail to reconcile to invoice tax (₹5,000); routes to `REVIEW_REQUIRED` with `risk_reversal_amount = Decimal("0.00")`.
@@ -119,6 +119,10 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
      - Scenario D2 (Non-Statutory Rate on Line Items): Blended/composite rate (13.67%) rejected under statutory rate whitelist; routes to `REVIEW_REQUIRED` with `0.00` reversal.
      - Scenario D3 (Document-Level Rate WITH Uniformity Gate): `is_uniform_rate_verified: True` allows valid statutory rate (18%) across lines, correctly reversing ₹1,800 catering and granting ₹3,600 repair.
      - Scenario D4 (Dynamic Rounding Tolerance Exceeded): Derived tolerance $N \times 0.01$ (₹0.02 for 2 lines) exceeded by ₹0.05 discrepancy routes to `REVIEW_REQUIRED` with `0.00` reversal.
+     - Scenario D5 (Legitimate 40.00% Statutory Rate): Notification No. 9/2025-Integrated Tax (Rate) 40% rate on aerated waters / pan masala correctly validated and allocated (₹4,000 catering/luxury reversed).
+     - Scenario D6 (Legitimate 0.25% Statutory Rate): Schedule V rate (0.25%) parsed directly as percentage points without erroneous 100x inflation to 25.00% (reverses ₹25.00).
+     - Scenario D7 (Strict Boolean Uniform-Rate Verification): String values ("false", "False", "0", "true", "yes") strictly rejected; prevents truthiness bypass.
+     - Scenario D8 (Structured Verification Record Acceptance): Verification metadata object with verifier identity accepted and authorized.
 
 ---
 
@@ -136,7 +140,7 @@ PYTHONPATH=. /opt/myca-venv/bin/python3 scripts/verify_migration_rollback_state.
 === Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json ===
   Provenance Origin: Independently provisioned clean PostgreSQL 16 database migrated strictly forward from base to 0019_m3_gstr3b_filings
   Clean Reference DB: myca_independent_reference
-  Schema SHA256: 094a634892baa01db85044604c00de7c80d1252cec5eb83254a0af58f2cad43c
+  Cryptographic Authentication: SHA256 verified (bfe3e3a342b56732d1d0cf43f8edfc50391df1020a2c487f22fb5834e9503373) [PASS]
   Complete Definitions: 79 grants, 87 policies, 41 tables.
 
 === Step 1: Establish Baseline at 0019 & Verify Against Independent Reference ===
@@ -186,7 +190,7 @@ computing gzip size...
 dist/index.html                   0.48 kB │ gzip:   0.33 kB
 dist/assets/index-CXHqnTlf.css   29.39 kB │ gzip:   5.62 kB
 dist/assets/index-DBkuh5Fw.js   420.23 kB │ gzip: 107.43 kB
-✓ built in 9.88s
+✓ built in 2.41s
 ```
 - TypeScript: 0 errors
-- Vite: 1,583 modules transformed in 9.88s
+- Vite: 1,583 modules transformed in 2.41s

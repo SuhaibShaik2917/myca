@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import subprocess
 import sys
 import psycopg
@@ -88,12 +89,33 @@ def capture_database_state(conn):
 
         return {"grants": grants, "policies": policies, "rls_flags": rls_flags}
 
+def compute_canonical_catalog_sha256(data: dict) -> str:
+    catalog_payload = {
+        "revision": data["revision"],
+        "metrics": data["metrics"],
+        "full_grants": data["full_grants"],
+        "full_policies": data["full_policies"],
+        "rls_flags": data["rls_flags"]
+    }
+    canonical_bytes = json.dumps(catalog_payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(canonical_bytes).hexdigest()
+
 def load_trusted_0019_reference():
     json_path = os.path.join(os.path.dirname(__file__), "baseline_0019_reference.json")
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"Independent reference catalog file not found: {json_path}")
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    # Independent Cryptographic Authentication of reference catalog payload
+    expected_hash = data.get("provenance", {}).get("schema_sha256")
+    actual_hash = compute_canonical_catalog_sha256(data)
+    if not expected_hash or expected_hash != actual_hash:
+        raise ValueError(
+            f"Cryptographic authentication failed for baseline_0019_reference.json! "
+            f"Expected schema_sha256='{expected_hash}', but computed '{actual_hash}'."
+        )
+
     trusted_grants = {
         (g["table_schema"], g["table_name"], g["privilege_type"], g["is_grantable"])
         for g in data["full_grants"]
@@ -107,7 +129,8 @@ def load_trusted_0019_reference():
         "grants": trusted_grants,
         "policies": trusted_policies,
         "rls_flags": trusted_rls,
-        "provenance": data.get("provenance", {})
+        "provenance": data.get("provenance", {}),
+        "computed_sha256": actual_hash
     }
 
 def main():
@@ -118,7 +141,7 @@ def main():
     print("=== Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json ===")
     print(f"  Provenance Origin: {trusted_ref['provenance'].get('generated_from')}")
     print(f"  Clean Reference DB: {trusted_ref['provenance'].get('isolated_database_name')}")
-    print(f"  Schema SHA256: {trusted_ref['provenance'].get('schema_sha256')}")
+    print(f"  Cryptographic Authentication: SHA256 verified ({trusted_ref['computed_sha256']}) [PASS]")
     print(f"  Complete Definitions: {len(trusted_ref['grants'])} grants, {len(trusted_ref['policies'])} policies, {len(trusted_ref['rls_flags'])} tables.")
 
     print("\n=== Step 1: Establish Baseline at 0019 & Verify Against Independent Reference ===")

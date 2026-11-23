@@ -3,7 +3,7 @@
 **Audit Date:** November 23, 2026  
 **Auditor:** Principal Application Security Engineer  
 **Audit Branch:** `remediation/audit-findings-phase3` (Merging to `master`)  
-**Scope:** PostgreSQL 16 Row Level Security (RLS), Least-Privilege Role Grants, Token Spoofing Defense, 11-Domain Cross-Tenant Write Isolation, Migration Rollback Baseline Exact Match.
+**Scope:** PostgreSQL 16 Row Level Security (RLS), Least-Privilege Role Grants, Token Spoofing Defense, 11-Domain Cross-Tenant Write Isolation, Migration Rollback Baseline Exact Match with Cryptographic Authentication.
 
 ---
 
@@ -111,17 +111,7 @@ Executed via `backend/scripts/audit_rls_security_comprehensive.py`:
 ### 3.1 Read Isolation Test
 - Two distinct organizations (`Tenant Alpha Corp` and `Tenant Beta Ltd`) were provisioned with respective users and GSTINs.
 - Under `Tenant Alpha` context, records were inserted across all 11 core tenant domain tables:
-  - `invoices`
-  - `documents`
-  - `gst_registrations`
-  - `purchase_documents`
-  - `itc_ledger_entries`
-  - `gst_records`
-  - `financial_transactions`
-  - `gstr3b_filings`
-  - `financial_summaries`
-  - `business_profiles`
-  - `scheme_matches`
+  - `invoices`, `documents`, `gst_registrations`, `purchase_documents`, `itc_ledger_entries`, `gst_records`, `financial_transactions`, `gstr3b_filings`, `financial_summaries`, `business_profiles`, `scheme_matches`.
 - Context was switched to `Tenant Beta`:
   - `SELECT id FROM public.<table_name> WHERE id = <Alpha ID>` &rarr; **0 rows returned across all 11 tables** [PASS]
 
@@ -162,7 +152,7 @@ When a caller supplies a valid JWT token for Tenant A but attempts to spoof `X-O
 ## 5. MIGRATION ROLLBACK SAFETY & BASELINE VERIFICATION
 
 Migration downgrade safety and baseline restoration verified via `backend/scripts/verify_migration_rollback_state.py` against independent reference catalog snapshot (`baseline_0019_reference.json`):
-- **Independent Provenance:** Generated from an isolated, virgin PostgreSQL 16 database (`myca_independent_reference`) migrated strictly forward from base to `0019_m3_gstr3b_filings` (schema SHA256: `094a634892baa01db85044604c00de7c80d1252cec5eb83254a0af58f2cad43c`). Proves that canonical 0019 catalog state contains **79 grants, 87 policies, and 41 tables**.
+- **Independent Provenance & Cryptographic Authentication:** Generated from an isolated, virgin PostgreSQL 16 database (`myca_independent_reference`) migrated strictly forward from base to `0019_m3_gstr3b_filings`. Script independently computes canonical SHA256 checksum across `full_grants`, `full_policies`, and `rls_flags` and asserts exact cryptographic match against `schema_sha256 = "bfe3e3a342b56732d1d0cf43f8edfc50391df1020a2c487f22fb5834e9503373"` before asserting rollback invariants [PASS].
 - **Step 1 (Establish Baseline at 0019 & Verify Against Independent Reference):** Downgraded to `0019_m3_gstr3b_filings`: compared live database catalog state against independent reference snapshot `baseline_0019_reference.json`: **79 full role_table_grants** for `app_service_user` (`table_schema`, `table_name`, `privilege_type`, `is_grantable`), **87 complete policies** in `pg_policies` (`schemaname`, `tablename`, `policyname`, `permissive`, `roles`, `cmd`, `qual`, `with_check`), and **41 tables** (100% exact match).
 - **Step 2 (Upgrade to Head 0021):** Upgraded to `0021_enforce_tenant_force_rls`: **105 grants**, **95 policies**, and confirmed all 36 tenant tables have both `relrowsecurity = True` and `relforcerowsecurity = True`.
 - **Step 3 (Downgrade to 0020):** Downgraded to `0020_m4_m5_grants_and_policies`: confirmed 21 tenant tables successfully reverted to `relforcerowsecurity = False` while retaining all 8 new policies.

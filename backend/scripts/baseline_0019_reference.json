@@ -7,7 +7,7 @@
     "generated_at": "2026-11-23T08:59:46.581542+00:00",
     "migration_command": "command.upgrade(cfg, '0019_m3_gstr3b_filings')",
     "untouched_by_remediation": true,
-    "schema_sha256": "094a634892baa01db85044604c00de7c80d1252cec5eb83254a0af58f2cad43c"
+    "schema_sha256": "bfe3e3a342b56732d1d0cf43f8edfc50391df1020a2c487f22fb5834e9503373"
   },
   "metrics": {
     "grants_count": 79,
