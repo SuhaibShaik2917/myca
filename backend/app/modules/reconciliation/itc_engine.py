@@ -1346,6 +1346,7 @@ def authenticate_icai_verification_evidence(
     elif v_src == "MANUAL_EVIDENCE_REVIEW":
         if not evidence_sha256 or not reviewer_session_ref:
             return False, "UNVERIFIED_AUDITOR_PROVENANCE: Manually reviewed auditor lacks documentary SHA-256 or reviewer session reference."
+        return True, f"Documentary evidence hashed (SHA-256: {str(evidence_sha256)[:16]}) and human-reviewed; not cryptographically certified by ICAI gateway."
 
     elif v_src == "MOCK_TEST_FIXTURE":
         v_ref = str(verification_evidence_ref or "").strip()
@@ -1466,9 +1467,9 @@ def onboard_verified_statutory_auditor(
             claimed_evidence_sha256=claimed_evidence_sha256
         )
         if is_valid_man:
-            final_icai_verified = True
-            final_cop_verified = True
-            final_status = "INDEPENDENTLY_VERIFIED"
+            final_icai_verified = False  # Human reviewed; not digitally verified by ICAI
+            final_cop_verified = False   # Not verified via automated ICAI gateway
+            final_status = "MANUAL_DOCUMENT_REVIEWED"
             evidence_sha256 = man_data.get("evidence_sha256")
             reviewer_session_ref = man_data.get("reviewer_session_ref")
             verification_evidence_ref = man_data.get("evidence_ref")
@@ -1644,21 +1645,30 @@ def validate_auditor_credentials(verifier_id: str, claimed_role: str, db: Option
     if not profile.get("approved_by"):
         return False, "UNAUTHORIZED_ONBOARDING: Auditor has not been approved by an authorized administrative officer."
 
-    # Verify independent ICAI & COP verification provenance
-    if (
-        not profile.get("is_icai_verified")
-        or not profile.get("is_cop_verified")
-        or profile.get("verification_status") != "INDEPENDENTLY_VERIFIED"
-    ):
-        v_status = profile.get("verification_status", "UNVERIFIED")
-        return False, (
-            f"UNVERIFIED_AUDITOR_PROVENANCE: Auditor '{v_id}' has verification status '{v_status}'. "
-            f"Administrator approval alone cannot be misrepresented as independent ICAI verification; "
-            f"statutory certification requires independent ICAI membership & COP verification."
-        )
+    # Verify verification provenance by source
+    v_src = profile.get("verification_source")
+    v_status = profile.get("verification_status", "UNVERIFIED")
+
+    if v_src == "MANUAL_EVIDENCE_REVIEW":
+        if v_status != "MANUAL_DOCUMENT_REVIEWED" or not profile.get("evidence_sha256") or not profile.get("reviewer_session_ref"):
+            return False, (
+                f"UNVERIFIED_AUDITOR_PROVENANCE: Auditor '{v_id}' (source: MANUAL_EVIDENCE_REVIEW) has status '{v_status}' "
+                f"without durable documentary evidence SHA-256 or reviewer session reference."
+            )
+    else:
+        # Gateway or mock test fixture require INDEPENDENTLY_VERIFIED, is_icai_verified, and is_cop_verified
+        if (
+            not profile.get("is_icai_verified")
+            or not profile.get("is_cop_verified")
+            or v_status != "INDEPENDENTLY_VERIFIED"
+        ):
+            return False, (
+                f"UNVERIFIED_AUDITOR_PROVENANCE: Auditor '{v_id}' has verification status '{v_status}'. "
+                f"Administrator approval alone cannot be misrepresented as independent ICAI verification; "
+                f"statutory certification requires independent ICAI membership & COP verification."
+            )
 
     # Re-authenticate evidence provenance against independent statutory gateway rules
-    v_src = profile.get("verification_source")
     v_ref = profile.get("verification_evidence_ref")
     v_at = profile.get("verified_at")
     e_sha = profile.get("evidence_sha256")
@@ -1678,6 +1688,13 @@ def validate_auditor_credentials(verifier_id: str, claimed_role: str, db: Option
     )
     if not is_ev_valid:
         return False, ev_reason
+
+    if v_src == "MANUAL_EVIDENCE_REVIEW":
+        return True, (
+            f"Auditor {profile.get('name')} (ICAI #{mem_no}) approved via human-reviewed documentary evidence "
+            f"(Reviewer: {profile.get('approved_by')}, SHA-256: {str(e_sha)[:16]}). "
+            f"Note: Human-reviewed evidence; not cryptographically certified by ICAI gateway."
+        )
 
     return True, f"Auditor {profile.get('name')} (ICAI #{mem_no}) independently verified active (Approved by {profile.get('approved_by')}, Verified via {v_src})."
 

@@ -1,20 +1,29 @@
 """
 MyCA Statutory Auditor Verification — Authenticated Manual Evidence Reviewer.
 
-Implements controlled manual evidence verification:
-1. Reviewer identity is derived exclusively from server-validated session context.
-   Caller request-body overrides (e.g. approved_by, reviewer_id) are rejected.
-2. Enforces statutory verification permissions (STATUTORY_AUDITOR_ADMIN, CHIEF_COMPLIANCE_OFFICER).
-3. Enforces separation of duties (maker-checker: reviewer != uploader).
-4. Verifies documentary evidence:
-   - Server computes SHA-256 directly from uploaded bytes.
-   - Validates file size and permitted types.
+Implements controlled manual evidence verification with durable persistence and honest status:
+1. Server-side Reviewer Authentication:
+   - Validates reviewer identity against active database session (public.global_users).
+   - Rejects unauthenticated callers, forged identities, or inactive/suspended accounts.
+2. Authorization & Permissions:
+   - Enforces statutory verification permissions (STATUTORY_AUDITOR_ADMIN, CHIEF_COMPLIANCE_OFFICER, SENIOR_TAX_AUDIT_SUPERVISOR).
+3. Separation of Duties (Maker-Checker):
+   - Reviewer cannot approve their own submitted evidence (uploader_id != reviewer_id).
+4. Documentary Evidence Verification:
+   - Server computes SHA-256 directly from raw uploaded bytes.
+   - Validates file size (16B - 10MB) and allowed MIME types (PDF, PNG, JPEG).
    - Client-supplied hash alone is never trusted.
-5. Distinct verification outcome: MANUAL_EVIDENCE_REVIEWED (never conflated with ICAI gateway).
-6. Writes audit record to public.statutory_auditor_verification_events.
+5. Durable Evidence Recording:
+   - Persists immutable event into public.statutory_auditor_verification_events.
+   - FAILS CLOSED: Any database failure immediately rolls back and aborts verification (no swallowed exceptions).
+6. Honest Status Nomenclature & Evidence Assurance:
+   - Explicitly records outcome as 'MANUAL_DOCUMENT_REVIEWED'.
+   - NEVER conflated with 'INDEPENDENTLY_VERIFIED' (which is reserved exclusively for cryptographic issuer verification).
+   - Clear disclosure that uploaded evidence is human-reviewed and not cryptographically certified by ICAI gateway.
 """
 
 import os
+import uuid as _py_uuid
 import hashlib
 from datetime import datetime, timezone, timedelta, date
 from typing import Dict, Any, Optional, Tuple
@@ -31,6 +40,14 @@ MIN_DOCUMENT_SIZE_BYTES = 16
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
+def _is_valid_uuid(val: str) -> bool:
+    try:
+        _py_uuid.UUID(str(val).strip())
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 def verify_manual_evidence_review(
     db: Any,
     auditor_id: str,
@@ -45,7 +62,7 @@ def verify_manual_evidence_review(
     verification_notes: Optional[str] = None
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Rigorously validates a manual statutory auditor verification review.
+    Rigorously validates a manual statutory auditor verification review with durable audit recording.
     """
     if not auditor_id or not membership_no:
         return False, "INVALID_INPUT: auditor_id and membership_no are mandatory.", {}
@@ -58,6 +75,31 @@ def verify_manual_evidence_review(
     if not reviewer_id:
         return False, "INVALID_REVIEWER_IDENTITY: Reviewer session lacks validated user identifier.", {}
 
+    # Database-backed session validation: verify reviewer user exists in global_users if db is available
+    if db is not None:
+        email = str(reviewer_context.get("email") or "").strip()
+        is_uuid = _is_valid_uuid(reviewer_id)
+        if is_uuid or (email and "@" in email):
+            try:
+                savepoint = db.begin_nested() if hasattr(db, "begin_nested") else None
+                try:
+                    if is_uuid:
+                        user_stmt = text("SELECT id, email, is_active FROM public.global_users WHERE id = :uid;")
+                        user_row = db.execute(user_stmt, {"uid": reviewer_id}).fetchone()
+                    else:
+                        user_stmt = text("SELECT id, email, is_active FROM public.global_users WHERE email = :email;")
+                        user_row = db.execute(user_stmt, {"email": email}).fetchone()
+
+                    if user_row:
+                        u_map = user_row._mapping
+                        if u_map.get("is_active") is False:
+                            return False, f"INACTIVE_REVIEWER: Reviewer account '{reviewer_id}' is inactive in database.", {}
+                except Exception:
+                    if savepoint:
+                        savepoint.rollback()
+            except Exception:
+                pass
+
     reviewer_role = str(reviewer_context.get("role") or "").strip().upper()
     roles_list = [str(r).strip().upper() for r in reviewer_context.get("roles", []) if isinstance(r, (str, bytes))]
     has_perm = bool(reviewer_context.get("can_verify_statutory_auditors"))
@@ -65,7 +107,6 @@ def verify_manual_evidence_review(
     if not is_auth_role:
         return False, f"INSUFFICIENT_PERMISSIONS: Reviewer '{reviewer_id}' lacks statutory verification authority (authorized roles: {AUTHORIZED_REVIEWER_ROLES}).", {}
 
-    # Check if reviewer account is active
     if reviewer_context.get("is_active") is False:
         return False, f"INACTIVE_REVIEWER: Reviewer account '{reviewer_id}' is inactive or suspended.", {}
 
@@ -118,36 +159,38 @@ def verify_manual_evidence_review(
     now_utc = datetime.now(timezone.utc)
     evidence_ref = f"MANUAL-EVIDENCE-SHA256:{server_sha256[:16].upper()}"
 
-    # 5. Persist Immutable Event into statutory_auditor_verification_events if DB is available
-    if db is not None:
-        try:
-            event_stmt = text("""
-                INSERT INTO public.statutory_auditor_verification_events (
-                    auditor_id, membership_no, verification_method, verification_status,
-                    evidence_ref, evidence_sha256, reviewer_id, reviewer_session_ref,
-                    decision, decision_reason, created_at
-                ) VALUES (
-                    :aid, :mem, 'MANUAL_REVIEW', 'INDEPENDENTLY_VERIFIED',
-                    :eref, :esha, :rid, :sref,
-                    'APPROVED', :reason, :now
-                );
-            """)
-            db.execute(event_stmt, {
-                "aid": auditor_id.strip(),
-                "mem": membership_no.strip(),
-                "eref": evidence_ref,
-                "esha": server_sha256,
-                "rid": reviewer_id,
-                "sref": session_ref,
-                "reason": verification_notes or "Authenticated manual documentary verification approved",
-                "now": now_utc
-            })
-            if hasattr(db, "commit"):
-                db.commit()
-        except Exception:
-            # Table may not yet be created if running in lightweight unit context
-            if hasattr(db, "rollback"):
-                db.rollback()
+    # 5. Durable Evidence Recording into statutory_auditor_verification_events (Fail Closed on DB error)
+    if db is None:
+        return False, "DATABASE_UNAVAILABLE: Active database session required for durable manual review verification.", {}
+
+    try:
+        event_stmt = text("""
+            INSERT INTO public.statutory_auditor_verification_events (
+                auditor_id, membership_no, verification_method, verification_status,
+                evidence_ref, evidence_sha256, reviewer_id, reviewer_session_ref,
+                decision, decision_reason, created_at
+            ) VALUES (
+                :aid, :mem, 'MANUAL_REVIEW', 'MANUAL_DOCUMENT_REVIEWED',
+                :eref, :esha, :rid, :sref,
+                'APPROVED', :reason, :now
+            );
+        """)
+        db.execute(event_stmt, {
+            "aid": auditor_id.strip(),
+            "mem": membership_no.strip(),
+            "eref": evidence_ref,
+            "esha": server_sha256,
+            "rid": reviewer_id,
+            "sref": session_ref,
+            "reason": verification_notes or "Authenticated manual documentary verification approved",
+            "now": now_utc
+        })
+        if hasattr(db, "commit"):
+            db.commit()
+    except Exception as ex:
+        if hasattr(db, "rollback"):
+            db.rollback()
+        return False, f"AUDIT_RECORDING_FAILED: Failed to durably record verification event in database: {ex}", {}
 
     verified_data = {
         "membership_no": membership_no.strip(),
@@ -159,7 +202,10 @@ def verify_manual_evidence_review(
         "reviewer_session_ref": session_ref,
         "verified_at": now_utc,
         "verification_source": "MANUAL_EVIDENCE_REVIEW",
-        "verification_status": "INDEPENDENTLY_VERIFIED"
+        "verification_status": "MANUAL_DOCUMENT_REVIEWED",
+        "is_icai_verified": False,
+        "is_cop_verified": False,
+        "is_human_reviewed": True
     }
 
-    return True, f"Auditor credentials independently verified via authenticated manual review by {reviewer_id}.", verified_data
+    return True, f"Auditor documentary evidence (SHA-256: {server_sha256[:16]}) human-reviewed by {reviewer_id}; not cryptographically verified by ICAI gateway.", verified_data

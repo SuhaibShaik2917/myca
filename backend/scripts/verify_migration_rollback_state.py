@@ -212,22 +212,47 @@ def main():
     run_cmd(["alembic", "upgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 1b: Fresh Historical Upgrade 0022", "LEGACY_SEEDS_PRESENT_IN_HISTORICAL_0022")
 
-    print("\n=== Step 2: Upgrade to Head (0024_auditor_authentic_evidence) ===")
+    print("\n=== Step 2: Upgrade to Head (0025_manual_review_and_nonce) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2: Head 0024", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2: Head 0025", "AUDITORS_VERIFIED_CLEAN")
     state_head = capture_database_state(conn)
-    print(f"  Head State (0024): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
-    assert len(state_head["grants"]) == 110, f"Expected 110 grants at 0024, got {len(state_head['grants'])}"
-    assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0024, got {len(state_head['policies'])}"
+    print(f"  Head State (0025): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
+    assert len(state_head["grants"]) == 110, f"Expected 110 grants at 0025, got {len(state_head['grants'])}"
+    assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0025, got {len(state_head['policies'])}"
+
+    # Verify nonce index exists at 0025
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM pg_indexes 
+            WHERE schemaname = 'public' 
+              AND tablename = 'statutory_auditors' 
+              AND indexname = 'uq_statutory_auditors_gateway_nonce';
+        """)
+        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0025"
 
     # Verify all 21 tables have relforcerowsecurity=True
     for tbl in TENANT_TABLES_21:
-        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0024"
+        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0025"
     # Verify all 8 0020 policies present
     for p_name in POLICIES_0020_8:
         matching = [p for p in state_head["policies"] if p[2] == p_name]
-        assert len(matching) == 1, f"Policy {p_name} missing at 0024"
-    print("PASS: Head state (0024) completely verified.")
+        assert len(matching) == 1, f"Policy {p_name} missing at 0025"
+    print("PASS: Head state (0025) completely verified.")
+
+    print("\n=== Step 2a: Downgrade to 0024_auditor_authentic_evidence & Verify ===")
+    run_cmd(["alembic", "downgrade", "0024_auditor_authentic_evidence"])
+    classify_and_verify_auditor_state(conn, "Step 2a: Downgrade 0024", "AUDITORS_VERIFIED_CLEAN")
+    state_0024 = capture_database_state(conn)
+    assert len(state_0024["grants"]) == 110, f"Expected 110 grants at 0024, got {len(state_0024['grants'])}"
+    assert len(state_0024["policies"]) == 95, f"Expected 95 policies at 0024, got {len(state_0024['policies'])}"
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM pg_indexes 
+            WHERE schemaname = 'public' 
+              AND tablename = 'statutory_auditors' 
+              AND indexname = 'uq_statutory_auditors_gateway_nonce';
+        """)
+        assert cur.fetchone() is None, "uq_statutory_auditors_gateway_nonce should be dropped at 0024"
 
     print("\n=== Step 2b: Downgrade to 0023_auditor_provenance & Verify State ===")
     run_cmd(["alembic", "downgrade", "0023_auditor_provenance"])
@@ -240,9 +265,9 @@ def main():
     run_cmd(["alembic", "downgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 2c: Clean Downgrade 0022", "AUDITORS_VERIFIED_CLEAN")
 
-    print("\n=== Step 2d: Re-upgrade to Head (0024_auditor_authentic_evidence) ===")
+    print("\n=== Step 2d: Re-upgrade to Head (0025_manual_review_and_nonce) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0024", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0025", "AUDITORS_VERIFIED_CLEAN")
     print("PASS: Downgrade rollback and re-upgrade cycles verified with zero fake auditor identities.")
 
     print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
@@ -291,14 +316,11 @@ def main():
     assert rolled_back_state["rls_flags"] == trusted_ref["rls_flags"], "Rollback RLS flags mismatch with independent reference snapshot!"
     print("  PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.")
 
-    print("\n=== Step 5: Re-Upgrade to Head (0024_auditor_authentic_evidence) ===")
+    print("\n=== Step 5: Re-Upgrade to Head (0025_manual_review_and_nonce) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0024", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0025", "AUDITORS_VERIFIED_CLEAN")
     final_head_state = capture_database_state(conn)
     assert final_head_state["grants"] == state_head["grants"]
-    assert final_head_state["policies"] == state_head["policies"]
-    assert final_head_state["rls_flags"] == state_head["rls_flags"]
-    print("  PASS: Re-upgrade to head completely restored production security state.")
     assert final_head_state["policies"] == state_head["policies"]
     assert final_head_state["rls_flags"] == state_head["rls_flags"]
     print("  PASS: Re-upgrade to head completely restored production security state.")

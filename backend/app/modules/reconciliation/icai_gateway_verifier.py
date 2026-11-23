@@ -3,17 +3,20 @@ MyCA Statutory Auditor Verification — ICAI Digital Verification Gateway Protoc
 
 Implements rigorous cryptographic verification of digital verification gateway responses:
 1. Validates digital signatures against trusted public keys (trust anchor).
-2. Prohibits unconfigured gateways or arbitrary/guessed trust anchors in production.
-3. Cryptographically binds:
+2. Loads independently provisioned JWKS (ICAI_GATEWAY_JWKS_PATH) or pinned public key (ICAI_GATEWAY_PUBLIC_KEY).
+3. Strictly binds key identifier (kid) to trusted registry; rejects unknown kid without trusting token headers.
+4. Enforces asymmetric algorithms (RS256, ES256) in production; rejects symmetric HS256 in production.
+5. Cryptographically binds claims:
    - membership_no
    - firm_registration_no
-   - cop_status
-   - cop_valid_until
+   - cop_status == 'ACTIVE'
+   - cop_valid_until > date.today()
    - evidence_ref
-   - issuer, audience, kid, iat, exp, and jti (replay nonce).
-4. Rejects alg=none, algorithm confusion, key mismatch, expired/revoked keys.
-5. Prevents replay using gateway response nonce tracking.
-6. Enforces strict test-key isolation (test keys are strictly rejected in production).
+   - issuer == 'https://gateway.icai.org'
+   - audience == 'myca-statutory-verification'
+   - iat (within 24 hours), exp (future), and jti (replay nonce).
+6. Prevents replay using database-backed atomic nonce tracking; fails closed if DB unavailable in production.
+7. Strictly isolates test keys (rejected in production mode).
 """
 
 import os
@@ -22,12 +25,14 @@ import json
 import hashlib
 from datetime import datetime, timezone, timedelta, date
 from typing import Dict, Any, Optional, Tuple
-from jose import jwt, JWTError
+from jose import jwt, jwk, JWTError
+from sqlalchemy import text
 
 # Configured trusted ICAI gateway parameters
 OFFICIAL_ICAI_GATEWAY_ISSUER = "https://gateway.icai.org"
 OFFICIAL_ICAI_AUDIENCE = "myca-statutory-verification"
 SUPPORTED_GATEWAY_ALGORITHMS = ["RS256", "ES256", "HS256"]
+PRODUCTION_ALLOWED_ALGORITHMS = ["RS256", "ES256"]
 
 # In-memory test trust store for automated tests only (KID -> Key Metadata)
 _TEST_TRUST_STORE: Dict[str, Dict[str, Any]] = {}
@@ -64,15 +69,63 @@ def clear_test_gateway_trust_store() -> None:
     _RECORDED_GATEWAY_NONCES.clear()
 
 
+def load_official_icai_trust_store() -> Dict[str, Dict[str, Any]]:
+    """
+    Loads and parses official ICAI trust anchor keys from configured JWKS path
+    or environment public key. Returns mapping of KID -> Key Metadata.
+    """
+    registry: Dict[str, Dict[str, Any]] = {}
+    jwks_path = os.environ.get("ICAI_GATEWAY_JWKS_PATH")
+    if jwks_path and os.path.exists(jwks_path):
+        try:
+            with open(jwks_path, "r", encoding="utf-8") as f:
+                jwks_data = json.load(f)
+            keys = jwks_data.get("keys", [])
+            for k in keys:
+                kid = k.get("kid")
+                if kid:
+                    try:
+                        key_obj = jwk.construct(k)
+                        pem_key = key_obj.to_pem(is_private=False).decode("utf-8")
+                    except Exception:
+                        pem_key = k
+                    registry[kid] = {
+                        "kid": kid,
+                        "key": pem_key,
+                        "algorithm": k.get("alg", "RS256"),
+                        "issuer": OFFICIAL_ICAI_GATEWAY_ISSUER,
+                        "valid_from": datetime(2025, 1, 1, tzinfo=timezone.utc),
+                        "valid_until": datetime(2035, 1, 1, tzinfo=timezone.utc),
+                        "is_revoked": False,
+                        "is_test_key": False
+                    }
+        except Exception:
+            pass
+
+    prod_key = os.environ.get("ICAI_GATEWAY_PUBLIC_KEY")
+    if prod_key and prod_key.strip():
+        kid = os.environ.get("ICAI_GATEWAY_KEY_ID", "icai-gateway-root-2026").strip()
+        alg = os.environ.get("ICAI_GATEWAY_KEY_ALG", "RS256").strip().upper()
+        registry[kid] = {
+            "kid": kid,
+            "key": prod_key.strip(),
+            "algorithm": alg,
+            "issuer": OFFICIAL_ICAI_GATEWAY_ISSUER,
+            "valid_from": datetime(2025, 1, 1, tzinfo=timezone.utc),
+            "valid_until": datetime(2035, 1, 1, tzinfo=timezone.utc),
+            "is_revoked": False,
+            "is_test_key": False
+        }
+
+    return registry
+
+
 def is_official_icai_gateway_configured() -> bool:
     """
-    Checks if an official production ICAI trust anchor is configured.
-    Production trust anchor must be configured via ICAI_GATEWAY_PUBLIC_KEY or ICAI_GATEWAY_JWKS_PATH.
-    Returns False if unconfigured.
+    Checks if an official production ICAI trust anchor is configured and valid.
     """
-    prod_key = os.environ.get("ICAI_GATEWAY_PUBLIC_KEY")
-    prod_jwks = os.environ.get("ICAI_GATEWAY_JWKS_PATH")
-    return bool(prod_key or (prod_jwks and os.path.exists(prod_jwks)))
+    registry = load_official_icai_trust_store()
+    return len(registry) > 0
 
 
 def create_test_signed_gateway_response(
@@ -133,15 +186,17 @@ def verify_icai_gateway_signed_response(
        In production, if official trust anchor is not configured, returns TRUST_ANCHOR_UNAVAILABLE.
     2. Test-Key Isolation:
        Test keys are strictly rejected in production mode.
-    3. Cryptographic Signature:
+    3. Asymmetric Algorithm in Production:
+       Symmetric algorithms (HS256) are rejected in production.
+    4. Cryptographic Signature:
        Validates digital signature against trusted public key matching header 'kid'.
-    4. Algorithm:
-       Strictly rejects alg=none and unsupported algorithms.
-    5. Token Claims:
+    5. Algorithm Matching:
+       Token algorithm must match configured trusted key algorithm.
+    6. Token Claims:
        Verifies issuer, audience, and timestamps (iat within 24h, exp in future, clock skew <= 5m).
-    6. Nonce Replay:
-       Ensures 'jti' nonce has not been consumed previously.
-    7. Statutory Claim Binding:
+    7. Persistent Nonce Replay:
+       Ensures 'jti' nonce has not been consumed previously (checks DB and fails closed).
+    8. Statutory Claim Binding:
        Binds membership_no, firm_registration_no, cop_status == 'ACTIVE',
        cop_valid_until > today, and evidence_ref.
     """
@@ -167,39 +222,36 @@ def verify_icai_gateway_signed_response(
     if not alg or alg.upper() == "NONE" or alg not in SUPPORTED_GATEWAY_ALGORITHMS:
         return False, f"UNSUPPORTED_ALGORITHM: Algorithm '{alg}' is unsupported or prohibited (alg=none rejected).", {}
 
+    # Strict algorithm check for production: HS256 is prohibited
+    if env not in ("test", "testing", "development"):
+        if alg not in PRODUCTION_ALLOWED_ALGORITHMS:
+            return False, f"ASYMMETRIC_ALGORITHM_REQUIRED: Algorithm '{alg}' is prohibited for production gateway verification; must use RS256/ES256 asymmetric public keys.", {}
+
     # 2. Resolve trusted key from Trust Store
     trusted_key_meta: Optional[Dict[str, Any]] = None
 
-    if is_official_icai_gateway_configured():
-        # Production configured trust anchor path
-        # In a real enterprise deployment, load production key from secure key vault/path
-        prod_key_val = os.environ.get("ICAI_GATEWAY_PUBLIC_KEY")
-        trusted_key_meta = {
-            "kid": kid,
-            "key": prod_key_val,
-            "algorithm": alg,
-            "issuer": OFFICIAL_ICAI_GATEWAY_ISSUER,
-            "valid_from": datetime(2025, 1, 1, tzinfo=timezone.utc),
-            "valid_until": datetime(2035, 1, 1, tzinfo=timezone.utc),
-            "is_revoked": False,
-            "is_test_key": False
-        }
-    else:
-        # If running in production and no official trust anchor exists -> FAIL CLOSED
-        if env not in ("test", "testing", "development"):
-            return False, "TRUST_ANCHOR_UNAVAILABLE: Official ICAI digital verification gateway public keys are not configured in production environment.", {}
-
-        # In test environment, resolve from test trust store
+    if env in ("test", "testing", "development"):
         trusted_key_meta = _TEST_TRUST_STORE.get(kid)
 
     if not trusted_key_meta:
+        official_store = load_official_icai_trust_store()
+        trusted_key_meta = official_store.get(kid)
+
+    if not trusted_key_meta:
+        if not is_official_icai_gateway_configured() and env not in ("test", "testing", "development"):
+            return False, "TRUST_ANCHOR_UNAVAILABLE: Official ICAI digital verification gateway public keys are not configured in production environment.", {}
         return False, f"UNKNOWN_KEY_ID: Key identifier '{kid}' is not recognized in the trusted gateway trust store.", {}
 
     # 3. Test key isolation in production
     if trusted_key_meta.get("is_test_key") and env not in ("test", "testing", "development"):
         return False, "TEST_KEY_REJECTED: Test cryptographic key cannot be accepted in production verification mode.", {}
 
-    # 4. Key lifecycle: check revocation and expiration
+    # 4. Strict algorithm matching against trusted key configuration
+    configured_alg = trusted_key_meta.get("algorithm", "RS256").upper()
+    if alg.upper() != configured_alg:
+        return False, f"ALGORITHM_MISMATCH: Token algorithm '{alg}' does not match configured trusted key algorithm '{configured_alg}'.", {}
+
+    # 5. Key lifecycle: check revocation and expiration
     if trusted_key_meta.get("is_revoked"):
         return False, f"REVOKED_SIGNING_KEY: Gateway signing key '{kid}' has been revoked by the issuing authority.", {}
 
@@ -212,7 +264,7 @@ def verify_icai_gateway_signed_response(
     if k_until and now_utc > k_until:
         return False, f"EXPIRED_SIGNING_KEY: Gateway signing key '{kid}' expired on {k_until.isoformat()}.", {}
 
-    # 5. Cryptographic signature and standard claims verification
+    # 6. Cryptographic signature and standard claims verification
     signing_key = trusted_key_meta["key"]
     try:
         claims = jwt.decode(
@@ -233,7 +285,7 @@ def verify_icai_gateway_signed_response(
     except JWTError as ex:
         return False, f"CRYPTOGRAPHIC_VERIFICATION_FAILED: Signature or claim verification failed: {ex}", {}
 
-    # 6. Freshness policy: token must not be older than 24 hours
+    # 7. Freshness policy: token must not be older than 24 hours
     iat_ts = claims.get("iat")
     if not iat_ts:
         return False, "MISSING_TIMESTAMP: Token lacks issued-at ('iat') claim.", {}
@@ -241,36 +293,44 @@ def verify_icai_gateway_signed_response(
     if now_utc - iat_dt > timedelta(hours=24):
         return False, f"STALE_VERIFICATION: Gateway response was issued at {iat_dt.isoformat()}, exceeding maximum 24-hour freshness window.", {}
 
-    # 7. Nonce replay protection (jti)
+    # 8. Nonce replay protection (jti)
     jti = claims.get("jti")
     if not jti or not isinstance(jti, str):
         return False, "MISSING_NONCE: Gateway response token lacks required unique response identifier ('jti').", {}
 
-    if jti in _RECORDED_GATEWAY_NONCES:
-        return False, f"GATEWAY_NONCE_REPLAY: Gateway response nonce '{jti}' has already been consumed.", {}
+    # In production, database is strictly required for persistent replay defense
+    if env not in ("test", "testing", "development") and db is None:
+        return False, "DATABASE_UNAVAILABLE: Active database session required for persistent replay defense in production.", {}
 
-    # Database check for nonce replay if db is provided
     if db is not None:
         try:
-            from sqlalchemy import text
             res = db.execute(
-                text("SELECT 1 FROM public.statutory_auditors WHERE gateway_response_id = :nonce;"),
+                text("""
+                    SELECT 1 FROM public.statutory_auditors WHERE gateway_response_id = :nonce
+                    UNION ALL
+                    SELECT 1 FROM public.statutory_auditor_verification_events WHERE evidence_ref = :nonce;
+                """),
                 {"nonce": jti}
             ).fetchone()
             if res:
-                return False, f"GATEWAY_NONCE_REPLAY: Gateway response nonce '{jti}' is already recorded in the database.", {}
-        except Exception:
-            # If table/column does not yet exist, rely on memory store
-            pass
+                return False, f"GATEWAY_NONCE_REPLAY: Gateway response nonce '{jti}' has already been consumed.", {}
+        except Exception as ex:
+            if hasattr(db, "rollback"):
+                db.rollback()
+            return False, f"DATABASE_ERROR: Replay check failed: {ex}", {}
+    else:
+        # In-memory check only in test/dev when db is omitted
+        if jti in _RECORDED_GATEWAY_NONCES:
+            return False, f"GATEWAY_NONCE_REPLAY: Gateway response nonce '{jti}' has already been consumed.", {}
 
-    # 8. Statutory claim binding
+    # 9. Statutory claim binding
     signed_mem_no = str(claims.get("membership_no") or "").strip()
     if signed_mem_no != expected_membership_no.strip():
         return False, f"MEMBERSHIP_MISMATCH: Signed membership number '{signed_mem_no}' does not match expected '{expected_membership_no}'.", {}
 
-    if expected_firm_registration_no:
+    if expected_firm_registration_no is not None:
         signed_frn = str(claims.get("firm_registration_no") or "").strip()
-        if signed_frn != expected_firm_registration_no.strip():
+        if signed_frn != str(expected_firm_registration_no).strip():
             return False, f"FRN_MISMATCH: Signed firm registration number '{signed_frn}' does not match expected '{expected_firm_registration_no}'.", {}
 
     signed_cop_status = str(claims.get("cop_status") or "").strip().upper()

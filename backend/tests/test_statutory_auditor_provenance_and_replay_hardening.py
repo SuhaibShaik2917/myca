@@ -558,7 +558,7 @@ def test_icai_gateway_cryptographic_verification_claims_and_replay(clean_test_au
 def test_icai_gateway_unconfigured_production_fails_closed(clean_test_auditor_env):
     """
     Verifies that in production mode, without an official ICAI trust anchor configured,
-    the gateway verifier fails closed with TRUST_ANCHOR_UNAVAILABLE.
+    the gateway verifier fails closed with TRUST_ANCHOR_UNAVAILABLE or ASYMMETRIC_ALGORITHM_REQUIRED.
     Test keys are strictly rejected in production.
     """
     m_no = clean_test_auditor_env["mem_no"]
@@ -571,7 +571,65 @@ def test_icai_gateway_unconfigured_production_fails_closed(clean_test_auditor_en
         environment="production"
     )
     assert ok is False
-    assert "TRUST_ANCHOR_UNAVAILABLE" in msg or "TEST_KEY_REJECTED_IN_PRODUCTION" in msg
+    assert (
+        "TRUST_ANCHOR_UNAVAILABLE" in msg
+        or "TEST_KEY_REJECTED" in msg
+        or "ASYMMETRIC_ALGORITHM_REQUIRED" in msg
+    )
+
+
+def test_gateway_forged_unknown_kid_rejected(clean_test_auditor_env):
+    """Verifies that a gateway response token referencing an untrusted/unknown kid is rejected."""
+    m_no = clean_test_auditor_env["mem_no"]
+    token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref="ICAI-REF-UNKNOWN-KID",
+        kid="untrusted-forged-kid-999"
+    )
+    ok, msg, data = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        environment="test"
+    )
+    assert ok is False
+    assert "UNKNOWN_KEY_ID" in msg
+
+
+def test_gateway_tampered_signature_rejected(clean_test_auditor_env):
+    """Verifies that tampering with the digital signature of a gateway token fails verification."""
+    m_no = clean_test_auditor_env["mem_no"]
+    token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref="ICAI-REF-TAMPER"
+    )
+    parts = token.split(".")
+    tampered_sig = parts[2][:-4] + ("AAAA" if parts[2][-4:] != "AAAA" else "ZZZZ")
+    tampered_token = f"{parts[0]}.{parts[1]}.{tampered_sig}"
+
+    ok, msg, data = verify_icai_gateway_signed_response(
+        signed_token=tampered_token,
+        expected_membership_no=m_no,
+        environment="test"
+    )
+    assert ok is False
+    assert "CRYPTOGRAPHIC_VERIFICATION_FAILED" in msg
+
+
+def test_gateway_symmetric_hs256_prohibited_in_production(clean_test_auditor_env):
+    """Verifies that symmetric algorithms like HS256 are strictly prohibited in production mode."""
+    m_no = clean_test_auditor_env["mem_no"]
+    token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref="ICAI-REF-PROD-HS256",
+        algorithm="HS256"
+    )
+    ok, msg, data = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        environment="production"
+    )
+    assert ok is False
+    assert "ASYMMETRIC_ALGORITHM_REQUIRED" in msg
 
 
 # ============================================================================
@@ -615,9 +673,9 @@ def test_manual_evidence_review_provenance_success(clean_test_auditor_env):
         environment="test"
     )
 
-    assert auditor["verification_status"] == "INDEPENDENTLY_VERIFIED"
-    assert auditor["is_icai_verified"] is True
-    assert auditor["is_cop_verified"] is True
+    assert auditor["verification_status"] == "MANUAL_DOCUMENT_REVIEWED"
+    assert auditor["is_icai_verified"] is False
+    assert auditor["is_cop_verified"] is False
     assert auditor["evidence_sha256"] == computed_hash
 
     # Verify event logged in statutory_auditor_verification_events
@@ -630,13 +688,14 @@ def test_manual_evidence_review_provenance_success(clean_test_auditor_env):
     assert r_map["evidence_sha256"] == computed_hash
     assert r_map["decision"] == "APPROVED"
     assert r_map["reviewer_id"] == "OFFICER-COMPLIANCE-01"
+    assert r_map["verification_status"] == "MANUAL_DOCUMENT_REVIEWED"
 
-    # Verify credential lookup succeeds
+    # Verify credential lookup succeeds with explicit human-reviewed documentary disclosure
     app_db = SessionLocal()
     try:
         is_valid, msg = validate_auditor_credentials(vid, "CHARTERED_ACCOUNTANT", db=app_db)
         assert is_valid is True
-        assert "MANUAL_EVIDENCE_REVIEW" in msg
+        assert "human-reviewed documentary evidence" in msg
     finally:
         app_db.close()
 
@@ -743,6 +802,118 @@ def test_manual_evidence_review_tampered_document_bytes_rejected(clean_test_audi
         assert False, "Should fail with hash mismatch"
     except ValueError as ex:
         assert "EVIDENCE_INTEGRITY_MISMATCH" in str(ex) or "EVIDENCE_HASH_MISMATCH" in str(ex)
+
+
+def test_manual_review_missing_db_fails_closed(clean_test_auditor_env):
+    """Verifies that verify_manual_evidence_review fails closed when db is None."""
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    reviewer_ctx = {
+        "user_id": "OFFICER-01",
+        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
+        "is_active": True,
+        "session_id": "SESS-01"
+    }
+    ok, msg, data = verify_manual_evidence_review(
+        db=None,
+        auditor_id=vid,
+        membership_no=m_no,
+        cop_status="ACTIVE",
+        cop_valid_until=datetime(2030, 12, 31).date(),
+        document_bytes=b"%PDF-1.4 genuine content",
+        reviewer_context=reviewer_ctx,
+        uploader_id="OTHER-01"
+    )
+    assert ok is False
+    assert "DATABASE_UNAVAILABLE" in msg
+
+
+def test_manual_review_inactive_reviewer_fails_closed(clean_test_auditor_env):
+    """Verifies that an inactive/suspended reviewer is rejected."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    reviewer_ctx = {
+        "user_id": "OFFICER-INACTIVE",
+        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
+        "is_active": False,
+        "session_id": "SESS-INACTIVE"
+    }
+    ok, msg, data = verify_manual_evidence_review(
+        db=admin_db,
+        auditor_id=vid,
+        membership_no=m_no,
+        cop_status="ACTIVE",
+        cop_valid_until=datetime(2030, 12, 31).date(),
+        document_bytes=b"%PDF-1.4 genuine content",
+        reviewer_context=reviewer_ctx,
+        uploader_id="OTHER-01"
+    )
+    assert ok is False
+    assert "INACTIVE_REVIEWER" in msg
+
+
+def test_manual_review_audit_event_persistence_failure_fails_closed(clean_test_auditor_env):
+    """Verifies that if audit event persistence fails, verification fails closed (no swallowed exceptions)."""
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    failing_db = MockFailingSession()
+    reviewer_ctx = {
+        "user_id": "OFFICER-01",
+        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
+        "is_active": True,
+        "session_id": "SESS-01"
+    }
+    ok, msg, data = verify_manual_evidence_review(
+        db=failing_db,
+        auditor_id=vid,
+        membership_no=m_no,
+        cop_status="ACTIVE",
+        cop_valid_until=datetime(2030, 12, 31).date(),
+        document_bytes=b"%PDF-1.4 genuine content",
+        reviewer_context=reviewer_ctx,
+        uploader_id="OTHER-01"
+    )
+    assert ok is False
+    assert "AUDIT_RECORDING_FAILED" in msg
+
+
+def test_manual_review_cannot_self_assert_independently_verified(clean_test_auditor_env):
+    """
+    Verifies that passing verification_status='INDEPENDENTLY_VERIFIED' in manual review
+    does not grant INDEPENDENTLY_VERIFIED status without authentic cryptographic gateway proof.
+    """
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    doc_bytes = b"%PDF-1.4 Mock ICAI Member Card and COP Certificate"
+
+    reviewer_ctx = {
+        "user_id": "OFFICER-COMPLIANCE-02",
+        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
+        "is_active": True,
+        "session_id": f"SESS-{uuid.uuid4().hex[:12]}"
+    }
+
+    auditor = onboard_verified_statutory_auditor(
+        db=admin_db,
+        auditor_id=vid,
+        membership_no=m_no,
+        name="CA No Conflation",
+        role="CHARTERED_ACCOUNTANT",
+        approved_by="OFFICER-COMPLIANCE-02",
+        cop_valid_until=datetime(2030, 12, 31).date(),
+        verification_source="MANUAL_EVIDENCE_REVIEW",
+        verification_status="INDEPENDENTLY_VERIFIED",  # Self-assertion attempt
+        document_bytes=doc_bytes,
+        reviewer_context=reviewer_ctx,
+        uploader_id="OPERATOR-UPLOADER-03",
+        environment="test"
+    )
+
+    # Must NOT be marked INDEPENDENTLY_VERIFIED because final_icai_verified is False
+    assert auditor["verification_status"] != "INDEPENDENTLY_VERIFIED"
+    assert auditor["is_icai_verified"] is False
 
 
 # ============================================================================
