@@ -1524,6 +1524,7 @@ def test_statutory_tariff_effective_date_and_subheadings():
     Validates exact statutory dates and tariff classifications under:
     - Notification No. 19/2025-Integrated Tax (Rate) & Central Tax (Rate)
     - Notification No. 01/2026-Integrated Tax (Rate) & Central Tax (Rate)
+    - Corrigendum G.S.R. 339(E) dated 6 May 2026
     """
     from datetime import date
     from app.modules.reconciliation.itc_engine import validate_hsn_statutory_rate
@@ -1574,43 +1575,106 @@ def test_statutory_tariff_effective_date_and_subheadings():
     assert valid is False
 
     # 3. Manufactured Tobacco (2403, non-biri) & Cigarettes (2402)
-    # Post-01.02.2026: 40% valid, 28% rejected
-    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "240399", post_feb_2026)
+    # Exact 8-digit tariff items (2403 11 10, 2403 19 10, 2403 99 90): Post-01.02.2026: 40% valid, 28% rejected
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "24039990", post_feb_2026)
     assert valid is True
-    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "240399", post_feb_2026)
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "24031910", post_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "24039990", post_feb_2026)
     assert valid is False
+
+    # Incomplete 2403 / 240319 / 240399 fails safe to AMBIGUOUS_TARIFF
+    for amb_2403 in ["2403", "240319", "240399"]:
+        valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), amb_2403, post_feb_2026)
+        assert valid is False
+        assert "AMBIGUOUS_TARIFF" in msg
+
+    # Cigarettes (2402)
     valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "240220", post_feb_2026)
     assert valid is True
     valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "240220", post_feb_2026)
     assert valid is False
 
-    # 4. Beverages (2202 Subheadings under Notification No. 01/2026-IT (Rate))
-    # Aerated / Caffeinated waters (2202 10 10, 2202 99 20):
-    # Pre-01.05.2026: 28% valid, 40% rejected
-    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22021010", pre_may_2026)
+    # 4. Heading 2401 (Unmanufactured tobacco leaves vs refuse)
+    # Leaves (2401 10, 2401 20): strictly 5%
+    valid, _ = validate_hsn_statutory_rate(Decimal("5.00"), "240110", post_feb_2026)
     assert valid is True
-    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "22021010", pre_may_2026)
+    valid, _ = validate_hsn_statutory_rate(Decimal("5.00"), "240120", post_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "240110", post_feb_2026)
+    assert valid is False
+    # Refuse (2401 30 00): 40% post-01.02.2026, 28% pre-Feb 2026
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "24013000", post_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "24013000", pre_feb_2026)
+    assert valid is True
+    # Incomplete 2401 fails safe to AMBIGUOUS_TARIFF
+    valid, msg = validate_hsn_statutory_rate(Decimal("5.00"), "2401", post_feb_2026)
+    assert valid is False
+    assert "AMBIGUOUS_TARIFF" in msg
+
+    # 5. Heading 2404 (Novel tobacco and nicotine products)
+    # Inhalation products (2404 11 00, 2404 19 00): 40% post-01.02.2026, 28% pre-Feb 2026
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "24041100", post_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "24041900", post_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "24041100", pre_feb_2026)
+    assert valid is True
+    # Other nicotine (2404 12 00 e-liquids, 2404 91 00 oral, 2404 92 00 transdermal): strictly 18%
+    valid, _ = validate_hsn_statutory_rate(Decimal("18.00"), "24041200", post_feb_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("18.00"), "24049100", post_feb_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "24041200", post_feb_2026)
+    assert valid is False
+    assert "statutory rate is 18%" in msg
+    # Broad 2404 fails safe to AMBIGUOUS_TARIFF
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "2404", post_feb_2026)
+    assert valid is False
+    assert "AMBIGUOUS_TARIFF" in msg
+
+    # 6. Beverages (2202 Subheadings under Notification No. 01/2026 & Corrigendum G.S.R. 339(E))
+    # Non-alcoholic beer (2202 91 00 per Corrigendum) & Caffeinated drinks (2202 99 91, 2202 99 99):
+    # Pre-01.05.2026: 28% valid, 40% rejected
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22029100", pre_may_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22029991", pre_may_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "22029100", pre_may_2026)
     assert valid is False
     assert "prior to 01.05.2026" in msg and "40% not in force" in msg
 
     # Post-01.05.2026: 40% valid, 28% rejected
-    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "22021010", post_may_2026)
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "22029100", post_may_2026)
     assert valid is True
-    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "22029920", post_may_2026)
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "22029991", post_may_2026)
     assert valid is True
-    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22021010", post_may_2026)
+    valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), "22029999", post_may_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22029100", post_may_2026)
     assert valid is False
 
-    # Fruit juice / milk-based beverages (2202 90, 2202 99 10):
+    # Aerated waters containing added sugar (2202 10 10, 2202 10 20, 2202 10 90, 2202 10):
+    # Statutorily maintained at 28% (40% strictly prohibited)
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22021010", post_may_2026)
+    assert valid is True
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "220210", post_may_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "22021010", post_may_2026)
+    assert valid is False
+    assert "40% is prohibited" in msg
+
+    # Fruit juice / milk-based beverages (2202 90, 2202 99 10, 2202 99 21):
     # Strictly 5% or 12%; 28% and 40% strictly rejected
     valid, _ = validate_hsn_statutory_rate(Decimal("5.00"), "22029910", post_may_2026)
     assert valid is True
-    valid, _ = validate_hsn_statutory_rate(Decimal("12.00"), "22029910", post_may_2026)
+    valid, _ = validate_hsn_statutory_rate(Decimal("12.00"), "22029921", post_may_2026)
     assert valid is True
     valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "22029910", post_may_2026)
     assert valid is False
     assert "statutory rate is 5% or 12%" in msg
-    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22029910", post_may_2026)
+    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22029921", post_may_2026)
     assert valid is False
 
     # Broad heading 2202 without subheading: fails safe to review
@@ -1626,13 +1690,27 @@ def test_statutory_tariff_effective_date_and_subheadings():
 def test_statutory_cryptographic_hmac_and_auditor_registry():
     """
     Validates server-side cryptographic HMAC-SHA256 signature verification
-    and trusted statutory auditor registry lookup for uniform-rate multi-line gating.
+    and trusted statutory auditor registry lookup for uniform-rate multi-line gating:
+    - Fail-closed security (missing key, short key <32 chars).
+    - Identity & credential verification (ICAI format, FRN format, COP status, expiry).
+    - Revoked auditor rejection.
+    - Timestamp freshness window (max 24h) and future clock skew (max 5m).
+    - Cryptographic HMAC-SHA256 tamper detection.
+    - Replay protection (preventing cross-document signature reuse).
     """
+    import os
+    from datetime import datetime, timezone, timedelta
     from app.modules.reconciliation.itc_engine import (
         _is_strictly_verified_uniform_rate,
         generate_auditor_verification_signature,
         TRUSTED_STATUTORY_AUDITOR_REGISTRY,
+        reset_audit_signature_cache_for_testing,
     )
+
+    reset_audit_signature_cache_for_testing()
+
+    test_key = "MYCA_TEST_SUITE_STATUTORY_AUDIT_SECRET_2026_MIN32CHAR"
+    os.environ["STATUTORY_AUDIT_SIGNING_KEY"] = test_key
 
     doc_id = "INV-DOC-AUTH-001"
     doc_number = "INV/2026/001"
@@ -1644,7 +1722,7 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
     verifier_id = "CA-AUDITOR-01"
     verifier_role = "CHARTERED_ACCOUNTANT"
     evidence_ref = "AUDIT-CERT-2026-99"
-    ts = "2026-11-23T11:00:00Z"
+    ts = datetime.now(timezone.utc).isoformat()
 
     valid_sig = generate_auditor_verification_signature(
         doc_id=doc_id,
@@ -1694,7 +1772,6 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
     unreg_doc = dict(base_doc)
     unreg_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
     unreg_doc["rate_verification_metadata"]["verifier_id"] = "CA-FAKE-99"
-    # Even if they sign with the key, unregistered ID is rejected
     unreg_sig = generate_auditor_verification_signature(
         doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
         total_tax=total_tax, header_rate=header_rate, verifier_id="CA-FAKE-99",
@@ -1703,20 +1780,26 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
     unreg_doc["rate_verification_metadata"]["authorization_token"] = unreg_sig
     assert _is_strictly_verified_uniform_rate(unreg_doc) is False
 
-    # 5. Role mismatch (auditor is CHARTERED_ACCOUNTANT but claims STATUTORY_AUDITOR) -> Rejected
+    # 5. Revoked auditor ID (in REVOKED_STATUTORY_AUDITOR_IDS) -> Rejected
+    revoked_doc = dict(base_doc)
+    revoked_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+    revoked_doc["rate_verification_metadata"]["verifier_id"] = "CA-REVOKED-99"
+    assert _is_strictly_verified_uniform_rate(revoked_doc) is False
+
+    # 6. Role mismatch (auditor is CHARTERED_ACCOUNTANT but claims STATUTORY_AUDITOR) -> Rejected
     role_mismatch_doc = dict(base_doc)
     role_mismatch_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
     role_mismatch_doc["rate_verification_metadata"]["verifier_role"] = "STATUTORY_AUDITOR"
     assert _is_strictly_verified_uniform_rate(role_mismatch_doc) is False
 
-    # 6. Raw client boolean True alone without metadata -> Rejected
+    # 7. Raw client boolean True alone without metadata -> Rejected
     raw_bool_doc = {
         "id": doc_id,
         "is_uniform_rate_verified": True,
     }
     assert _is_strictly_verified_uniform_rate(raw_bool_doc) is False
 
-    # 7. String values ("false", "true", "0", "1") -> Rejected
+    # 8. String values ("false", "true", "0", "1") -> Rejected
     for str_val in ["false", "true", "0", "1", "yes"]:
         str_trap_doc = {
             "id": doc_id,
@@ -1724,6 +1807,50 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
             "rate_verification_metadata": base_doc["rate_verification_metadata"],
         }
         assert _is_strictly_verified_uniform_rate(str_trap_doc) is False
+
+    # 9. Fail-Closed Security: Missing signing secret in environment -> Rejected
+    del os.environ["STATUTORY_AUDIT_SIGNING_KEY"]
+    assert _is_strictly_verified_uniform_rate(base_doc) is False
+
+    # 10. Fail-Closed Security: Secret shorter than 32 characters -> Rejected
+    os.environ["STATUTORY_AUDIT_SIGNING_KEY"] = "short_insecure_secret_12345"
+    assert _is_strictly_verified_uniform_rate(base_doc) is False
+
+    # Restore valid test key
+    os.environ["STATUTORY_AUDIT_SIGNING_KEY"] = test_key
+
+    # 11. Expired Timestamp (> 24 hours old) -> Rejected
+    expired_ts = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    exp_sig = generate_auditor_verification_signature(
+        doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
+        total_tax=total_tax, header_rate=header_rate, verifier_id=verifier_id,
+        verifier_role=verifier_role, evidence_ref=evidence_ref, timestamp=expired_ts
+    )
+    expired_doc = dict(base_doc)
+    expired_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+    expired_doc["rate_verification_metadata"]["verification_timestamp"] = expired_ts
+    expired_doc["rate_verification_metadata"]["authorization_token"] = exp_sig
+    assert _is_strictly_verified_uniform_rate(expired_doc) is False
+
+    # 12. Future Timestamp (> 5 minutes clock skew) -> Rejected
+    future_ts = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    fut_sig = generate_auditor_verification_signature(
+        doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
+        total_tax=total_tax, header_rate=header_rate, verifier_id=verifier_id,
+        verifier_role=verifier_role, evidence_ref=evidence_ref, timestamp=future_ts
+    )
+    future_doc = dict(base_doc)
+    future_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+    future_doc["rate_verification_metadata"]["verification_timestamp"] = future_ts
+    future_doc["rate_verification_metadata"]["authorization_token"] = fut_sig
+    assert _is_strictly_verified_uniform_rate(future_doc) is False
+
+    # 13. Replay Protection: Token issued for doc1 replayed on doc2 -> Rejected
+    doc2_doc = dict(base_doc)
+    doc2_doc["id"] = "INV-DOC-AUTH-002"
+    doc2_doc["document_number"] = "INV/2026/002"
+    # Even if total tax and value match, token was already bound to doc1
+    assert _is_strictly_verified_uniform_rate(doc2_doc) is False
 
 
 # ============================================================================
@@ -1879,6 +2006,114 @@ def test_statutory_zero_trust_missing_or_unknown_hsn():
     food_eval = next(e for e in evals if e.rule_code == "SEC_17_5_FOOD")
     assert food_eval.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
     assert food_eval.risk_reversal_amount == Decimal("0.00")
+
+    # 4. Multi-line invoice with explicit line taxes where one line has missing HSN
+    p_doc_explicit_missing_hsn = {
+        "id": "p_multi_expl_missing_hsn",
+        "document_number": "INV-EXPL-MISSING-HSN",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("1800.00"),
+        "sgst_amount": Decimal("1800.00"),
+        "total_invoice_value": Decimal("23600.00"),
+        "line_items": [
+            {
+                "item_description": "Factory vehicle maintenance",
+                "hsn_sac_code": "998729",
+                "tax_amount": Decimal("1800.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True,
+                },
+            },
+            {
+                "item_description": "Office party catering",
+                "hsn_sac_code": "",  # MISSING HSN!
+                "tax_amount": Decimal("1800.00"),
+            },
+        ],
+    }
+    g_doc_expl = {
+        "id": "g_multi_expl",
+        "section_name": "B2B",
+        "itc_availability": "available",
+        "central_tax": Decimal("1800.00"),
+        "state_ut_tax": Decimal("1800.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "document_number": "INV-EXPL-MISSING-HSN",
+        "document_date": "2026-11-01",
+    }
+    evals_expl = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_explicit_missing_hsn,
+        gstr2b_doc=g_doc_expl,
+        evaluation_date=today,
+    )
+    food_eval_expl = next(e for e in evals_expl if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_expl.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_expl.risk_reversal_amount == Decimal("0.00")
+
+    # 5. Single-line invoice with missing HSN -> routes to STATUTORY_CLASSIFICATION_REVIEW
+    p_doc_single_missing = {
+        "id": "p_single_missing",
+        "document_number": "INV-SINGLE-MISSING",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("900.00"),
+        "sgst_amount": Decimal("900.00"),
+        "total_invoice_value": Decimal("11800.00"),
+        "hsn_sac_code": "",
+        "item_description": "General Consulting Services",
+        "goods_receipt_date": "2026-11-02",
+        "goods_receipt_note_ref": "GRN-SINGLE-01",
+    }
+    g_doc_single = {
+        "id": "g_single_valid",
+        "section_name": "B2B",
+        "itc_availability": "available",
+        "central_tax": Decimal("900.00"),
+        "state_ut_tax": Decimal("900.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "document_number": "INV-SINGLE-MISSING",
+        "document_date": "2026-11-01",
+    }
+    evals_single_missing = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_single_missing,
+        gstr2b_doc=g_doc_single,
+        evaluation_date=today,
+    )
+    class_eval_missing = next(e for e in evals_single_missing if e.rule_code == "STATUTORY_CLASSIFICATION_REVIEW")
+    assert class_eval_missing.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert class_eval_missing.risk_reversal_amount == Decimal("0.00")
+
+    # 6. Single-line invoice with unknown / uncatalogued HSN -> routes to STATUTORY_CLASSIFICATION_REVIEW
+    p_doc_single_unknown = dict(p_doc_single_missing)
+    p_doc_single_unknown["id"] = "p_single_unknown"
+    p_doc_single_unknown["hsn_sac_code"] = "999999"
+    evals_single_unknown = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_single_unknown,
+        gstr2b_doc=g_doc_single,
+        evaluation_date=today,
+    )
+    class_eval_unknown = next(e for e in evals_single_unknown if e.rule_code == "STATUTORY_CLASSIFICATION_REVIEW")
+    assert class_eval_unknown.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert class_eval_unknown.risk_reversal_amount == Decimal("0.00")
+
+    # 7. Single-line invoice with valid catalogued HSN and valid rate -> routes to SEC_16_COMPLETE
+    p_doc_single_valid = dict(p_doc_single_missing)
+    p_doc_single_valid["id"] = "p_single_valid"
+    p_doc_single_valid["hsn_sac_code"] = "998311"
+    p_doc_single_valid["gst_rate"] = Decimal("18.00")
+    p_doc_single_valid["item_description"] = "General Technical Consulting"
+    evals_single_valid = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_single_valid,
+        gstr2b_doc=g_doc_single,
+        evaluation_date=today,
+    )
+    complete_eval = next(e for e in evals_single_valid if e.rule_code == "SEC_16_COMPLETE")
+    assert complete_eval.eligibility_status == ITCEligibilityEnum.ELIGIBLE_EVIDENCE_COMPLETE
+    assert complete_eval.risk_reversal_amount == Decimal("0.00")
 
 
 

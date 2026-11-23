@@ -22,15 +22,53 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: myca
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: backend
+    env:
+      DATABASE_URL: postgresql://app_service_user:secret@localhost:5432/myca
+      DATABASE_WORKER_URL: postgresql://worker_service_user:secret@localhost:5432/myca
+      DB_ADMIN_URL: postgresql://postgres:postgrespassword@localhost:5432/myca
+      STATUTORY_AUDIT_SIGNING_KEY: "MYCA_PROD_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.4_SECURE_2026_MIN32CHAR"
+      SECRET_KEY: "myca_jwt_test_secret_key_minimum_32_characters_long_for_security"
+      ENVIRONMENT: development
+      PYTHONPATH: .
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - run: pip install -r requirements.txt
-      - run: python -m compileall -q app
-      - run: python -c "from app.main import app; print(len(app.routes))"
-      - run: python -m pytest --collect-only -q
+          python-version: "3.12"
+      - name: Install PostgreSQL Client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+      - name: Install Python Dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python Application
+        run: python -m compileall -q app
+      - name: Verify Routes
+        run: python -c "from app.main import app; print(len(app.routes))"
+      - name: Apply Migrations & Provision Role Passwords
+        run: |
+          alembic upgrade head
+          PGPASSWORD=postgrespassword psql -h localhost -U postgres -d myca -c "ALTER ROLE app_service_user WITH PASSWORD 'secret'; ALTER ROLE worker_service_user WITH PASSWORD 'secret';"
+      - name: Execute Full Pytest Suite
+        run: python -m pytest tests/ -v --tb=short
+      - name: Verify Migration Rollback & Baseline Provenance
+        run: python scripts/verify_migration_rollback_state.py
+      - name: Execute Comprehensive RLS Security Audit
+        run: python scripts/audit_rls_security_comprehensive.py

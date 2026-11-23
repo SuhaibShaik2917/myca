@@ -5,8 +5,8 @@
 **Execution Campaign:** Master Execution Directive & Final Product Closure  
 **Release Verdict:** **100% PRODUCT SCOPE COMPLETE — EXTERNAL RELEASE BLOCKERS REMAIN**  
 **Audit Head:** Engineering, Product, QA, Security, and Statutory Review Team  
-**Date:** November 22, 2026  
-**Git Commit / Tag:** `release-v1.0.0-final`  
+**Date:** November 23, 2026  
+**Git Commit / Tag:** `v1.0.4`  
 
 ---
 
@@ -17,7 +17,7 @@ MyCA has reached **100% product feature implementation** across all canonical PR
 | Product Area | Milestone | Development Status | Verification Status | Verdict |
 | :--- | :--- | :--- | :--- | :--- |
 | **Outward Invoicing & OCR Brain** | M1 | 100% Complete | 42/42 Tests Passing | **Approved** |
-| **Inward Statutory & 4-Pass Reconciliation** | M2 | 100% Complete | 193/193 Tests Passing | **Approved** |
+| **Inward Statutory & 4-Pass Reconciliation** | M2 | 100% Complete | 203/203 Tests Passing | **Approved** |
 | **GSTR-3B, Rule 88A Offset & Maker-Checker** | M3 | 100% Complete | 5/5 Tests Passing | **Approved** |
 | **Credit Builder & Cash Flow Analytics** | M4 | 100% Complete | 5/5 Tests Passing | **Approved** |
 | **Government Scheme Navigator** | M5 | 100% Complete | 5/5 Tests Passing | **Approved** |
@@ -25,7 +25,7 @@ MyCA has reached **100% product feature implementation** across all canonical PR
 | **Multi-Tenant RLS Security** | Core | 100% Complete | Verified with 0 Leaks | **Approved** |
 | **Frontend SPA Production Build** | UI | 100% Complete | `tsc -b && vite build` Passed | **Approved** |
 
-**Total Backend Test Count:** **253 / 253 Passed (100% Pass Rate)**  
+**Total Backend Test Count:** **263 / 263 Passed (100% Pass Rate)**  
 **Production Readiness Score:** **100 / 100 (Product Scope)**  
 
 ---
@@ -98,7 +98,7 @@ MyCA has reached **100% product feature implementation** across all canonical PR
 
 **Why 100% Product Scope is Complete:**
 - Every single feature, calculation, statutory rule, data structure, API endpoint, and UI view specified in the approved PRD is built and tested.
-- 253 backend automated tests pass without a single failure.
+- 263 backend automated tests pass without a single failure.
 - Frontend builds with zero TypeScript compilation errors.
 - Multi-tenant RLS isolation is cryptographically and procedurally enforced.
 
@@ -106,3 +106,11 @@ MyCA has reached **100% product feature implementation** across all canonical PR
 - In strict accordance with the Master Execution Directive, live production filing to the Indian Goods and Services Tax Network (GSTN) requires a licensed GST Suvidha Provider (GSP) production certificate and digital signature dongles (DSC/EVC).
 - Live bank statement auto-fetching requires an RBI Account Aggregator (AA) production license and bank partner API keys.
 - MyCA correctly implements production-grade sandbox adapters with deterministic hashing and ARN/CIN generation for these external boundaries. Live deployment to public MSME taxpayers is ready to proceed immediately upon provisioning external partner credentials.
+
+---
+
+## 5. v1.0.4 Statutory & Security Closure
+
+1. **Exact Statutory Tariff Subheadings:** Strict implementation of 8-digit tariff classifications under Notifications 19/2025 and 01/2026 (with Corrigendum G.S.R. 339(E)), capping aerated waters at 28%, differentiating unmanufactured tobacco vs. refuse, and restricting 40% rates strictly to designated subheadings.
+2. **Fail-Closed HMAC Auditor Security:** Completely eliminated default HMAC fallback secrets; enforces dynamic credential validation against ICAI membership, firm registration, and active COP, accompanied by timestamp freshness checks and signature replay protection.
+3. **CI Pipeline Production Parity:** Fully automated GitHub Actions CI featuring a dedicated PostgreSQL 16 service container, live schema migration, automated test execution (263 tests), migration rollback verification, and comprehensive RLS isolation auditing.

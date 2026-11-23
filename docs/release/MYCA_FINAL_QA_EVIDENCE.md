@@ -3,7 +3,7 @@
 **Audit Date:** November 23, 2026  
 **Environment:** Linux (WSL Ubuntu 24.04 / Python 3.12.3 / PostgreSQL 16.11 / Node.js v24.14)  
 **Branch:** `remediation/audit-findings-phase3` (Merging to `master`)  
-**Git Checkpoints:** Baseline `9f97516`, Audit Phase 1 `d421f0e`, Phase 2 Baseline `9961014`, v1.0.0 `56dc543`, v1.0.1 `eaa451a`, v1.0.2 `abbc575`, Release Checkpoint v1.0.3  
+**Git Checkpoints:** Baseline `9f97516`, Audit Phase 1 `d421f0e`, Phase 2 Baseline `9961014`, v1.0.0 `56dc543`, v1.0.1 `eaa451a`, v1.0.2 `abbc575`, v1.0.3 `49b33ae`, Release Checkpoint `v1.0.4`  
 
 ---
 
@@ -108,17 +108,29 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
    - In GSTR-3B Table 4(B)(1), permanent reversals are ₹0.00; Net ITC in 4(C) retains the full amount until CA confirms block.
 6. `test_multi_line_invoice_exception_and_blocked_catering`:
    - Evaluates multi-line invoices across 15 comprehensive statutory scenarios including explicit tax allocations, proportional calculations, dynamic tolerance gating, and rate representations.
-7. `test_statutory_tariff_effective_date_and_subheadings` (v1.0.3):
-   - Notification No. 19/2025-IT (Rate): Pan Masala `2106 90 20` 28% pre-Feb 2026 / 40% post-Feb 2026 (rejecting 40% pre-01.02.2026 and 28% post-01.02.2026); Biris `2403 19 21` / `2403 19 29` moved to 18% schedule from 1 Feb 2026 (rejecting 28% and 40%); manufactured tobacco `2403` and cigarettes `2402` 28% pre-Feb 2026 / 40% post-Feb 2026.
-   - Notification No. 01/2026-IT (Rate): Aerated / caffeinated waters `2202 10` / `2202 99 20` 28% pre-May 2026 / 40% post-May 2026; fruit juice / milk drinks `2202 90` / `2202 99 10` strictly 5% or 12% (28%/40% prohibited); generic heading `2202` without subheading fails safe to CA review (`AMBIGUOUS_TARIFF`).
-8. `test_statutory_cryptographic_hmac_and_auditor_registry` (v1.0.3):
-   - Authenticates server-side HMAC-SHA256 signature verification over canonical document state against active `TRUSTED_STATUTORY_AUDITOR_REGISTRY`.
-   - Proves rejection of fabricated tokens (`"TOKEN-AUTH-SIG-998877"`), unregistered auditor IDs (`"CA-FAKE-99"`), role mismatches, and tampered document states.
-9. `test_statutory_decimal_precision_and_component_rates` (v1.0.3):
+7. `test_statutory_tariff_effective_date_and_subheadings` (v1.0.4):
+   - Notification No. 19/2025-IT (Rate):
+     - Pan Masala `2106 90 20`: 28% pre-Feb 2026 / 40% post-Feb 2026.
+     - Heading 2404: Strictly subheadings `2404 11 00` and `2404 19 00` move to 40% post-01.02.2026 (28% pre-Feb 2026); `2404 12 00` (e-liquids) and `2404 91 00`, `2404 92 00`, `2404 99 00` (oral/transdermal) are strictly 18% (40% rejected); broad `2404` fails safe to `AMBIGUOUS_TARIFF`.
+     - Heading 2401: Unmanufactured tobacco leaves `2401 10` and `2401 20` strictly 5% (Schedule I); tobacco refuse `2401 30 00` 40% post-01.02.2026 (28% pre-Feb 2026); incomplete `2401` fails safe to `AMBIGUOUS_TARIFF`.
+     - Heading 2403: Biris `2403 19 21` / `2403 19 29` moved to 18% schedule from 1 Feb 2026 (rejecting 28% and 40%); exact 8-digit manufactured tobacco (`2403 11 10`, `2403 19 10`, `2403 19 90`, `2403 91 00`, `2403 99 10`, `2403 99 20`, `2403 99 30`, `2403 99 90`) moves to 40% post-01.02.2026; broad `2403` or 6-digit `240319`/`240399` fails safe to `AMBIGUOUS_TARIFF`.
+     - Heading 2402: Cigarettes and cigars 28% pre-Feb 2026 / 40% post-Feb 2026.
+   - Notification No. 01/2026-IT (Rate) & Corrigendum G.S.R. 339(E):
+     - Non-alcoholic beer `2202 91 00` (Corrigendum G.S.R. 339(E) dated 6 May 2026) and caffeinated drinks `2202 99 91` / `2202 99 99` move to 40% post-01.05.2026 (28% pre-May 2026).
+     - Aerated waters containing added sugar (`2202 10 10`, `2202 10 20`, `2202 10 90`, `2202 10`) statutorily capped at 28% (40% prohibited).
+     - Fruit juice and milk drinks `2202 90` / `2202 99 10` / `2202 99 21` strictly 5% or 12%.
+     - Generic heading `2202` without subheading fails safe to CA review (`AMBIGUOUS_TARIFF`).
+8. `test_statutory_cryptographic_hmac_and_auditor_registry` (v1.0.4):
+   - Fail-closed secret key resolution: raises `KeyResolverError` immediately when `STATUTORY_AUDIT_SIGNING_KEY` is missing, empty, or shorter than 32 characters.
+   - Auditor credentials validation: validates ICAI membership (`^ICAI-[MF]-\d{6}$`), firm registration (`^\d{6}[A-Z]$`), Certificate of Practice (`cop_status == "ACTIVE"`), validity period, and blacklists revoked auditors (`REVOKED_STATUTORY_AUDITOR_IDS`).
+   - Timestamp freshness: strictly validates ISO 8601 UTC timestamp within 24-hour freshness window and 5-minute future clock skew.
+   - Replay attack defense: in-memory replay cache tracking `(doc_id, doc_number)` prevents cross-document token reuse.
+   - Server-side HMAC-SHA256 verification over canonical document state with constant-time `hmac.compare_digest`.
+9. `test_statutory_decimal_precision_and_component_rates` (v1.0.4):
    - Rejection of excess decimal precision beyond statutory 2 decimal places (`18.004`, `0.254`, `5.001`, `0.18004`), prohibiting silent rounding.
-   - Component rate aggregation: `cgst_rate: 9% + sgst_rate: 9% = 18%`; `igst_rate: 5%` direct; standalone ambiguous component rates (14% or 20% in `gst_rate`) rejected.
-10. `test_statutory_zero_trust_missing_or_unknown_hsn` (v1.0.3):
-    - Missing HSN (`""` or `None`) and unknown HSN (`"999999"`) fail safe to CA review with ₹0.00 reversal.
+   - Component rate aggregation: `cgst_rate: 9% + sgst_rate: 9% = 18%`; `igst_rate: 5%` direct; standalone ambiguous component rates (14% or 20% in `gst_rate`) rejected; `1.50%` prohibited as total statutory rate.
+10. `test_statutory_zero_trust_missing_or_unknown_hsn` (v1.0.4):
+    - Missing HSN (`""` or `None`) and unknown HSN (`"999999"`) fail safe to CA review (`REVIEW_REQUIRED`) with ₹0.00 reversal across single-line, explicit-line, and multi-line proportional invoices.
     - End-to-end multi-line invoice evaluation with missing HSN line routes to `REVIEW_REQUIRED` with ₹0.00 reversal.
 
 ---
@@ -191,3 +203,23 @@ dist/assets/index-DBkuh5Fw.js   420.23 kB │ gzip: 107.43 kB
 ```
 - TypeScript: 0 errors
 - Vite: 1,583 modules transformed in 2.41s
+
+---
+
+## 5. CONTINUOUS INTEGRATION (CI) AUTOMATION (v1.0.4)
+
+File: `.github/workflows/ci.yml`
+- **PostgreSQL 16 Service Container:** Provisions official `postgres:16` container with health checks (`pg_isready`), dedicated application database `myca`, and administrative password credentials.
+- **Environment & Key Configuration:**
+  - `STATUTORY_AUDIT_SIGNING_KEY` injected via environment with 64-character entropy, satisfying fail-closed key resolution requirements.
+  - Runtime and administrative database URLs configured for non-superuser `app_service_user`.
+- **Database Provisioning & Alembic Migrations:**
+  - Executes `alembic upgrade head` to apply all migrations up to `0021_enforce_tenant_force_rls`.
+  - Configures dedicated `app_service_user` with restricted grants and verified passwords.
+- **Full Test Suite & Audit Script Execution:**
+  - Replaced legacy `--collect-only` with live test execution:
+    ```bash
+    python -m pytest tests/ -v --tb=short
+    ```
+  - Executes `verify_migration_rollback_state.py` to cryptographically verify schema rollback invariants.
+  - Executes `audit_rls_security_comprehensive.py` to audit table-level RLS, forced RLS, and 11-domain cross-tenant mutation blocks.

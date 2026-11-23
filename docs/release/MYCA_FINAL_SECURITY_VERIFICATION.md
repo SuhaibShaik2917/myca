@@ -3,7 +3,8 @@
 **Audit Date:** November 23, 2026  
 **Auditor:** Principal Application Security Engineer  
 **Audit Branch:** `remediation/audit-findings-phase3` (Merging to `master`)  
-**Scope:** PostgreSQL 16 Row Level Security (RLS), Least-Privilege Role Grants, Token Spoofing Defense, 11-Domain Cross-Tenant Write Isolation, Migration Rollback Baseline Exact Match with Cryptographic Authentication.
+**Release Checkpoint:** `v1.0.4`  
+**Scope:** PostgreSQL 16 Row Level Security (RLS), Least-Privilege Role Grants, Token Spoofing Defense, 11-Domain Cross-Tenant Write Isolation, Migration Rollback Baseline Exact Match with Cryptographic Authentication, Fail-Closed Server-Side HMAC Auditor Authentication, and Replay Protection.
 
 ---
 
@@ -165,18 +166,38 @@ Migration downgrade safety and baseline restoration verified via `backend/script
 
 ---
 
-## 6. SERVER-SIDE CRYPTOGRAPHIC AUDITOR AUTHENTICATION (v1.0.3)
+## 6. SERVER-SIDE CRYPTOGRAPHIC AUDITOR AUTHENTICATION & REPLAY PROTECTION (v1.0.4)
 
 Implemented in `backend/app/modules/reconciliation/itc_engine.py`:
-- **Cryptographic Signature Engine:** Server-side HMAC-SHA256 signature generation and verification over canonical invoice and certification state:
-  ```text
-  canonical_msg = f"{doc_id}:{doc_number}:{total_invoice_value}:{total_tax}:{header_rate}:{verifier_id}:{verifier_role}:{evidence_ref}:{timestamp}"
-  ```
-- **Signing Secret Key:** Authenticated via server-side `STATUTORY_AUDIT_SIGNING_KEY` (injected via secure production environment configuration).
-- **Identity & Role Registry Lookup:** Cross-referenced against authoritative `TRUSTED_STATUTORY_AUDITOR_REGISTRY` verifying:
-  - Auditor ID exists and is strictly `ACTIVE`.
-  - Authorized role matches claimed role in `AUTHORIZED_VERIFIER_ROLES` (`CHARTERED_ACCOUNTANT`, `TAX_AUDITOR`, `STATUTORY_AUDITOR`).
-  - Active ICAI membership and firm registration number validations.
-- **Constant-Time Verification:** Employs `hmac.compare_digest` to prevent side-channel timing attacks. Arbitrary client strings (e.g. `"TOKEN-AUTH-SIG-998877"`), unregistered IDs (`"CA-FAKE-99"`), tampered totals, or expired certifications fail safe to CA review (`REVIEW_REQUIRED`).
-- **Elimination of Boolean Traps:** Python string values (`"true"`, `"false"`, `"0"`, `"1"`, `"yes"`) and raw unauthenticated booleans are strictly rejected.
+- **Fail-Closed Key Resolver:**
+  - Removed all hardcoded fallback secrets.
+  - `get_statutory_audit_signing_key()` strictly inspects `os.environ.get("STATUTORY_AUDIT_SIGNING_KEY")`.
+  - If the environment variable is missing, empty, or strictly shorter than 32 characters, it raises `KeyResolverError` immediately, failing closed and routing to `REVIEW_REQUIRED` (₹0.00 reversal).
+- **Statutory Auditor Credentials & Verification:**
+  - Validated via `validate_auditor_credentials()` against statutory standards:
+    - ICAI membership format: `^ICAI-[MF]-\d{6}$`
+    - Firm registration format: `^\d{6}[A-Z]$`
+    - Certificate of Practice: `cop_status == "ACTIVE"`
+    - Active validity window: `valid_until >= datetime.now(timezone.utc).date()`
+    - Explicit revocation blacklist: check against `REVOKED_STATUTORY_AUDITOR_IDS`
+  - Cross-referenced against authoritative `TRUSTED_STATUTORY_AUDITOR_REGISTRY`.
+- **Timestamp Freshness & Clock Skew Defense:**
+  - Validated via `validate_certification_timestamp()`:
+    - Strict ISO 8601 UTC format validation (`YYYY-MM-DDTHH:MM:SSZ` or with offset).
+    - Maximum certification age: 24 hours (86,400 seconds).
+    - Maximum clock skew into the future: 5 minutes (300 seconds).
+- **Cross-Document Replay Defense:**
+  - Implemented via `check_and_record_signature_replay()`:
+    - Maintains in-memory cache binding each verification token to its canonical `(doc_id, doc_number)`.
+    - Attempts to replay an existing valid signature token against a different document or invoice are instantly rejected.
+- **Cryptographic Signature Engine & Constant-Time Verification:**
+  - Server-side HMAC-SHA256 signature generation and verification over canonical invoice and certification state:
+    ```text
+    canonical_msg = f"{doc_id}:{doc_number}:{total_invoice_value}:{total_tax}:{header_rate}:{verifier_id}:{verifier_role}:{evidence_ref}:{timestamp}"
+    ```
+  - Employs `hmac.compare_digest` to prevent side-channel timing attacks.
+  - Arbitrary client strings (e.g. `"TOKEN-AUTH-SIG-998877"`), unregistered IDs (`"CA-FAKE-99"`), tampered totals, revoked auditors, or expired timestamps fail safe to CA review (`REVIEW_REQUIRED`, ₹0.00 reversal).
+- **Elimination of Boolean Traps & Rate Inflation:**
+  - Python string values (`"true"`, `"false"`, `"0"`, `"1"`, `"yes"`) and raw unauthenticated booleans are strictly rejected.
+  - Total statutory rate whitelist enforced (0%, 0.10%, 0.25%, 3%, 5%, 12%, 18%, 28%, 40%), rejecting fractional 1.50% component rates from standalone total rates.
 
