@@ -1922,27 +1922,46 @@ def test_statutory_cryptographic_hmac_and_auditor_registry(isolated_verified_aud
         doc2_doc["id"] = doc2_id
         doc2_doc["document_number"] = doc2_num
         assert _is_strictly_verified_uniform_rate(doc2_doc) is False
+        token_exp_test = datetime.now(timezone.utc) + timedelta(hours=24)
         replay_ok, replay_msg = check_and_record_signature_replay(
-            token=valid_sig, doc_id=doc2_id, doc_number=doc2_num, db=app_db
+            token=valid_sig, doc_id=doc2_id, doc_number=doc2_num, db=app_db,
+            expires_at=token_exp_test
         )
         assert replay_ok is False
         assert "cross-document replay rejected" in replay_msg
 
         # Duplicate consumption on same document rejection:
         dup_ok, dup_msg = check_and_record_signature_replay(
-            token=valid_sig, doc_id=doc_id, doc_number=doc_number, db=app_db
+            token=valid_sig, doc_id=doc_id, doc_number=doc_number, db=app_db,
+            expires_at=token_exp_test
         )
         assert dup_ok is False
         assert "already been consumed" in dup_msg
 
         # Fail-closed behavior on database unavailability (no in-memory fallback):
         db_fail_ok, db_fail_msg = check_and_record_signature_replay(
-            token=valid_sig, doc_id="ANY_DOC", doc_number="ANY_NUM", db=None
+            token=valid_sig, doc_id="ANY_DOC", doc_number="ANY_NUM", db=None,
+            expires_at=token_exp_test
         )
         # Without an active db session or if session fails, must fail closed
-        assert isinstance(db_fail_ok, bool)
+        assert db_fail_ok is False
 
         # 14. Database-Backed Auditor Onboarding, Credential Validation & Revocation
+        from app.modules.reconciliation.icai_gateway_verifier import (
+            register_test_gateway_key,
+            create_test_signed_gateway_response,
+        )
+        test_sec = "test-secret-key-32chars-long-strictly!!"
+        register_test_gateway_key("test-key-17-5", test_sec)
+        gw_token_654321 = create_test_signed_gateway_response(
+            membership_no="654321",
+            firm_registration_no="654321N",
+            cop_status="ACTIVE",
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            evidence_ref="ICAI-GATEWAY-TRACE-TEST-654321",
+            kid="test-key-17-5",
+            secret_or_key=test_sec
+        )
         new_auditor = onboard_verified_statutory_auditor(
             db=admin_db,
             auditor_id="CA-TEST-654321",
@@ -1958,6 +1977,7 @@ def test_statutory_cryptographic_hmac_and_auditor_registry(isolated_verified_aud
             verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
             verified_at=datetime.now(timezone.utc),
             verification_evidence_ref="ICAI-GATEWAY-TRACE-TEST-654321",
+            gateway_signed_response=gw_token_654321,
             environment="test"
         )
         assert new_auditor["membership_no"] == "654321"
@@ -1982,6 +2002,15 @@ def test_statutory_cryptographic_hmac_and_auditor_registry(isolated_verified_aud
         assert "REVOKED_AUDITOR" in msg
 
         # Expired COP validation:
+        gw_token_654322 = create_test_signed_gateway_response(
+            membership_no="654322",
+            firm_registration_no=None,
+            cop_status="ACTIVE",
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            evidence_ref="ICAI-GATEWAY-TRACE-EXPIRED-654322",
+            kid="test-key-17-5",
+            secret_or_key=test_sec
+        )
         onboard_verified_statutory_auditor(
             db=admin_db,
             auditor_id="CA-TEST-EXPIRED-COP",
@@ -1996,6 +2025,7 @@ def test_statutory_cryptographic_hmac_and_auditor_registry(isolated_verified_aud
             verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
             verified_at=datetime.now(timezone.utc),
             verification_evidence_ref="ICAI-GATEWAY-TRACE-EXPIRED-654322",
+            gateway_signed_response=gw_token_654322,
             environment="test"
         )
         # Update cop_valid_until to past to test lifecycle expiration rejection

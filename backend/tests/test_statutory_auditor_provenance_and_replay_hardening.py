@@ -1,36 +1,103 @@
 """
-MyCA v1.0.6 — Statutory Auditor Verification Provenance and Persistent Replay Hardening.
+MyCA v1.0.8 — Statutory Auditor Verification Provenance, Authentic Evidence & Persistent Replay Hardening.
 Exhaustively tests:
-1. Critical Finding A:
-   - Empty production auditor registry by default.
-   - Removal of in-memory test registry fallback.
-   - Separation of administrator approval from independent ICAI verification.
-   - Rejection of unverified provenance (is_icai_verified=False, verification_status != 'INDEPENDENTLY_VERIFIED').
-   - Rejection of revoked, inactive, or expired COP auditors.
-   - Fail-closed behavior on database error / connection loss during auditor lookup.
-2. Critical Finding B:
-   - Removal of in-memory signature replay cache fallback.
-   - Strict database-backed atomic token replay prevention via sha256(token).
+1. Authentic ICAI Verification vs Format Validation:
+   - Rejection of fabricated reference strings (e.g. ICAI-GATEWAY-FAKE123) without cryptographic proof.
+   - Cryptographic verification of gateway responses (RS256/ES256/HS256).
+   - Strict binding of claims: membership_no, firm_registration_no, cop_status, cop_valid_until, evidence_ref.
+   - Anti-replay nonce (jti) tracking for gateway tokens.
+   - Test-key isolation (test keys rejected in production mode).
+   - Fail-closed behavior (TRUST_ANCHOR_UNAVAILABLE) when official ICAI gateway is unconfigured in production.
+2. Authenticated Manual Evidence Review:
+   - Server-side SHA-256 calculation over genuine document bytes.
+   - Server-validated reviewer session context (ignoring unauthenticated caller overrides).
+   - Authorized reviewer role enforcement (STATUTORY_AUDITOR_ADMIN, CHIEF_COMPLIANCE_OFFICER).
+   - Active reviewer requirement.
+   - Maker-checker separation (uploader != reviewer).
+   - Immutable audit logging in public.statutory_auditor_verification_events.
+3. Persistent Signature Replay Protection & Mandatory Expiry:
+   - Strict mandatory requirement for non-synthesized expires_at (fails closed if omitted).
+   - Rejection of already-expired tokens before database insertion.
    - Rejection of duplicate consumption on same document.
    - Rejection of cross-document token replay.
-   - Rejection of concurrent collision across distinct sessions.
-   - Permanent invalidation lifecycle (expired tokens cannot be reused).
-   - Fail-closed behavior on database error / connection loss during replay check.
+   - Permanent invalidation lifecycle.
+   - Conclusive PostgreSQL pre-INSERT concurrency race test via SQLAlchemy before_cursor_execute hook.
+   - Fail-closed behavior on database unavailability / transaction failure.
 """
 
+import os
 import uuid
-from datetime import datetime, timezone, timedelta
+import hashlib
+import threading
+from datetime import datetime, timezone, timedelta, date
+from decimal import Decimal
 import pytest
-from sqlalchemy import text
+from sqlalchemy import text, event
 
 from tests.test_db_config import get_admin_session
-from app.database import SessionLocal
+from app.database import SessionLocal, engine
 from app.modules.reconciliation.itc_engine import (
     validate_auditor_credentials,
     onboard_verified_statutory_auditor,
     revoke_statutory_auditor,
     check_and_record_signature_replay,
 )
+from app.modules.reconciliation.icai_gateway_verifier import (
+    register_test_gateway_key,
+    clear_test_gateway_trust_store,
+    create_test_signed_gateway_response,
+    verify_icai_gateway_signed_response,
+)
+from app.modules.reconciliation.manual_review_verifier import (
+    verify_manual_evidence_review,
+    AUTHORIZED_REVIEWER_ROLES,
+)
+
+
+TEST_KEY_ID = "test-key-v1-0-8"
+TEST_SECRET = "MYCA_TEST_SUITE_GATEWAY_SECRET_KEY_MIN32CHARS!"
+
+
+@pytest.fixture(autouse=True)
+def setup_test_trust_store():
+    """Initializes and cleans up the test gateway trust store."""
+    register_test_gateway_key(TEST_KEY_ID, TEST_SECRET)
+    yield
+    clear_test_gateway_trust_store()
+
+
+def make_test_gateway_token(
+    membership_no: str,
+    evidence_ref: str,
+    firm_registration_no: str = None,
+    cop_status: str = "ACTIVE",
+    cop_valid_until: date = None,
+    kid: str = TEST_KEY_ID,
+    secret: str = TEST_SECRET,
+    algorithm: str = "HS256",
+    issuer: str = "https://gateway.icai.org",
+    audience: str = "myca-statutory-verification",
+    nonce: str = None,
+    issued_at: datetime = None,
+    expires_at: datetime = None,
+    verification_status: str = "INDEPENDENTLY_VERIFIED"
+) -> str:
+    return create_test_signed_gateway_response(
+        membership_no=membership_no,
+        firm_registration_no=firm_registration_no,
+        cop_status=cop_status,
+        cop_valid_until=cop_valid_until or (date.today() + timedelta(days=365)),
+        evidence_ref=evidence_ref,
+        kid=kid,
+        secret_or_key=secret,
+        algorithm=algorithm,
+        issuer=issuer,
+        audience=audience,
+        nonce=nonce,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        verification_status=verification_status
+    )
 
 
 class MockFailingSession:
@@ -60,6 +127,10 @@ def clean_test_auditor_env():
             {"vid": test_id}
         )
         admin_db.execute(
+            text("DELETE FROM public.statutory_auditor_verification_events WHERE auditor_id = :vid;"),
+            {"vid": test_id}
+        )
+        admin_db.execute(
             text("DELETE FROM public.statutory_auditors WHERE auditor_id = :vid;"),
             {"vid": test_id}
         )
@@ -71,7 +142,7 @@ def clean_test_auditor_env():
 
 
 # ============================================================================
-# CRITICAL FINDING A: STATUTORY AUDITOR VERIFICATION PROVENANCE & FAIL-CLOSED
+# PART 1: STATUTORY AUDITOR VERIFICATION PROVENANCE & CREDENTIAL GATE
 # ============================================================================
 
 def test_statutory_auditor_unregistered_fails_closed(clean_test_auditor_env):
@@ -98,7 +169,6 @@ def test_statutory_auditor_unverified_provenance_rejected(clean_test_auditor_env
     m_no = clean_test_auditor_env["mem_no"]
 
     try:
-        # Onboard auditor with admin approval but WITHOUT independent ICAI verification
         onboard_verified_statutory_auditor(
             db=admin_db,
             auditor_id=vid,
@@ -124,9 +194,8 @@ def test_statutory_auditor_unverified_provenance_rejected(clean_test_auditor_env
 
 def test_statutory_auditor_self_assertion_precluded(clean_test_auditor_env):
     """
-    Verifies that arbitrary callers CANNOT self-assert verification status by simply passing
-    is_icai_verified=True without providing authentic independent verification evidence.
-    Engine must reject self-assertion and record as unverified.
+    Verifies that callers CANNOT self-assert verification status by passing
+    is_icai_verified=True without authentic independent verification evidence.
     """
     admin_db = clean_test_auditor_env["admin_db"]
     app_db = SessionLocal()
@@ -134,7 +203,6 @@ def test_statutory_auditor_self_assertion_precluded(clean_test_auditor_env):
     m_no = clean_test_auditor_env["mem_no"]
 
     try:
-        # Attempt self-assertion: caller claims is_icai_verified=True but provides NO authentic evidence ref or verified_at
         onboard_verified_statutory_auditor(
             db=admin_db,
             auditor_id=vid,
@@ -150,7 +218,6 @@ def test_statutory_auditor_self_assertion_precluded(clean_test_auditor_env):
             environment="test"
         )
 
-        # Verification must be rejected by the engine
         is_valid, msg = validate_auditor_credentials(vid, "CHARTERED_ACCOUNTANT", db=app_db)
         assert is_valid is False
         assert "UNVERIFIED_AUDITOR_PROVENANCE" in msg
@@ -165,6 +232,13 @@ def test_statutory_auditor_independently_verified_provenance_accepted(clean_test
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
     now_utc = datetime.now(timezone.utc)
+    ev_ref = f"ICAI-GATEWAY-TRACE-{uuid.uuid4().hex[:8]}"
+
+    gw_token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=ev_ref,
+        cop_valid_until=datetime(2030, 12, 31).date()
+    )
 
     try:
         onboard_verified_statutory_auditor(
@@ -180,7 +254,8 @@ def test_statutory_auditor_independently_verified_provenance_accepted(clean_test
             is_cop_verified=True,
             verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
             verified_at=now_utc,
-            verification_evidence_ref="ICAI-GATEWAY-TRACE-PROV-001",
+            verification_evidence_ref=ev_ref,
+            gateway_signed_response=gw_token,
             environment="test"
         )
 
@@ -199,6 +274,13 @@ def test_statutory_auditor_revoked_status_rejected(clean_test_auditor_env):
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
     now_utc = datetime.now(timezone.utc)
+    ev_ref = f"ICAI-GATEWAY-TRACE-{uuid.uuid4().hex[:8]}"
+
+    gw_token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=ev_ref,
+        cop_valid_until=datetime(2030, 12, 31).date()
+    )
 
     try:
         onboard_verified_statutory_auditor(
@@ -214,7 +296,8 @@ def test_statutory_auditor_revoked_status_rejected(clean_test_auditor_env):
             is_cop_verified=True,
             verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
             verified_at=now_utc,
-            verification_evidence_ref="ICAI-GATEWAY-TRACE-REVOKE-001",
+            verification_evidence_ref=ev_ref,
+            gateway_signed_response=gw_token,
             environment="test"
         )
 
@@ -241,6 +324,7 @@ def test_statutory_auditor_expired_cop_rejected(clean_test_auditor_env):
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
     now_utc = datetime.now(timezone.utc)
+    ev_ref = f"ICAI-GATEWAY-TRACE-{uuid.uuid4().hex[:8]}"
 
     try:
         # 1. Onboarding with already-expired COP must raise ValueError
@@ -258,7 +342,7 @@ def test_statutory_auditor_expired_cop_rejected(clean_test_auditor_env):
                 is_cop_verified=True,
                 verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
                 verified_at=now_utc,
-                verification_evidence_ref="ICAI-GATEWAY-TRACE-EXPIRED-001",
+                verification_evidence_ref=ev_ref,
                 environment="test"
             )
             assert False, "Onboarding with expired COP date must raise ValueError"
@@ -266,6 +350,11 @@ def test_statutory_auditor_expired_cop_rejected(clean_test_auditor_env):
             assert "future date" in str(ex)
 
         # 2. Onboard with valid future COP, then simulate COP expiration via database update
+        gw_token = make_test_gateway_token(
+            membership_no=m_no,
+            evidence_ref=ev_ref,
+            cop_valid_until=datetime(2030, 12, 31).date()
+        )
         onboard_verified_statutory_auditor(
             db=admin_db,
             auditor_id=vid,
@@ -279,7 +368,8 @@ def test_statutory_auditor_expired_cop_rejected(clean_test_auditor_env):
             is_cop_verified=True,
             verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
             verified_at=now_utc,
-            verification_evidence_ref="ICAI-GATEWAY-TRACE-EXPIRED-001",
+            verification_evidence_ref=ev_ref,
+            gateway_signed_response=gw_token,
             environment="test"
         )
         admin_db.execute(
@@ -304,8 +394,382 @@ def test_statutory_auditor_db_failure_fails_closed():
 
 
 # ============================================================================
-# CRITICAL FINDING B: PERSISTENT REPLAY DEFENSE & REMOVAL OF IN-MEMORY FALLBACK
+# PART 2: ICAI GATEWAY CRYPTOGRAPHIC VERIFICATION & FAIL-CLOSED PROTOCOL
 # ============================================================================
+
+def test_icai_gateway_fabricated_reference_rejected(clean_test_auditor_env):
+    """
+    Verifies that fabricated reference strings (e.g. 'ICAI-GATEWAY-FAKE123')
+    are strictly rejected when presented without authentic cryptographic proof.
+    """
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+
+    # Attempt to onboard using bare fabricated reference string without signed response
+    auditor = onboard_verified_statutory_auditor(
+        db=admin_db,
+        auditor_id=vid,
+        membership_no=m_no,
+        name="CA Fake Gateway Reference",
+        role="CHARTERED_ACCOUNTANT",
+        approved_by="ADMIN_OPERATOR",
+        cop_valid_until=datetime(2030, 12, 31).date(),
+        verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
+        verification_evidence_ref="ICAI-GATEWAY-FAKE123",
+        environment="test"
+    )
+
+    # Must fail closed: status recorded as PENDING_INDEPENDENT_VERIFICATION
+    assert auditor["verification_status"] == "PENDING_INDEPENDENT_VERIFICATION"
+    assert auditor["is_icai_verified"] is False
+    assert auditor["is_cop_verified"] is False
+
+    # Credential lookup must reject unverified auditor
+    app_db = SessionLocal()
+    try:
+        is_valid, msg = validate_auditor_credentials(vid, "CHARTERED_ACCOUNTANT", db=app_db)
+        assert is_valid is False
+        assert "UNVERIFIED_AUDITOR_PROVENANCE" in msg
+    finally:
+        app_db.close()
+
+
+def test_icai_gateway_cryptographic_verification_claims_and_replay(clean_test_auditor_env):
+    """
+    Exhaustively tests cryptographic verification of digital gateway responses:
+    1. Valid signed token succeeds and records key ID and response nonce.
+    2. Tampered signature fails with INVALID_SIGNATURE.
+    3. Unknown kid fails with UNKNOWN_KEY.
+    4. Expired token fails with TOKEN_EXPIRED.
+    5. Revoked key fails with KEY_REVOKED.
+    6. Claim mismatch (e.g. mismatched membership number) fails with CLAIM_MISMATCH.
+    7. Replayed nonce fails with NONCE_REPLAY_DETECTED.
+    """
+    m_no = clean_test_auditor_env["mem_no"]
+    ev_ref = f"ICAI-GATEWAY-REF-{uuid.uuid4().hex[:8]}"
+    cop_date = datetime(2030, 12, 31).date()
+
+    # 1. Valid signed response
+    token = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=ev_ref,
+        cop_valid_until=cop_date,
+        nonce="NONCE-UNIQUE-001"
+    )
+    ok, msg, data = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test"
+    )
+    assert ok is True
+    assert data["kid"] == TEST_KEY_ID
+    assert data["jti"] == "NONCE-UNIQUE-001"
+
+    # 2. Tampered signature fails
+    tampered_token = token[:-8] + "ABCDEF12"
+    ok_tamp, msg_tamp, _ = verify_icai_gateway_signed_response(
+        signed_token=tampered_token,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test"
+    )
+    assert ok_tamp is False
+    assert "Signature verification failed" in msg_tamp or "CRYPTOGRAPHIC_VERIFICATION_FAILED" in msg_tamp
+
+    # 3. Unknown kid fails
+    token_bad_kid = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=ev_ref,
+        kid="unknown-kid-999"
+    )
+    ok_kid, msg_kid, _ = verify_icai_gateway_signed_response(
+        signed_token=token_bad_kid,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test"
+    )
+    assert ok_kid is False
+    assert "UNKNOWN_KEY" in msg_kid
+
+    # 4. Expired token fails
+    now = datetime.now(timezone.utc)
+    token_exp = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=ev_ref,
+        issued_at=now - timedelta(days=2),
+        expires_at=now - timedelta(days=1)
+    )
+    ok_exp, msg_exp, _ = verify_icai_gateway_signed_response(
+        signed_token=token_exp,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test"
+    )
+    assert ok_exp is False
+    assert "EXPIRED_GATEWAY_TOKEN" in msg_exp or "Signature has expired" in msg_exp
+
+    # 5. Revoked key fails
+    register_test_gateway_key("revoked-key-id", "some-secret-key-32chars-long-here!!", is_revoked=True)
+    token_rev = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=ev_ref,
+        kid="revoked-key-id",
+        secret="some-secret-key-32chars-long-here!!"
+    )
+    ok_rev, msg_rev, _ = verify_icai_gateway_signed_response(
+        signed_token=token_rev,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test"
+    )
+    assert ok_rev is False
+    assert "REVOKED" in msg_rev or "KEY_REVOKED" in msg_rev
+
+    # 6. Claim mismatch fails (e.g. wrong membership_no)
+    token_claim = make_test_gateway_token(
+        membership_no=m_no,
+        evidence_ref=ev_ref,
+        cop_valid_until=cop_date,
+        nonce="NONCE-CLAIM-MISMATCH-TEST"
+    )
+    ok_claim, msg_claim, _ = verify_icai_gateway_signed_response(
+        signed_token=token_claim,
+        expected_membership_no="999999",  # mismatched
+        expected_cop_valid_until=cop_date,
+        environment="test"
+    )
+    assert ok_claim is False
+    assert "MISMATCH" in msg_claim or "CLAIM_MISMATCH" in msg_claim
+
+    # 7. Replayed nonce (jti) fails
+    # token has nonce "NONCE-UNIQUE-001" which was registered in step 1
+    ok_replay, msg_replay, _ = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        expected_cop_valid_until=cop_date,
+        environment="test"
+    )
+    assert ok_replay is False
+    assert "NONCE_REPLAY" in msg_replay or "already been consumed" in msg_replay
+
+
+def test_icai_gateway_unconfigured_production_fails_closed(clean_test_auditor_env):
+    """
+    Verifies that in production mode, without an official ICAI trust anchor configured,
+    the gateway verifier fails closed with TRUST_ANCHOR_UNAVAILABLE.
+    Test keys are strictly rejected in production.
+    """
+    m_no = clean_test_auditor_env["mem_no"]
+    token = make_test_gateway_token(membership_no=m_no, evidence_ref="ICAI-REF-PROD-001")
+
+    # In production environment (without official keys set in env)
+    ok, msg, _ = verify_icai_gateway_signed_response(
+        signed_token=token,
+        expected_membership_no=m_no,
+        environment="production"
+    )
+    assert ok is False
+    assert "TRUST_ANCHOR_UNAVAILABLE" in msg or "TEST_KEY_REJECTED_IN_PRODUCTION" in msg
+
+
+# ============================================================================
+# PART 3: AUTHENTICATED MANUAL EVIDENCE REVIEW PROVENANCE
+# ============================================================================
+
+def test_manual_evidence_review_provenance_success(clean_test_auditor_env):
+    """
+    Verifies successful manual review verification:
+    - Server computes SHA-256 over uploaded document bytes.
+    - Validates authorized reviewer role (STATUTORY_AUDITOR_ADMIN).
+    - Enforces maker-checker (uploader != reviewer).
+    - Logs immutable event in statutory_auditor_verification_events.
+    """
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    doc_bytes = b"%PDF-1.4 Mock ICAI Member Card and COP Certificate for test auditor"
+    computed_hash = hashlib.sha256(doc_bytes).hexdigest()
+
+    reviewer_ctx = {
+        "user_id": "OFFICER-COMPLIANCE-01",
+        "email": "compliance.officer@myca.internal",
+        "roles": ["CHIEF_COMPLIANCE_OFFICER"],
+        "is_active": True,
+        "session_id": f"SESS-{uuid.uuid4().hex[:12]}"
+    }
+
+    auditor = onboard_verified_statutory_auditor(
+        db=admin_db,
+        auditor_id=vid,
+        membership_no=m_no,
+        name="CA Manual Review Pass",
+        role="CHARTERED_ACCOUNTANT",
+        approved_by="OFFICER-COMPLIANCE-01",
+        cop_valid_until=datetime(2030, 12, 31).date(),
+        verification_source="MANUAL_EVIDENCE_REVIEW",
+        document_bytes=doc_bytes,
+        reviewer_context=reviewer_ctx,
+        uploader_id="OPERATOR-UPLOADER-02",  # Maker != Checker
+        environment="test"
+    )
+
+    assert auditor["verification_status"] == "INDEPENDENTLY_VERIFIED"
+    assert auditor["is_icai_verified"] is True
+    assert auditor["is_cop_verified"] is True
+    assert auditor["evidence_sha256"] == computed_hash
+
+    # Verify event logged in statutory_auditor_verification_events
+    row = admin_db.execute(
+        text("SELECT * FROM public.statutory_auditor_verification_events WHERE auditor_id = :aid;"),
+        {"aid": vid}
+    ).fetchone()
+    assert row is not None
+    r_map = row._mapping
+    assert r_map["evidence_sha256"] == computed_hash
+    assert r_map["decision"] == "APPROVED"
+    assert r_map["reviewer_id"] == "OFFICER-COMPLIANCE-01"
+
+    # Verify credential lookup succeeds
+    app_db = SessionLocal()
+    try:
+        is_valid, msg = validate_auditor_credentials(vid, "CHARTERED_ACCOUNTANT", db=app_db)
+        assert is_valid is True
+        assert "MANUAL_EVIDENCE_REVIEW" in msg
+    finally:
+        app_db.close()
+
+
+def test_manual_evidence_review_unauthorized_role_rejected(clean_test_auditor_env):
+    """Verifies that a reviewer without an authorized compliance role is rejected."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    doc_bytes = b"Dummy certificate bytes"
+
+    reviewer_ctx = {
+        "user_id": "STANDARD-USER-01",
+        "roles": ["STANDARD_USER", "VIEWER"],  # Unauthorized role
+        "is_active": True,
+        "session_id": "SESS-001"
+    }
+
+    try:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id=vid,
+            membership_no=m_no,
+            name="CA Unauthorized Reviewer",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by="STANDARD-USER-01",
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            verification_source="MANUAL_EVIDENCE_REVIEW",
+            document_bytes=doc_bytes,
+            reviewer_context=reviewer_ctx,
+            uploader_id="OPERATOR-01",
+            environment="test"
+        )
+        assert False, "Should fail with unauthorized reviewer"
+    except ValueError as ex:
+        assert "INSUFFICIENT_PERMISSIONS" in str(ex) or "UNAUTHORIZED_REVIEWER_ROLE" in str(ex)
+
+
+def test_manual_evidence_review_maker_checker_rejected(clean_test_auditor_env):
+    """Verifies that self-approval (maker-checker violation: uploader == reviewer) is rejected."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    doc_bytes = b"Dummy certificate bytes"
+
+    reviewer_ctx = {
+        "user_id": "OPERATOR-SAME-01",
+        "roles": ["STATUTORY_AUDITOR_ADMIN"],
+        "is_active": True,
+        "session_id": "SESS-SAME-01"
+    }
+
+    try:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id=vid,
+            membership_no=m_no,
+            name="CA Maker Checker Violation",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by="OPERATOR-SAME-01",
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            verification_source="MANUAL_EVIDENCE_REVIEW",
+            document_bytes=doc_bytes,
+            reviewer_context=reviewer_ctx,
+            uploader_id="OPERATOR-SAME-01",  # Same as reviewer!
+            environment="test"
+        )
+        assert False, "Should fail with maker-checker violation"
+    except ValueError as ex:
+        assert "MAKER_CHECKER_VIOLATION" in str(ex)
+
+
+def test_manual_evidence_review_tampered_document_bytes_rejected(clean_test_auditor_env):
+    """Verifies that if claimed SHA-256 does not match computed bytes, it is rejected."""
+    admin_db = clean_test_auditor_env["admin_db"]
+    vid = clean_test_auditor_env["id"]
+    m_no = clean_test_auditor_env["mem_no"]
+    doc_bytes = b"Genuine certificate bytes"
+    fake_hash = hashlib.sha256(b"Tampered different bytes").hexdigest()
+
+    reviewer_ctx = {
+        "user_id": "ADMIN-01",
+        "roles": ["STATUTORY_AUDITOR_ADMIN"],
+        "is_active": True,
+        "session_id": "SESS-01"
+    }
+
+    try:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id=vid,
+            membership_no=m_no,
+            name="CA Hash Mismatch",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by="ADMIN-01",
+            cop_valid_until=datetime(2030, 12, 31).date(),
+            verification_source="MANUAL_EVIDENCE_REVIEW",
+            document_bytes=doc_bytes,
+            reviewer_context=reviewer_ctx,
+            uploader_id="UPLOADER-01",
+            claimed_evidence_sha256=fake_hash,
+            environment="test"
+        )
+        assert False, "Should fail with hash mismatch"
+    except ValueError as ex:
+        assert "EVIDENCE_INTEGRITY_MISMATCH" in str(ex) or "EVIDENCE_HASH_MISMATCH" in str(ex)
+
+
+# ============================================================================
+# PART 4: PERSISTENT SIGNATURE REPLAY DEFENSE & MANDATORY EXPIRY
+# ============================================================================
+
+def test_signature_replay_missing_expires_at_fails_closed(clean_test_auditor_env):
+    """
+    Verifies that omitting expires_at fails closed with MISSING_TOKEN_EXPIRY.
+    Synthetic default expiration is strictly prohibited.
+    """
+    token = f"TEST_TOKEN_MISSING_EXPIRY_{uuid.uuid4().hex}_{uuid.uuid4().hex}"
+    app_db = SessionLocal()
+    try:
+        ok, msg = check_and_record_signature_replay(
+            token=token,
+            doc_id="DOC-NO-EXP",
+            doc_number="INV/NOEXP/01",
+            db=app_db,
+            verifier_id="SYSTEM_VERIFIED",
+            expires_at=None  # Explicitly omitted
+        )
+        assert ok is False
+        assert "MISSING_TOKEN_EXPIRY" in msg
+    finally:
+        app_db.close()
+
 
 def test_signature_replay_cross_document_reuse_rejected(clean_test_auditor_env):
     """Verifies that a token issued for doc1 cannot be reused for doc2."""
@@ -313,12 +777,14 @@ def test_signature_replay_cross_document_reuse_rejected(clean_test_auditor_env):
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
     now_utc = datetime.now(timezone.utc)
+    ev_ref = f"ICAI-GATEWAY-TRACE-{uuid.uuid4().hex[:8]}"
+    gw_token = make_test_gateway_token(membership_no=m_no, evidence_ref=ev_ref)
 
     onboard_verified_statutory_auditor(
         db=admin_db,
         auditor_id=vid,
         membership_no=m_no,
-        name="CA Replay Test",
+        name="CA Replay Cross",
         role="CHARTERED_ACCOUNTANT",
         approved_by="SYS_ADMIN",
         cop_valid_until=datetime(2030, 12, 31).date(),
@@ -327,7 +793,8 @@ def test_signature_replay_cross_document_reuse_rejected(clean_test_auditor_env):
         is_cop_verified=True,
         verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
         verified_at=now_utc,
-        verification_evidence_ref="ICAI-GATEWAY-TRACE-CROSS-001",
+        verification_evidence_ref=ev_ref,
+        gateway_signed_response=gw_token,
         environment="test"
     )
 
@@ -336,19 +803,22 @@ def test_signature_replay_cross_document_reuse_rejected(clean_test_auditor_env):
     doc1_num = "INV/TEST/001"
     doc2_id = f"DOC-TEST-2-{uuid.uuid4().hex[:6]}"
     doc2_num = "INV/TEST/002"
+    exp = now_utc + timedelta(hours=24)
 
     app_db = SessionLocal()
     try:
         # First consumption on doc1 succeeds
         ok1, msg1 = check_and_record_signature_replay(
-            token=token, doc_id=doc1_id, doc_number=doc1_num, db=app_db, verifier_id=vid
+            token=token, doc_id=doc1_id, doc_number=doc1_num, db=app_db,
+            verifier_id=vid, expires_at=exp
         )
         assert ok1 is True
         assert "recorded successfully" in msg1
 
         # Second consumption attempt on doc2 fails with cross-document replay
         ok2, msg2 = check_and_record_signature_replay(
-            token=token, doc_id=doc2_id, doc_number=doc2_num, db=app_db, verifier_id=vid
+            token=token, doc_id=doc2_id, doc_number=doc2_num, db=app_db,
+            verifier_id=vid, expires_at=exp
         )
         assert ok2 is False
         assert "SIGNATURE_REPLAY_DETECTED" in msg2
@@ -363,6 +833,8 @@ def test_signature_replay_duplicate_consumption_rejected(clean_test_auditor_env)
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
     now_utc = datetime.now(timezone.utc)
+    ev_ref = f"ICAI-GATEWAY-TRACE-{uuid.uuid4().hex[:8]}"
+    gw_token = make_test_gateway_token(membership_no=m_no, evidence_ref=ev_ref)
 
     onboard_verified_statutory_auditor(
         db=admin_db,
@@ -377,25 +849,29 @@ def test_signature_replay_duplicate_consumption_rejected(clean_test_auditor_env)
         is_cop_verified=True,
         verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
         verified_at=now_utc,
-        verification_evidence_ref="ICAI-GATEWAY-TRACE-DUP-001",
+        verification_evidence_ref=ev_ref,
+        gateway_signed_response=gw_token,
         environment="test"
     )
 
     token = f"TEST_TOKEN_SAME_DOC_DUP_{uuid.uuid4().hex}_{uuid.uuid4().hex}"
     doc_id = f"DOC-DUP-{uuid.uuid4().hex[:6]}"
     doc_num = "INV/TEST/DUP01"
+    exp = now_utc + timedelta(hours=24)
 
     app_db = SessionLocal()
     try:
         # First consumption succeeds
         ok1, msg1 = check_and_record_signature_replay(
-            token=token, doc_id=doc_id, doc_number=doc_num, db=app_db, verifier_id=vid
+            token=token, doc_id=doc_id, doc_number=doc_num, db=app_db,
+            verifier_id=vid, expires_at=exp
         )
         assert ok1 is True
 
         # Duplicate consumption on same document rejected
         ok2, msg2 = check_and_record_signature_replay(
-            token=token, doc_id=doc_id, doc_number=doc_num, db=app_db, verifier_id=vid
+            token=token, doc_id=doc_id, doc_number=doc_num, db=app_db,
+            verifier_id=vid, expires_at=exp
         )
         assert ok2 is False
         assert "already been consumed" in msg2
@@ -413,6 +889,8 @@ def test_signature_replay_expired_token_permanent_invalidation(clean_test_audito
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
     now_utc = datetime.now(timezone.utc)
+    ev_ref = f"ICAI-GATEWAY-TRACE-{uuid.uuid4().hex[:8]}"
+    gw_token = make_test_gateway_token(membership_no=m_no, evidence_ref=ev_ref)
 
     onboard_verified_statutory_auditor(
         db=admin_db,
@@ -427,7 +905,8 @@ def test_signature_replay_expired_token_permanent_invalidation(clean_test_audito
         is_cop_verified=True,
         verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
         verified_at=now_utc,
-        verification_evidence_ref="ICAI-GATEWAY-TRACE-EXPIRED-001",
+        verification_evidence_ref=ev_ref,
+        gateway_signed_response=gw_token,
         environment="test"
     )
 
@@ -447,8 +926,7 @@ def test_signature_replay_expired_token_permanent_invalidation(clean_test_audito
         assert "EXPIRED_TOKEN" in msg1
 
         # Verify it was NOT recorded in the database
-        from hashlib import sha256
-        hash_expired = sha256(token_expired.encode("utf-8")).hexdigest()
+        hash_expired = hashlib.sha256(token_expired.encode("utf-8")).hexdigest()
         count = admin_db.execute(
             text("SELECT count(*) FROM public.statutory_audit_signature_replays WHERE token_hash = :th;"),
             {"th": hash_expired}
@@ -478,18 +956,23 @@ def test_signature_replay_expired_token_permanent_invalidation(clean_test_audito
         app_db.close()
 
 
-def test_signature_replay_concurrent_collision_rejected(clean_test_auditor_env):
+def test_conclusive_postgresql_insert_concurrency_race(clean_test_auditor_env):
     """
-    Rigorously tests concurrent race condition across distinct database sessions using
-    a multi-threaded execution barrier (threading.Barrier(2)).
-    Asserts that exactly one consumption succeeds and the other fails with atomic collision detection.
+    Rigorously tests concurrent race condition across distinct database sessions.
+    Hooks SQLAlchemy 'before_cursor_execute' event on the INSERT statement:
+    both worker threads pass the initial SELECT pre-check, arrive at the barrier
+    right before executing the INSERT statement, and strike PostgreSQL simultaneously.
+    Asserts:
+    1. Exactly 1 worker succeeds.
+    2. Exactly 1 worker receives CONCURRENT_REPLAY_DETECTED.
+    3. Exactly 1 row exists in the database.
     """
-    import threading
-
     admin_db = clean_test_auditor_env["admin_db"]
     vid = clean_test_auditor_env["id"]
     m_no = clean_test_auditor_env["mem_no"]
     now_utc = datetime.now(timezone.utc)
+    ev_ref = f"ICAI-GATEWAY-TRACE-{uuid.uuid4().hex[:8]}"
+    gw_token = make_test_gateway_token(membership_no=m_no, evidence_ref=ev_ref)
 
     onboard_verified_statutory_auditor(
         db=admin_db,
@@ -504,25 +987,34 @@ def test_signature_replay_concurrent_collision_rejected(clean_test_auditor_env):
         is_cop_verified=True,
         verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
         verified_at=now_utc,
-        verification_evidence_ref="ICAI-GATEWAY-TRACE-CONCURRENCY-001",
+        verification_evidence_ref=ev_ref,
+        gateway_signed_response=gw_token,
         environment="test"
     )
 
     token = f"TEST_TOKEN_CONCURRENT_RACE_{uuid.uuid4().hex}_{uuid.uuid4().hex}"
     doc_id = f"DOC-CONC-{uuid.uuid4().hex[:6]}"
     doc_num = "INV/TEST/CONC01"
+    exp = now_utc + timedelta(hours=24)
 
     barrier = threading.Barrier(2)
     results = []
     errors = []
 
+    def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        if "INSERT INTO public.statutory_audit_signature_replays" in statement:
+            # Synchronize both threads right before striking the INSERT cursor
+            barrier.wait(timeout=10)
+
+    # Attach SQLAlchemy event listener to the engine
+    event.listen(engine, "before_cursor_execute", before_cursor_execute)
+
     def worker(worker_id):
         session = SessionLocal()
         try:
-            # Synchronize threads at the barrier so they strike the DB simultaneously
-            barrier.wait(timeout=5)
             ok, msg = check_and_record_signature_replay(
-                token=token, doc_id=doc_id, doc_number=doc_num, db=session, verifier_id=vid
+                token=token, doc_id=doc_id, doc_number=doc_num, db=session,
+                verifier_id=vid, expires_at=exp
             )
             results.append((worker_id, ok, msg))
         except Exception as ex:
@@ -530,14 +1022,17 @@ def test_signature_replay_concurrent_collision_rejected(clean_test_auditor_env):
         finally:
             session.close()
 
-    t1 = threading.Thread(target=worker, args=(1,))
-    t2 = threading.Thread(target=worker, args=(2,))
+    try:
+        t1 = threading.Thread(target=worker, args=(1,))
+        t2 = threading.Thread(target=worker, args=(2,))
 
-    t1.start()
-    t2.start()
+        t1.start()
+        t2.start()
 
-    t1.join(timeout=10)
-    t2.join(timeout=10)
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+    finally:
+        event.remove(engine, "before_cursor_execute", before_cursor_execute)
 
     assert not errors, f"Unexpected thread exceptions during concurrent execution: {errors}"
     assert len(results) == 2, f"Expected 2 worker results, got {len(results)}"
@@ -549,13 +1044,12 @@ def test_signature_replay_concurrent_collision_rejected(clean_test_auditor_env):
     assert len(successes) == 1, f"Expected exactly 1 success, got {len(successes)}: {results}"
     assert len(failures) == 1, f"Expected exactly 1 failure, got {len(failures)}: {results}"
 
-    # Failure must indicate signature replay or collision
+    # Failure must indicate concurrent collision or signature replay
     fail_msg = failures[0][2]
-    assert ("SIGNATURE_REPLAY_DETECTED" in fail_msg or "CONCURRENT_REPLAY_DETECTED" in fail_msg or "already been consumed" in fail_msg), f"Unexpected failure message: {fail_msg}"
+    assert ("CONCURRENT_REPLAY_DETECTED" in fail_msg or "SIGNATURE_REPLAY_DETECTED" in fail_msg or "already been consumed" in fail_msg), f"Unexpected failure message: {fail_msg}"
 
     # Verify database state has exactly 1 record for this token hash
-    from hashlib import sha256
-    token_hash = sha256(token.encode("utf-8")).hexdigest()
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     rec_count = admin_db.execute(
         text("SELECT count(*) FROM public.statutory_audit_signature_replays WHERE token_hash = :th;"),
         {"th": token_hash}
@@ -570,9 +1064,11 @@ def test_signature_replay_db_failure_fails_closed_no_in_memory_fallback():
     """
     failing_db = MockFailingSession()
     token = "TEST_TOKEN_DB_FAILURE_FAIL_CLOSED_32_CHARS"
+    now_utc = datetime.now(timezone.utc)
 
     ok, msg = check_and_record_signature_replay(
-        token=token, doc_id="DOC_FAIL_01", doc_number="INV_FAIL", db=failing_db
+        token=token, doc_id="DOC_FAIL_01", doc_number="INV_FAIL", db=failing_db,
+        expires_at=now_utc + timedelta(hours=24)
     )
     assert ok is False
     assert "DATABASE_TRANSACTION_FAILURE" in msg

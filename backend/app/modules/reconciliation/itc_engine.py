@@ -7,6 +7,15 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Any, Optional, Set, Tuple
 from datetime import date, datetime, timezone, timedelta
 from .schemas import ITCEligibilityEnum, ITCAssessmentOut, Rule37PaymentCheck, Rule37AFilingCheck
+from .icai_gateway_verifier import (
+    verify_icai_gateway_signed_response,
+    is_official_icai_gateway_configured,
+    OFFICIAL_ICAI_GATEWAY_ISSUER
+)
+from .manual_review_verifier import (
+    verify_manual_evidence_review,
+    AUTHORIZED_REVIEWER_ROLES
+)
 from sqlalchemy import text
 
 try:
@@ -1233,7 +1242,8 @@ def get_verified_statutory_auditor(verifier_id: str, db: Optional[Any] = None) -
                    cop_status, cop_valid_until, approved_by, approved_at,
                    is_revoked, revoked_at, revocation_reason,
                    verification_source, verification_status, is_icai_verified, is_cop_verified,
-                   verified_at, verification_evidence_ref
+                   verified_at, verification_evidence_ref, evidence_sha256, reviewer_session_ref,
+                   gateway_kid, gateway_response_id
             FROM public.statutory_auditors
             WHERE auditor_id = :vid OR membership_no = :vid;
         """)
@@ -1258,7 +1268,11 @@ def get_verified_statutory_auditor(verifier_id: str, db: Optional[Any] = None) -
                 "is_icai_verified": bool(m.get("is_icai_verified", False)),
                 "is_cop_verified": bool(m.get("is_cop_verified", False)),
                 "verified_at": m.get("verified_at"),
-                "verification_evidence_ref": m.get("verification_evidence_ref")
+                "verification_evidence_ref": m.get("verification_evidence_ref"),
+                "evidence_sha256": m.get("evidence_sha256"),
+                "reviewer_session_ref": m.get("reviewer_session_ref"),
+                "gateway_kid": m.get("gateway_kid"),
+                "gateway_response_id": m.get("gateway_response_id")
             }
         return None
     except Exception as ex:
@@ -1274,46 +1288,73 @@ def authenticate_icai_verification_evidence(
     verification_source: str,
     verification_evidence_ref: Optional[str],
     verified_at: Optional[datetime],
-    environment: Optional[str] = None
+    environment: Optional[str] = None,
+    evidence_sha256: Optional[str] = None,
+    reviewer_session_ref: Optional[str] = None,
+    gateway_response_id: Optional[str] = None
 ) -> tuple[bool, str]:
     """
     Rigorously authenticates independent ICAI membership and COP verification evidence.
     Precludes self-assertion of verification status by arbitrary callers.
-    Requires genuine gateway / portal verification evidence with valid timestamp.
+    Requires genuine cryptographic gateway proof or authenticated manual review.
+    Rejects bare or fabricated references (such as ICAI-GATEWAY-FAKE123).
     Rejects MOCK_TEST_FIXTURE in production environments.
+    Enforces statutory 24-hour freshness and clock skew bounds.
     """
     env = (environment or os.environ.get("ENVIRONMENT", "production")).strip().lower()
     v_src = str(verification_source or "").strip()
 
     # 1. Verification source statutory whitelist
-    if v_src not in ('MANUAL_REVIEW', 'ICAI_PORTAL_MANUAL_SEARCH', 'ICAI_DIGITAL_VERIFICATION_GATEWAY', 'MOCK_TEST_FIXTURE'):
+    allowed_sources = (
+        'MANUAL_REVIEW',
+        'MANUAL_EVIDENCE_REVIEW',
+        'ICAI_PORTAL_MANUAL_SEARCH',
+        'ICAI_DIGITAL_VERIFICATION_GATEWAY',
+        'MOCK_TEST_FIXTURE'
+    )
+    if v_src not in allowed_sources:
         return False, f"UNVERIFIED_AUDITOR_PROVENANCE: Unknown or unsupported verification source '{v_src}'."
 
     # 2. Strict rejection of MOCK_TEST_FIXTURE in production
     if v_src == "MOCK_TEST_FIXTURE" and env not in ("test", "testing", "development"):
         return False, "UNVERIFIED_AUDITOR_PROVENANCE: MOCK_TEST_FIXTURE verification source is strictly prohibited in production statutory certification."
 
-    # 3. Verified at timestamp validation
+    # 3. Verified at timestamp validation & freshness
     if not verified_at:
         return False, "UNVERIFIED_AUDITOR_PROVENANCE: Auditor verification timestamp 'verified_at' is missing or unrecorded."
 
     v_dt = verified_at if verified_at.tzinfo else verified_at.replace(tzinfo=timezone.utc)
     now_utc = datetime.now(timezone.utc)
     if v_dt > now_utc + timedelta(minutes=5):
-        return False, f"UNVERIFIED_AUDITOR_PROVENANCE: Verification timestamp {v_dt.isoformat()} is in the future beyond allowed clock skew."
+        return False, f"FUTURE_VERIFICATION_TIMESTAMP: Verification timestamp {v_dt.isoformat()} is in the future beyond allowed clock skew."
 
-    # 4. Verification evidence reference validation
-    v_ref = str(verification_evidence_ref or "").strip()
-    if not v_ref or len(v_ref) < 10:
-        return False, "UNVERIFIED_AUDITOR_PROVENANCE: Verification evidence reference 'verification_evidence_ref' is missing or insufficient length (min 10 chars)."
+    # Enforce statutory 24-hour verification freshness
+    if now_utc - v_dt > timedelta(hours=24):
+        return False, f"STALE_VERIFICATION_TIMESTAMP: Auditor verification timestamp {v_dt.isoformat()} is older than the allowed 24-hour freshness window. Re-verification required."
 
-    # Must match statutory gateway/portal verification pattern
-    pattern = r"^(ICAI-(GATEWAY|PORTAL|VERIF|REF|EVIDENCE)-[A-Z0-9_-]{6,}|SHA256:[a-f0-9]{64}|MOCK-(TEST|TRACE|FIXTURE)-[A-Z0-9_-]{6,})$"
-    if not re.match(pattern, v_ref, re.IGNORECASE):
-        return False, f"UNVERIFIED_AUDITOR_PROVENANCE: Evidence reference '{v_ref}' does not match statutory ICAI verification trace format."
+    # 4. Source-specific authenticity checks
+    if v_src == "ICAI_DIGITAL_VERIFICATION_GATEWAY":
+        # Check production trust anchor configuration
+        if env not in ("test", "testing", "development") and not is_official_icai_gateway_configured():
+            return False, "TRUST_ANCHOR_UNAVAILABLE: Official ICAI digital verification gateway is not configured in production."
 
-    if "MOCK" in v_ref.upper() and env not in ("test", "testing", "development"):
-        return False, "UNVERIFIED_AUDITOR_PROVENANCE: Mock evidence reference is strictly prohibited in production statutory certification."
+        # Reject bare string references without authentic cryptographic proof
+        v_ref = str(verification_evidence_ref or "").strip()
+        if not gateway_response_id and not (v_ref and len(v_ref) > 30 and "." in v_ref):
+            return False, f"UNVERIFIED_AUDITOR_PROVENANCE: Bare gateway reference '{v_ref}' without authentic cryptographic response token cannot establish verification."
+
+    elif v_src == "MANUAL_EVIDENCE_REVIEW":
+        if not evidence_sha256 or not reviewer_session_ref:
+            return False, "UNVERIFIED_AUDITOR_PROVENANCE: Manually reviewed auditor lacks documentary SHA-256 or reviewer session reference."
+
+    elif v_src == "MOCK_TEST_FIXTURE":
+        v_ref = str(verification_evidence_ref or "").strip()
+        if not v_ref or len(v_ref) < 10:
+            return False, "UNVERIFIED_AUDITOR_PROVENANCE: Test fixture reference is missing or insufficient length."
+
+    elif v_src in ('MANUAL_REVIEW', 'ICAI_PORTAL_MANUAL_SEARCH'):
+        # Legacy/generic sources without cryptographic proof or documentary evidence fail independent verification
+        return False, f"UNVERIFIED_AUDITOR_PROVENANCE: Verification source '{v_src}' alone does not provide authentic independent verification proof."
 
     return True, f"ICAI membership and COP verification independently authenticated via {v_src}."
 
@@ -1335,6 +1376,11 @@ def onboard_verified_statutory_auditor(
     verified_at: Optional[datetime] = None,
     verification_evidence_ref: Optional[str] = None,
     environment: Optional[str] = None,
+    gateway_signed_response: Optional[str] = None,
+    document_bytes: Optional[bytes] = None,
+    reviewer_context: Optional[Dict[str, Any]] = None,
+    uploader_id: Optional[str] = None,
+    claimed_evidence_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Onboards an auditor into the controlled database registry with independent verification provenance.
@@ -1363,37 +1409,108 @@ def onboard_verified_statutory_auditor(
     if c_val <= date.today():
         raise ValueError(f"cop_valid_until ({c_val}) must be a future date; expired COP cannot be onboarded.")
 
-    # Authenticate independent verification evidence rather than trusting caller booleans
-    is_auth, auth_reason = authenticate_icai_verification_evidence(
-        membership_no=membership_no,
-        verification_source=verification_source,
-        verification_evidence_ref=verification_evidence_ref,
-        verified_at=verified_at,
-        environment=environment
-    )
+    env = (environment or os.environ.get("ENVIRONMENT", "production")).strip().lower()
 
-    if is_auth:
-        final_icai_verified = True
-        final_cop_verified = (cop_status == "ACTIVE" and c_val > date.today())
-        final_status = "INDEPENDENTLY_VERIFIED" if (final_icai_verified and final_cop_verified) else "VERIFICATION_FAILED"
+    final_icai_verified = False
+    final_cop_verified = False
+    final_status = "PENDING_INDEPENDENT_VERIFICATION"
+    evidence_sha256 = None
+    reviewer_session_ref = None
+    gateway_kid = None
+    gateway_response_id = None
+    auth_reason = ""
+
+    # Route verification based on source
+    if verification_source == "ICAI_DIGITAL_VERIFICATION_GATEWAY":
+        gw_token = gateway_signed_response
+        if not gw_token and verification_evidence_ref and len(verification_evidence_ref) > 30 and "." in verification_evidence_ref:
+            gw_token = verification_evidence_ref
+
+        if not gw_token:
+            # Bare reference string without cryptographic response token -> REJECT
+            final_status = "PENDING_INDEPENDENT_VERIFICATION"
+            auth_reason = f"Bare reference '{verification_evidence_ref}' rejected without authentic cryptographic gateway token."
+        else:
+            is_valid_gw, gw_msg, gw_data = verify_icai_gateway_signed_response(
+                signed_token=gw_token,
+                expected_membership_no=membership_no,
+                expected_firm_registration_no=firm_registration_no,
+                expected_cop_valid_until=c_val,
+                expected_evidence_ref=verification_evidence_ref if (verification_evidence_ref and "." not in verification_evidence_ref) else None,
+                environment=env,
+                db=db
+            )
+            if is_valid_gw:
+                final_icai_verified = True
+                final_cop_verified = True
+                final_status = "INDEPENDENTLY_VERIFIED"
+                gateway_kid = gw_data.get("gateway_kid")
+                gateway_response_id = gw_data.get("gateway_response_id")
+                verified_at = gw_data.get("verified_at")
+                verification_evidence_ref = gw_data.get("evidence_ref") or verification_evidence_ref or f"GATEWAY-NONCE:{gateway_response_id}"
+                auth_reason = gw_msg
+            else:
+                final_status = "PENDING_INDEPENDENT_VERIFICATION"
+                auth_reason = f"Gateway verification failed: {gw_msg}"
+
+    elif verification_source == "MANUAL_EVIDENCE_REVIEW":
+        is_valid_man, man_msg, man_data = verify_manual_evidence_review(
+            db=db,
+            auditor_id=auditor_id,
+            membership_no=membership_no,
+            cop_status=cop_status,
+            cop_valid_until=c_val,
+            document_bytes=document_bytes,
+            reviewer_context=reviewer_context,
+            uploader_id=uploader_id,
+            claimed_evidence_sha256=claimed_evidence_sha256
+        )
+        if is_valid_man:
+            final_icai_verified = True
+            final_cop_verified = True
+            final_status = "INDEPENDENTLY_VERIFIED"
+            evidence_sha256 = man_data.get("evidence_sha256")
+            reviewer_session_ref = man_data.get("reviewer_session_ref")
+            verification_evidence_ref = man_data.get("evidence_ref")
+            verified_at = man_data.get("verified_at")
+            auth_reason = man_msg
+        else:
+            final_status = "PENDING_INDEPENDENT_VERIFICATION"
+            auth_reason = f"Manual evidence review failed: {man_msg}"
+            raise ValueError(f"Manual evidence review rejected: {man_msg}")
+
+    elif verification_source == "MOCK_TEST_FIXTURE":
+        if env in ("test", "testing", "development"):
+            if verified_at and verification_evidence_ref and ("MOCK" in verification_evidence_ref.upper() or "FIXTURE" in verification_evidence_ref.upper()):
+                final_icai_verified = True
+                final_cop_verified = (cop_status == "ACTIVE" and c_val > date.today())
+                final_status = "INDEPENDENTLY_VERIFIED" if (final_icai_verified and final_cop_verified) else "VERIFICATION_FAILED"
+            else:
+                final_status = "PENDING_INDEPENDENT_VERIFICATION"
+        else:
+            final_status = "PENDING_INDEPENDENT_VERIFICATION"
+            auth_reason = "MOCK_TEST_FIXTURE prohibited in production"
     else:
-        # If caller attempted to assert verification without valid authentic evidence, mark unverified
+        # Caller attempted self-assertion via MANUAL_REVIEW or ICAI_PORTAL_MANUAL_SEARCH without evidence
+        final_status = "PENDING_INDEPENDENT_VERIFICATION"
         final_icai_verified = False
         final_cop_verified = False
-        final_status = verification_status or "PENDING_INDEPENDENT_VERIFICATION"
-        if final_status == "INDEPENDENTLY_VERIFIED":
-            # Caller attempted self-assertion without authentic evidence!
-            final_status = "PENDING_INDEPENDENT_VERIFICATION"
+        auth_reason = "Unauthenticated verification source; independent evidence required."
+
+    # If caller explicitly attempted self-assertion by passing INDEPENDENTLY_VERIFIED without proof
+    if verification_status == "INDEPENDENTLY_VERIFIED" and not final_icai_verified:
+        final_status = "PENDING_INDEPENDENT_VERIFICATION"
 
     stmt = text("""
         INSERT INTO public.statutory_auditors (
             auditor_id, membership_no, firm_registration_no, name, role,
             cop_status, cop_valid_until, approved_by, approved_at, is_revoked,
             verification_source, verification_status, is_icai_verified, is_cop_verified,
-            verified_at, verification_evidence_ref
+            verified_at, verification_evidence_ref, evidence_sha256, reviewer_session_ref,
+            gateway_kid, gateway_response_id
         ) VALUES (
             :aid, :mem, :frn, :name, :role, :cop, :until, :app_by, clock_timestamp(), false,
-            :v_src, :v_stat, :icai_v, :cop_v, :v_at, :v_ref
+            :v_src, :v_stat, :icai_v, :cop_v, :v_at, :v_ref, :e_sha, :s_ref, :g_kid, :g_resp
         )
         ON CONFLICT (auditor_id) DO UPDATE SET
             membership_no = EXCLUDED.membership_no,
@@ -1412,9 +1529,15 @@ def onboard_verified_statutory_auditor(
             is_cop_verified = EXCLUDED.is_cop_verified,
             verified_at = EXCLUDED.verified_at,
             verification_evidence_ref = EXCLUDED.verification_evidence_ref,
+            evidence_sha256 = EXCLUDED.evidence_sha256,
+            reviewer_session_ref = EXCLUDED.reviewer_session_ref,
+            gateway_kid = EXCLUDED.gateway_kid,
+            gateway_response_id = EXCLUDED.gateway_response_id,
             updated_at = clock_timestamp()
         RETURNING auditor_id, membership_no, name, role, cop_status, cop_valid_until, approved_by,
-                  verification_source, verification_status, is_icai_verified, is_cop_verified;
+                  verification_source, verification_status, is_icai_verified, is_cop_verified,
+                  verified_at, verification_evidence_ref, evidence_sha256, reviewer_session_ref,
+                  gateway_kid, gateway_response_id;
     """)
     res = db.execute(stmt, {
         "aid": auditor_id.strip(),
@@ -1431,6 +1554,10 @@ def onboard_verified_statutory_auditor(
         "cop_v": final_cop_verified,
         "v_at": verified_at,
         "v_ref": verification_evidence_ref.strip() if verification_evidence_ref else None,
+        "e_sha": evidence_sha256,
+        "s_ref": reviewer_session_ref,
+        "g_kid": gateway_kid,
+        "g_resp": gateway_response_id,
     }).fetchone()
     if hasattr(db, "commit"):
         db.commit()
@@ -1534,6 +1661,9 @@ def validate_auditor_credentials(verifier_id: str, claimed_role: str, db: Option
     v_src = profile.get("verification_source")
     v_ref = profile.get("verification_evidence_ref")
     v_at = profile.get("verified_at")
+    e_sha = profile.get("evidence_sha256")
+    s_ref = profile.get("reviewer_session_ref")
+    g_resp = profile.get("gateway_response_id")
     env = os.environ.get("ENVIRONMENT", "production")
 
     is_ev_valid, ev_reason = authenticate_icai_verification_evidence(
@@ -1541,7 +1671,10 @@ def validate_auditor_credentials(verifier_id: str, claimed_role: str, db: Option
         verification_source=v_src,
         verification_evidence_ref=v_ref,
         verified_at=v_at,
-        environment=env
+        environment=env,
+        evidence_sha256=e_sha,
+        reviewer_session_ref=s_ref,
+        gateway_response_id=g_resp
     )
     if not is_ev_valid:
         return False, ev_reason
@@ -1595,14 +1728,23 @@ def check_and_record_signature_replay(
     """
     Enforces persistent database-backed replay protection with atomic conflict detection.
     Precludes cross-document reuse, duplicate consumption, and multi-worker race conditions.
+    Requires explicit, non-synthesized expires_at timestamp; fails closed if omitted.
     Fails closed on database errors, missing session, missing table, or transaction failures;
     in-memory fallbacks are strictly prohibited.
     """
     if not token or len(token) < 32:
         return False, "INVALID_TOKEN: Signature token is missing or insufficient length."
 
+    # Enforce mandatory expires_at: synthetic default is strictly prohibited
+    if expires_at is None:
+        return False, "MISSING_TOKEN_EXPIRY: Explicit expires_at timestamp is mandatory; synthetic defaults are prohibited."
+
+    exp_check = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    if exp_check <= now_utc:
+        return False, f"EXPIRED_TOKEN: Signature token expired at {exp_check.isoformat()}; expired tokens cannot be accepted or recorded."
+
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    exp_dt = expires_at or (datetime.now(timezone.utc) + timedelta(days=1))
     rate_val = Decimal(str(certified_rate or 0)).quantize(Decimal("0.01"))
     tax_val = Decimal(str(total_tax or 0)).quantize(Decimal("0.01"))
     did_str = str(doc_id).strip()
@@ -1640,14 +1782,7 @@ def check_and_record_signature_replay(
                 )
             return False, f"SIGNATURE_REPLAY_DETECTED: Signature token has already been consumed for document '{did_str}'."
 
-        # 2. Strict rejection of expired tokens before acceptance or recording
-        now_utc = datetime.now(timezone.utc)
-        if expires_at is not None:
-            exp_check = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
-            if exp_check <= now_utc:
-                return False, f"EXPIRED_TOKEN: Signature token expired at {exp_check.isoformat()}; expired tokens cannot be accepted or recorded."
-
-        # 3. Atomic insert with ON CONFLICT DO NOTHING
+        # 2. Atomic insert with ON CONFLICT DO NOTHING
         stmt_ins = text("""
             INSERT INTO public.statutory_audit_signature_replays (
                 token_hash, doc_id, doc_number, verifier_id, certified_rate, total_tax, recorded_at, expires_at
@@ -1662,7 +1797,7 @@ def check_and_record_signature_replay(
             "vid": vid_str,
             "rate": rate_val,
             "tax": tax_val,
-            "exp": exp_dt
+            "exp": exp_check
         })
         if hasattr(session, "commit"):
             session.commit()
@@ -2317,6 +2452,16 @@ def _is_strictly_verified_uniform_rate(purchase_doc: Dict[str, Any]) -> bool:
         return False
 
     # Persistent Replay Protection: Check and record signature token to prevent reuse
+    # Token expiry is strictly derived from the validated verification timestamp + 24h validity window
+    try:
+        ts_cleaned = timestamp.replace("Z", "+00:00")
+        ts_dt = datetime.fromisoformat(ts_cleaned)
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        token_expiry = ts_dt + timedelta(hours=24)
+    except Exception:
+        return False
+
     is_unique, _ = check_and_record_signature_replay(
         token=token,
         doc_id=doc_id,
@@ -2324,7 +2469,8 @@ def _is_strictly_verified_uniform_rate(purchase_doc: Dict[str, Any]) -> bool:
         db=db_ctx,
         verifier_id=verifier_id,
         certified_rate=header_rate,
-        total_tax=total_tax
+        total_tax=total_tax,
+        expires_at=token_expiry
     )
     if not is_unique:
         return False
