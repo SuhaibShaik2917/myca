@@ -1830,9 +1830,12 @@ def test_statutory_cryptographic_hmac_and_auditor_registry(isolated_verified_aud
             name="CA Unverified",
             role="CHARTERED_ACCOUNTANT",
             approved_by="SYS_ADMIN",
+            cop_valid_until=datetime(2030, 12, 31).date(),
             verification_status="PENDING_INDEPENDENT_VERIFICATION",
             is_icai_verified=False,
-            is_cop_verified=False
+            is_cop_verified=False,
+            verification_source="MANUAL_REVIEW",
+            environment="test"
         )
         is_prov_valid, prov_msg = validate_auditor_credentials("CA-UNVERIFIED-PROVENANCE", "CHARTERED_ACCOUNTANT", db=app_db)
         assert is_prov_valid is False
@@ -1948,10 +1951,14 @@ def test_statutory_cryptographic_hmac_and_auditor_registry(isolated_verified_aud
             role="CHARTERED_ACCOUNTANT",
             approved_by="ICAI-ADMIN-CHIEF-01",
             firm_registration_no="654321N",
+            cop_valid_until=datetime(2030, 12, 31).date(),
             verification_status="INDEPENDENTLY_VERIFIED",
             is_icai_verified=True,
             is_cop_verified=True,
-            verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY"
+            verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
+            verified_at=datetime.now(timezone.utc),
+            verification_evidence_ref="ICAI-GATEWAY-TRACE-TEST-654321",
+            environment="test"
         )
         assert new_auditor["membership_no"] == "654321"
 
@@ -1982,12 +1989,21 @@ def test_statutory_cryptographic_hmac_and_auditor_registry(isolated_verified_aud
             name="CA Expired COP",
             role="CHARTERED_ACCOUNTANT",
             approved_by="ICAI-ADMIN",
-            cop_valid_until="2020-01-01",
+            cop_valid_until=datetime(2030, 12, 31).date(),
             verification_status="INDEPENDENTLY_VERIFIED",
             is_icai_verified=True,
             is_cop_verified=True,
-            verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY"
+            verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY",
+            verified_at=datetime.now(timezone.utc),
+            verification_evidence_ref="ICAI-GATEWAY-TRACE-EXPIRED-654322",
+            environment="test"
         )
+        # Update cop_valid_until to past to test lifecycle expiration rejection
+        admin_db.execute(
+            text("UPDATE public.statutory_auditors SET cop_valid_until = '2020-01-01' WHERE auditor_id = 'CA-TEST-EXPIRED-COP';")
+        )
+        admin_db.commit()
+
         exp_valid, exp_msg = validate_auditor_credentials("CA-TEST-EXPIRED-COP", "CHARTERED_ACCOUNTANT", db=app_db)
         assert exp_valid is False
         assert "EXPIRED" in exp_msg
@@ -2008,7 +2024,7 @@ def test_statutory_cryptographic_hmac_and_auditor_registry(isolated_verified_aud
     finally:
         try:
             admin_db.execute(text("DELETE FROM public.statutory_audit_signature_replays WHERE verifier_id IN ('CA-UNVERIFIED-PROVENANCE', 'CA-TEST-654321', 'CA-TEST-EXPIRED-COP');"))
-            admin_db.execute(text("DELETE FROM public.statutory_auditors WHERE verifier_id IN ('CA-UNVERIFIED-PROVENANCE', 'CA-TEST-654321', 'CA-TEST-EXPIRED-COP');"))
+            admin_db.execute(text("DELETE FROM public.statutory_auditors WHERE auditor_id IN ('CA-UNVERIFIED-PROVENANCE', 'CA-TEST-654321', 'CA-TEST-EXPIRED-COP');"))
             admin_db.commit()
         except Exception:
             admin_db.rollback()

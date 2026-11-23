@@ -58,26 +58,9 @@ def upgrade() -> None:
     REVOKE ALL ON public.statutory_audit_signature_replays FROM app_service_user;
     GRANT SELECT, INSERT ON public.statutory_audit_signature_replays TO app_service_user;
 
-    -- 4. Seed Verified Statutory Auditors with Authentic ICAI 6-Digit Credentials and Approval Metadata
-    INSERT INTO public.statutory_auditors (
-        auditor_id, membership_no, firm_registration_no, name, role, cop_status, cop_valid_until, approved_by, is_revoked
-    ) VALUES 
-    (
-        'CA-ICAI-098765', '098765', '123456N', 'CA Rajesh Kumar', 'CHARTERED_ACCOUNTANT', 'ACTIVE', '2028-03-31', 'ICAI-VERIFIED-ADMIN-OFFICER-SYS', false
-    ),
-    (
-        'CA-ICAI-054321', '054321', '654321W', 'CA Priya Sharma', 'TAX_AUDITOR', 'ACTIVE', '2027-12-31', 'ICAI-VERIFIED-ADMIN-OFFICER-SYS', false
-    ),
-    (
-        'CA-REVOKED-011223', '011223', '112233S', 'CA Suresh Gupta', 'CHARTERED_ACCOUNTANT', 'SUSPENDED', '2024-03-31', 'ICAI-VERIFIED-ADMIN-OFFICER-SYS', true
-    )
-    ON CONFLICT (auditor_id) DO NOTHING;
-
-    -- Mark revocation timestamp and reason for revoked auditor
-    UPDATE public.statutory_auditors 
-    SET revoked_at = clock_timestamp(),
-        revocation_reason = 'ICAI Disciplinary Committee Order Ref DC/2025/088'
-    WHERE auditor_id = 'CA-REVOKED-011223' AND revoked_at IS NULL;
+    -- 4. In accordance with statutory auditor provenance defense, production database must never
+    -- seed fabricated demonstration auditor identities. Registry is populated exclusively via authenticated
+    -- onboarding workflows with verified ICAI/COP credentials.
     """)
 
 

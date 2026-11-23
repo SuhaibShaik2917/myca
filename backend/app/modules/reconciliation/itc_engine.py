@@ -1269,6 +1269,55 @@ def get_verified_statutory_auditor(verifier_id: str, db: Optional[Any] = None) -
             session.close()
 
 
+def authenticate_icai_verification_evidence(
+    membership_no: str,
+    verification_source: str,
+    verification_evidence_ref: Optional[str],
+    verified_at: Optional[datetime],
+    environment: Optional[str] = None
+) -> tuple[bool, str]:
+    """
+    Rigorously authenticates independent ICAI membership and COP verification evidence.
+    Precludes self-assertion of verification status by arbitrary callers.
+    Requires genuine gateway / portal verification evidence with valid timestamp.
+    Rejects MOCK_TEST_FIXTURE in production environments.
+    """
+    env = (environment or os.environ.get("ENVIRONMENT", "production")).strip().lower()
+    v_src = str(verification_source or "").strip()
+
+    # 1. Verification source statutory whitelist
+    if v_src not in ('MANUAL_REVIEW', 'ICAI_PORTAL_MANUAL_SEARCH', 'ICAI_DIGITAL_VERIFICATION_GATEWAY', 'MOCK_TEST_FIXTURE'):
+        return False, f"UNVERIFIED_AUDITOR_PROVENANCE: Unknown or unsupported verification source '{v_src}'."
+
+    # 2. Strict rejection of MOCK_TEST_FIXTURE in production
+    if v_src == "MOCK_TEST_FIXTURE" and env not in ("test", "testing", "development"):
+        return False, "UNVERIFIED_AUDITOR_PROVENANCE: MOCK_TEST_FIXTURE verification source is strictly prohibited in production statutory certification."
+
+    # 3. Verified at timestamp validation
+    if not verified_at:
+        return False, "UNVERIFIED_AUDITOR_PROVENANCE: Auditor verification timestamp 'verified_at' is missing or unrecorded."
+
+    v_dt = verified_at if verified_at.tzinfo else verified_at.replace(tzinfo=timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    if v_dt > now_utc + timedelta(minutes=5):
+        return False, f"UNVERIFIED_AUDITOR_PROVENANCE: Verification timestamp {v_dt.isoformat()} is in the future beyond allowed clock skew."
+
+    # 4. Verification evidence reference validation
+    v_ref = str(verification_evidence_ref or "").strip()
+    if not v_ref or len(v_ref) < 10:
+        return False, "UNVERIFIED_AUDITOR_PROVENANCE: Verification evidence reference 'verification_evidence_ref' is missing or insufficient length (min 10 chars)."
+
+    # Must match statutory gateway/portal verification pattern
+    pattern = r"^(ICAI-(GATEWAY|PORTAL|VERIF|REF|EVIDENCE)-[A-Z0-9_-]{6,}|SHA256:[a-f0-9]{64}|MOCK-(TEST|TRACE|FIXTURE)-[A-Z0-9_-]{6,})$"
+    if not re.match(pattern, v_ref, re.IGNORECASE):
+        return False, f"UNVERIFIED_AUDITOR_PROVENANCE: Evidence reference '{v_ref}' does not match statutory ICAI verification trace format."
+
+    if "MOCK" in v_ref.upper() and env not in ("test", "testing", "development"):
+        return False, "UNVERIFIED_AUDITOR_PROVENANCE: Mock evidence reference is strictly prohibited in production statutory certification."
+
+    return True, f"ICAI membership and COP verification independently authenticated via {v_src}."
+
+
 def onboard_verified_statutory_auditor(
     db: Any,
     auditor_id: str,
@@ -1280,15 +1329,17 @@ def onboard_verified_statutory_auditor(
     cop_status: str = "ACTIVE",
     cop_valid_until: Optional[date] = None,
     verification_source: str = "MANUAL_REVIEW",
-    verification_status: str = "PENDING_INDEPENDENT_VERIFICATION",
-    is_icai_verified: bool = False,
-    is_cop_verified: bool = False,
+    verification_status: Optional[str] = None,
+    is_icai_verified: Optional[bool] = None,
+    is_cop_verified: Optional[bool] = None,
     verified_at: Optional[datetime] = None,
     verification_evidence_ref: Optional[str] = None,
+    environment: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Onboards an auditor into the controlled database registry with explicit verification provenance.
-    Validates genuine 6-digit ICAI membership number, FRN, COP validity, and records approver metadata.
+    Onboards an auditor into the controlled database registry with independent verification provenance.
+    Validates genuine 6-digit ICAI membership number, FRN, mandatory non-synthesized COP validity,
+    authorized administrator approval, and authenticates independent verification evidence.
     """
     if not re.match(r"^[0-9]{6}$", str(membership_no).strip()):
         raise ValueError(f"Invalid ICAI membership number '{membership_no}': must be exactly 6 digits.")
@@ -1297,7 +1348,43 @@ def onboard_verified_statutory_auditor(
     if role not in AUTHORIZED_VERIFIER_ROLES:
         raise ValueError(f"Invalid auditor role '{role}': must be one of {AUTHORIZED_VERIFIER_ROLES}.")
 
-    valid_until = cop_valid_until or (date.today() + timedelta(days=365))
+    # Authenticate administrator approver
+    appr = str(approved_by or "").strip()
+    if not appr or len(appr) < 3:
+        raise ValueError("approved_by is mandatory: administrative approval officer must be identified.")
+
+    # Require explicit, non-synthesized COP validity date in the future
+    if cop_valid_until is None:
+        raise ValueError("cop_valid_until is mandatory and cannot be synthesized or omitted.")
+    if isinstance(cop_valid_until, datetime):
+        c_val = cop_valid_until.date()
+    else:
+        c_val = cop_valid_until
+    if c_val <= date.today():
+        raise ValueError(f"cop_valid_until ({c_val}) must be a future date; expired COP cannot be onboarded.")
+
+    # Authenticate independent verification evidence rather than trusting caller booleans
+    is_auth, auth_reason = authenticate_icai_verification_evidence(
+        membership_no=membership_no,
+        verification_source=verification_source,
+        verification_evidence_ref=verification_evidence_ref,
+        verified_at=verified_at,
+        environment=environment
+    )
+
+    if is_auth:
+        final_icai_verified = True
+        final_cop_verified = (cop_status == "ACTIVE" and c_val > date.today())
+        final_status = "INDEPENDENTLY_VERIFIED" if (final_icai_verified and final_cop_verified) else "VERIFICATION_FAILED"
+    else:
+        # If caller attempted to assert verification without valid authentic evidence, mark unverified
+        final_icai_verified = False
+        final_cop_verified = False
+        final_status = verification_status or "PENDING_INDEPENDENT_VERIFICATION"
+        if final_status == "INDEPENDENTLY_VERIFIED":
+            # Caller attempted self-assertion without authentic evidence!
+            final_status = "PENDING_INDEPENDENT_VERIFICATION"
+
     stmt = text("""
         INSERT INTO public.statutory_auditors (
             auditor_id, membership_no, firm_registration_no, name, role,
@@ -1336,12 +1423,12 @@ def onboard_verified_statutory_auditor(
         "name": name.strip(),
         "role": role.strip(),
         "cop": cop_status.strip(),
-        "until": valid_until,
-        "app_by": approved_by.strip(),
+        "until": c_val,
+        "app_by": appr,
         "v_src": verification_source.strip(),
-        "v_stat": verification_status.strip(),
-        "icai_v": is_icai_verified,
-        "cop_v": is_cop_verified,
+        "v_stat": final_status,
+        "icai_v": final_icai_verified,
+        "cop_v": final_cop_verified,
         "v_at": verified_at,
         "v_ref": verification_evidence_ref.strip() if verification_evidence_ref else None,
     }).fetchone()
@@ -1412,18 +1499,19 @@ def validate_auditor_credentials(verifier_id: str, claimed_role: str, db: Option
 
     # Validate COP validity date
     valid_until = profile.get("cop_valid_until")
-    if valid_until:
-        try:
-            if isinstance(valid_until, str):
-                v_dt = date.fromisoformat(valid_until)
-            elif isinstance(valid_until, datetime):
-                v_dt = valid_until.date()
-            else:
-                v_dt = valid_until
-            if date.today() > v_dt:
-                return False, f"EXPIRED_CREDENTIALS: Certificate of Practice expired on {v_dt}."
-        except Exception:
-            return False, "INVALID_VALIDITY_DATE: Unable to parse auditor cop_valid_until date."
+    if not valid_until:
+        return False, "MISSING_COP_VALIDITY: Auditor has no Certificate of Practice validity date registered."
+    try:
+        if isinstance(valid_until, str):
+            v_dt = date.fromisoformat(valid_until)
+        elif isinstance(valid_until, datetime):
+            v_dt = valid_until.date()
+        else:
+            v_dt = valid_until
+        if date.today() > v_dt:
+            return False, f"EXPIRED_CREDENTIALS: Certificate of Practice expired on {v_dt}."
+    except Exception:
+        return False, "INVALID_VALIDITY_DATE: Unable to parse auditor cop_valid_until date."
 
     # Verify presence of onboarding approval metadata
     if not profile.get("approved_by"):
@@ -1442,7 +1530,23 @@ def validate_auditor_credentials(verifier_id: str, claimed_role: str, db: Option
             f"statutory certification requires independent ICAI membership & COP verification."
         )
 
-    return True, f"Auditor {profile.get('name')} (ICAI #{mem_no}) independently verified active (Approved by {profile.get('approved_by')}, Verified via {profile.get('verification_source')})."
+    # Re-authenticate evidence provenance against independent statutory gateway rules
+    v_src = profile.get("verification_source")
+    v_ref = profile.get("verification_evidence_ref")
+    v_at = profile.get("verified_at")
+    env = os.environ.get("ENVIRONMENT", "production")
+
+    is_ev_valid, ev_reason = authenticate_icai_verification_evidence(
+        membership_no=mem_no,
+        verification_source=v_src,
+        verification_evidence_ref=v_ref,
+        verified_at=v_at,
+        environment=env
+    )
+    if not is_ev_valid:
+        return False, ev_reason
+
+    return True, f"Auditor {profile.get('name')} (ICAI #{mem_no}) independently verified active (Approved by {profile.get('approved_by')}, Verified via {v_src})."
 
 
 def validate_certification_timestamp(
@@ -1520,7 +1624,7 @@ def check_and_record_signature_replay(
             return False, "DATABASE_UNAVAILABLE: Active database session required for replay verification; in-memory fallback is prohibited."
 
     try:
-        # Pre-check existing token record
+        # 1. Pre-check existing token record for replay
         stmt_check = text("""
             SELECT doc_id, doc_number, verifier_id, expires_at 
             FROM public.statutory_audit_signature_replays 
@@ -1536,7 +1640,14 @@ def check_and_record_signature_replay(
                 )
             return False, f"SIGNATURE_REPLAY_DETECTED: Signature token has already been consumed for document '{did_str}'."
 
-        # Atomic insert with ON CONFLICT DO NOTHING
+        # 2. Strict rejection of expired tokens before acceptance or recording
+        now_utc = datetime.now(timezone.utc)
+        if expires_at is not None:
+            exp_check = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+            if exp_check <= now_utc:
+                return False, f"EXPIRED_TOKEN: Signature token expired at {exp_check.isoformat()}; expired tokens cannot be accepted or recorded."
+
+        # 3. Atomic insert with ON CONFLICT DO NOTHING
         stmt_ins = text("""
             INSERT INTO public.statutory_audit_signature_replays (
                 token_hash, doc_id, doc_number, verifier_id, certified_rate, total_tax, recorded_at, expires_at

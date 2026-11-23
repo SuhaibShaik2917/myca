@@ -4,6 +4,7 @@ Ensures reference data catalogs are seeded and manages isolated test statutory a
 """
 
 import os
+os.environ.setdefault("ENVIRONMENT", "test")
 import pytest
 from datetime import datetime, timezone
 from sqlalchemy import text
@@ -24,8 +25,14 @@ def ensure_reference_catalogs_seeded():
         if count == 0:
             seed_schemes_catalog_if_needed(session)
     except Exception as ex:
-        # Non-fatal if DB is not reachable during unit-only offline test collection
-        pass
+        # Fail visibly unless explicitly in offline unit test mode
+        if os.environ.get("MYCA_OFFLINE_TEST_MODE") == "1":
+            print(f"INFO [conftest]: Skipping reference catalog seeding in offline test mode: {ex}")
+        else:
+            raise RuntimeError(
+                f"Failed to seed reference catalogs in conftest.py. Ensure PostgreSQL is reachable or set "
+                f"MYCA_OFFLINE_TEST_MODE=1 for pure offline tests. Error: {ex}"
+            ) from ex
     finally:
         if session is not None:
             session.close()
@@ -64,7 +71,8 @@ def isolated_verified_auditor(admin_db_session):
         is_icai_verified=True,
         is_cop_verified=True,
         verified_at=now_utc,
-        verification_evidence_ref="ICAI-FIXTURE-EVIDENCE-999"
+        verification_evidence_ref="ICAI-EVIDENCE-FIXTURE-999",
+        environment="test"
     )
 
     yield verifier_id

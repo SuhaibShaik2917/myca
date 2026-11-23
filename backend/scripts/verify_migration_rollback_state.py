@@ -42,6 +42,36 @@ POLICIES_0020_8 = [
     "scheme_rules_read_all"
 ]
 
+FAKE_AUDITOR_IDS = ("CA-ICAI-098765", "CA-ICAI-054321", "CA-REVOKED-011223")
+
+def assert_zero_fake_auditors(conn, step_name: str):
+    """Assert zero fabricated or demonstration auditor identities exist in the database."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name = 'statutory_auditors'
+            );
+        """)
+        table_exists = cur.fetchone()[0]
+        if not table_exists:
+            print(f"  PASS: [{step_name}] Table public.statutory_auditors does not exist at this revision.")
+            return
+
+        cur.execute("""
+            SELECT auditor_id, name, membership_no FROM public.statutory_auditors
+            WHERE auditor_id IN ('CA-ICAI-098765', 'CA-ICAI-054321', 'CA-REVOKED-011223')
+               OR name ILIKE '%%Rajesh Kumar%%'
+               OR name ILIKE '%%Priya Sharma%%'
+               OR name ILIKE '%%Suresh Gupta%%';
+        """)
+        found = cur.fetchall()
+        assert len(found) == 0, (
+            f"SECURITY VIOLATION [{step_name}]: Fabricated demo auditor records found in public.statutory_auditors! "
+            f"Found: {found}"
+        )
+        print(f"  PASS: [{step_name}] Zero fabricated auditor records in public.statutory_auditors (verified clean).")
+
 def run_cmd(cmd_list):
     if cmd_list and cmd_list[0] == "alembic":
         cmd_list = [sys.executable, "-m", "alembic"] + cmd_list[1:]
@@ -155,6 +185,7 @@ def main():
 
     print("\n=== Step 1: Establish Baseline at 0019 & Verify Against Independent Reference ===")
     run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
+    assert_zero_fake_auditors(conn, "Step 1: Baseline 0019")
     baseline_0019 = capture_database_state(conn)
     print(f"  Captured 0019 Database State: {len(baseline_0019['grants'])} grants, {len(baseline_0019['policies'])} policies, {len(baseline_0019['rls_flags'])} tables.")
     assert baseline_0019["grants"] == trusted_ref["grants"], f"Grants mismatch with independent reference! Diff: {baseline_0019['grants'] ^ trusted_ref['grants']}"
@@ -164,6 +195,7 @@ def main():
 
     print("\n=== Step 2: Upgrade to Head (0023_auditor_provenance) ===")
     run_cmd(["alembic", "upgrade", "head"])
+    assert_zero_fake_auditors(conn, "Step 2: Head 0023")
     state_head = capture_database_state(conn)
     print(f"  Head State (0023): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
     assert len(state_head["grants"]) == 108, f"Expected 108 grants at 0023, got {len(state_head['grants'])}"
@@ -178,8 +210,16 @@ def main():
         assert len(matching) == 1, f"Policy {p_name} missing at 0023"
     print("PASS: Head state (0023) completely verified.")
 
+    print("\n=== Step 2b: Downgrade to 0022_statutory_auditors_replay & Verify Zero Fake Auditors ===")
+    run_cmd(["alembic", "downgrade", "0022_statutory_auditors_replay"])
+    assert_zero_fake_auditors(conn, "Step 2b: Intermediate Downgrade 0022")
+    run_cmd(["alembic", "upgrade", "head"])
+    assert_zero_fake_auditors(conn, "Step 2b: Re-upgrade to 0023")
+    print("PASS: Downgrade to 0022 and re-upgrade verified with zero fake auditor identities.")
+
     print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
     run_cmd(["alembic", "downgrade", "0020_m4_m5_grants_and_policies"])
+    assert_zero_fake_auditors(conn, "Step 3: Downgrade 0020")
     state_0020 = capture_database_state(conn)
     print(f"  State at 0020: {len(state_0020['grants'])} grants, {len(state_0020['policies'])} policies.")
     # Verify all 21 tables reverted to relforcerowsecurity=False
@@ -194,6 +234,7 @@ def main():
 
     print("\n=== Step 4: Downgrade to 0019_m3_gstr3b_filings & Assert Exact Baseline Match ===")
     run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
+    assert_zero_fake_auditors(conn, "Step 4: Downgrade 0019")
     rolled_back_state = capture_database_state(conn)
 
     # A. Assert all 8 0020 policies are completely removed
@@ -224,6 +265,7 @@ def main():
 
     print("\n=== Step 5: Re-Upgrade to Head (0023_auditor_provenance) ===")
     run_cmd(["alembic", "upgrade", "head"])
+    assert_zero_fake_auditors(conn, "Step 5: Final Re-upgrade 0023")
     final_head_state = capture_database_state(conn)
     assert final_head_state["grants"] == state_head["grants"]
     assert final_head_state["policies"] == state_head["policies"]

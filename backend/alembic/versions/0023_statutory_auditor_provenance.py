@@ -59,20 +59,6 @@ def downgrade() -> None:
         DROP COLUMN IF EXISTS verified_at,
         DROP COLUMN IF EXISTS verification_evidence_ref;
     """)
+    # NOTE: Never re-insert fabricated demonstration auditor identities on downgrade.
+    # Production registry must remain clean of fake credentials across all revisions.
 
-    # 2. Restore 0022 historical seed records for downgrade state parity
-    op.execute("""
-    INSERT INTO public.statutory_auditors (
-        auditor_id, membership_no, firm_registration_no, name, role, cop_status, cop_valid_until, approved_by, is_revoked
-    ) VALUES 
-    (
-        'CA-ICAI-098765', '098765', '123456N', 'CA Rajesh Kumar', 'CHARTERED_ACCOUNTANT', 'ACTIVE', '2028-03-31', 'ICAI-VERIFIED-ADMIN-OFFICER-SYS', false
-    ),
-    (
-        'CA-ICAI-054321', '054321', '654321W', 'CA Priya Sharma', 'TAX_AUDITOR', 'ACTIVE', '2027-12-31', 'ICAI-VERIFIED-ADMIN-OFFICER-SYS', false
-    ),
-    (
-        'CA-REVOKED-011223', '011223', '112233S', 'CA Suresh Gupta', 'CHARTERED_ACCOUNTANT', 'SUSPENDED', '2024-03-31', 'ICAI-VERIFIED-ADMIN-OFFICER-SYS', true
-    )
-    ON CONFLICT (auditor_id) DO NOTHING;
-    """)
