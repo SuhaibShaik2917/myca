@@ -113,10 +113,13 @@ File: `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py`
      - Asserts `total_itc_reversed = Decimal("0.00")`.
      - Asserts `net_itc_available = Decimal("28000.00")` (preserved for CA adjudication).
 6. `test_multi_line_invoice_exception_and_blocked_catering`:
-    - Evaluates multi-line invoices across 3 statutory scenarios:
+    - Evaluates multi-line invoices across 6 comprehensive statutory scenarios:
       - Scenario A (Explicit Line Tax): ₹2,000 catering reversed out of ₹5,000 total invoice tax, preserving ₹3,000 eligible repair credit.
-      - Scenario B (Proportional Tax Allocation): ₹2,000 catering reversed out of ₹6,000 total invoice tax based on ₹10,000 / ₹30,000 taxable value.
-      - Scenario C (Missing Line-Level Data Fallback): Mixed invoice without line-level tax or taxable values routes to `REVIEW_REQUIRED` with `risk_reversal_amount = Decimal("0.00")` and flags missing breakdown for CA adjudication.
+      - Scenario B1 (Rate-Aware Proportional Allocation): Vehicle repair at 18% (₹20,000 -> ₹3,600 tax) and catering at 5% (₹10,000 -> ₹500 tax), total tax ₹4,100; catering reversed at exactly ₹500.00, NOT ₹1,366.67 from an unweighted ratio.
+      - Scenario B2 (Explicit Line Tax Discrepancy Gate): Line taxes (₹3,000 + ₹1,500 = ₹4,500) fail to reconcile to invoice tax (₹5,000); routes to `REVIEW_REQUIRED` with `risk_reversal_amount = Decimal("0.00")`.
+      - Scenario C1 (Missing Rates on Mixed Lines): Line taxable values provided without GST rates; routes to `REVIEW_REQUIRED` with `0.00` reversal.
+      - Scenario C2 (Disallowed GST-Inclusive Total Amount Basis): Only `total_amount`/`line_total` provided without pure `taxable_value`; routes to `REVIEW_REQUIRED` with `0.00` reversal.
+      - Scenario C3 (Completely Missing Line Data): Invoices without line-level itemization route to `REVIEW_REQUIRED` with `0.00` reversal.
 
 ---
 
@@ -130,8 +133,12 @@ python scripts/verify_migration_rollback_state.py
 
 **Log Output:**
 ```text
-=== Step 1: Establish & Capture Baseline at 0019_m3_gstr3b_filings ===
-  Captured 0019 Baseline: 79 grants, 88 policies, 41 tables.
+Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json:
+  79 grants, 88 policies, 41 tables.
+
+=== Step 1: Establish Baseline at 0019 & Verify Against Independent Reference ===
+  Captured 0019 Database State: 79 grants, 88 policies, 41 tables.
+  PASS: Initial downgrade to 0019 matches independent trusted reference snapshot 100% (79 grants, 88 policies, 41 tables).
 
 === Step 2: Upgrade to Head (0021_enforce_tenant_force_rls) ===
   Head State (0021): 105 grants, 96 policies.
@@ -143,14 +150,14 @@ PASS: Downgrade to 0020 completely verified.
 
 === Step 4: Downgrade to 0019_m3_gstr3b_filings & Assert Exact Baseline Match ===
   PASS: All 8 policies from 0020 were cleanly dropped.
-  PASS: Exact match on all 79 role_table_grants for app_service_user.
-  PASS: Exact match on all 88 policies in pg_policies.
-  PASS: Exact match on all table RLS and FORCE RLS flags.
+  PASS: Exact match on all 79 role_table_grants against independent reference.
+  PASS: Exact match on all 88 policies against independent reference.
+  PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.
 
 === Step 5: Re-Upgrade to Head (0021_enforce_tenant_force_rls) ===
   PASS: Re-upgrade to head completely restored production security state.
 
-ALL MIGRATION ROLLBACK & BASELINE RESTORATION INVARIANTS 100% VERIFIED!
+ALL MIGRATION ROLLBACK & INDEPENDENT BASELINE REFERENCE INVARIANTS 100% VERIFIED!
 ```
 
 ---

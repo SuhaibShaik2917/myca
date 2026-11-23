@@ -38,7 +38,7 @@ VERDICT: B. 100% PRODUCT SCOPE COMPLETE — EXTERNAL RELEASE BLOCKERS REMAIN
      - **Seating Capacity Threshold:** Seating capacity $\le 13$ persons is BLOCKED; $> 13$ persons (14+ seats) is outside Section 17(5)(a) restriction (subject to Section 16 general conditions).
      - **Missing Seating Capacity:** Missing or unverified seating capacity on verified RC documents routes to `REVIEW_REQUIRED_FACTS_PENDING` (never silently defaulted to confirmed block).
      - **Unverified Context:** Invoices with missing or empty facts dictionaries route to `REVIEW_REQUIRED_FACTS_PENDING`.
-   - **Migration Rollback Baseline Exact Match:** Verified via `verify_migration_rollback_state.py`: captured exact baseline at `0019_m3_gstr3b_filings` (79 role table grants for `app_service_user`, 88 policies, 41 tables). Full rollback cycle `0021` &rarr; `0020` &rarr; `0019` compared against baseline matches 100% (0 missing grants, 0 extra grants, 0 missing policies, 0 extra policies, exact table RLS flags match). Re-upgraded cleanly to `0021`.
+   - **Independent Reference Migration Rollback Verification:** Verified via `verify_migration_rollback_state.py` against an independent, immutable pre-migration reference snapshot (`baseline_0019_reference.json`): 79 role table grants for `app_service_user`, 88 policies in `pg_policies`, 41 table RLS/FORCE RLS flags in `pg_class`. Both initial downgrade to 0019 and full rollback cycle `0021` &rarr; `0020` &rarr; `0019` match the independent reference snapshot 100% (0 missing, 0 extra). Re-upgraded cleanly to `0021`.
    - **Frontend Production Build Verified:** Vite + React 18 production build compiles 1,583 modules in 3.48s with 0 errors across all 8 dynamic views.
 
 2. **External Release Blockers (Pre-Production External Environment Boundaries):**
@@ -59,8 +59,8 @@ VERDICT: B. 100% PRODUCT SCOPE COMPLETE — EXTERNAL RELEASE BLOCKERS REMAIN
 | **Least-Privilege Grants** | Extra write grants on catalogues | **SELECT-only on reference catalogues; INSERT/UPDATE/DELETE rejected on both** | **VERIFIED** |
 | **Active DB Session User** | Implicit | **Explicitly asserted: `current_user = 'app_service_user'`** | **VERIFIED** |
 | **Multi-Tenant RLS** | Mixed FORCE RLS | **100% of 36 tenant tables have RLS=True & FORCE_RLS=True** | **VERIFIED** |
-| **11-Domain Cross-Tenant Write**| 3 tables tested | **100% isolation on all 11 core tables (UPDATE/DELETE 0 rows, INSERT rejected across all 11)** | **VERIFIED** |
-| **Multi-Line Tax Allocation** | Reversal on total tax | **Line tax / proportional split; unallocated routes to REVIEW_REQUIRED with 0 reversal** | **VERIFIED** |
+| **11-Domain Cross-Tenant Write**| 3 tables tested | **100% isolation on all 11 core tables (UPDATE/DELETE 0 rows, positive INSERT OK, spoofed INSERT caught with SQLSTATE 42501)** | **VERIFIED** |
+| **Multi-Line Tax Allocation** | Reversal on total tax | **Rate-aware line tax & proportional allocation; exact rounding reconciliation; discrepancy/missing data routes to review** | **VERIFIED** |
 | **Sec 17(5)(a)/(ab) Dual Standard**| Permit alone permitted | **Strictly dual: Permit AND actual taxable passenger transport use** | **VERIFIED** |
 | **Sec 17(5)(ab) Proviso (ii)**| Missing insured vehicle gate | **Insurer requires insured vehicle proof; Manufacturer requires license + nexus** | **VERIFIED** |
 | **Review-Required Downstream** | Reversal leakage risk | **Engine sets risk=0; GSTR-3B strictly excludes from Table 4(B)(1)** | **VERIFIED** |

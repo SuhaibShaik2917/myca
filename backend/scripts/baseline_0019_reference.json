@@ -1,0 +1,845 @@
+{
+  "revision": "0019_m3_gstr3b_filings",
+  "description": "Trusted pre-migration baseline catalog snapshot independently recorded for migration rollback verification",
+  "grants_count": 79,
+  "policies_count": 88,
+  "tables_count": 41,
+  "grants": [
+    [
+      "gst_registrations",
+      "DELETE"
+    ],
+    [
+      "gst_registrations",
+      "INSERT"
+    ],
+    [
+      "gst_registrations",
+      "SELECT"
+    ],
+    [
+      "gst_registrations",
+      "UPDATE"
+    ],
+    [
+      "gstr2b_imports",
+      "DELETE"
+    ],
+    [
+      "gstr2b_imports",
+      "INSERT"
+    ],
+    [
+      "gstr2b_imports",
+      "SELECT"
+    ],
+    [
+      "gstr2b_imports",
+      "UPDATE"
+    ],
+    [
+      "gstr2b_snapshots",
+      "DELETE"
+    ],
+    [
+      "gstr2b_snapshots",
+      "INSERT"
+    ],
+    [
+      "gstr2b_snapshots",
+      "SELECT"
+    ],
+    [
+      "gstr2b_snapshots",
+      "UPDATE"
+    ],
+    [
+      "gstr2b_source_documents",
+      "DELETE"
+    ],
+    [
+      "gstr2b_source_documents",
+      "INSERT"
+    ],
+    [
+      "gstr2b_source_documents",
+      "SELECT"
+    ],
+    [
+      "gstr2b_source_documents",
+      "UPDATE"
+    ],
+    [
+      "gstr2b_unbooked_candidates",
+      "DELETE"
+    ],
+    [
+      "gstr2b_unbooked_candidates",
+      "INSERT"
+    ],
+    [
+      "gstr2b_unbooked_candidates",
+      "SELECT"
+    ],
+    [
+      "gstr2b_unbooked_candidates",
+      "UPDATE"
+    ],
+    [
+      "gstr3b_filings",
+      "DELETE"
+    ],
+    [
+      "gstr3b_filings",
+      "INSERT"
+    ],
+    [
+      "gstr3b_filings",
+      "SELECT"
+    ],
+    [
+      "gstr3b_filings",
+      "UPDATE"
+    ],
+    [
+      "human_resolution_events",
+      "DELETE"
+    ],
+    [
+      "human_resolution_events",
+      "INSERT"
+    ],
+    [
+      "human_resolution_events",
+      "SELECT"
+    ],
+    [
+      "human_resolution_events",
+      "UPDATE"
+    ],
+    [
+      "ims_action_history",
+      "DELETE"
+    ],
+    [
+      "ims_action_history",
+      "INSERT"
+    ],
+    [
+      "ims_action_history",
+      "SELECT"
+    ],
+    [
+      "ims_action_history",
+      "UPDATE"
+    ],
+    [
+      "ims_document_actions",
+      "DELETE"
+    ],
+    [
+      "ims_document_actions",
+      "INSERT"
+    ],
+    [
+      "ims_document_actions",
+      "SELECT"
+    ],
+    [
+      "ims_document_actions",
+      "UPDATE"
+    ],
+    [
+      "itc_assessments",
+      "DELETE"
+    ],
+    [
+      "itc_assessments",
+      "INSERT"
+    ],
+    [
+      "itc_assessments",
+      "SELECT"
+    ],
+    [
+      "itc_assessments",
+      "UPDATE"
+    ],
+    [
+      "itc_ledger_entries",
+      "INSERT"
+    ],
+    [
+      "itc_ledger_entries",
+      "SELECT"
+    ],
+    [
+      "itc_reavailment_events",
+      "DELETE"
+    ],
+    [
+      "itc_reavailment_events",
+      "INSERT"
+    ],
+    [
+      "itc_reavailment_events",
+      "SELECT"
+    ],
+    [
+      "itc_reavailment_events",
+      "UPDATE"
+    ],
+    [
+      "itc_reversal_events",
+      "DELETE"
+    ],
+    [
+      "itc_reversal_events",
+      "INSERT"
+    ],
+    [
+      "itc_reversal_events",
+      "SELECT"
+    ],
+    [
+      "itc_reversal_events",
+      "UPDATE"
+    ],
+    [
+      "itc_rule_catalogue",
+      "SELECT"
+    ],
+    [
+      "purchase_documents",
+      "DELETE"
+    ],
+    [
+      "purchase_documents",
+      "INSERT"
+    ],
+    [
+      "purchase_documents",
+      "SELECT"
+    ],
+    [
+      "purchase_documents",
+      "UPDATE"
+    ],
+    [
+      "purchase_line_items",
+      "DELETE"
+    ],
+    [
+      "purchase_line_items",
+      "INSERT"
+    ],
+    [
+      "purchase_line_items",
+      "SELECT"
+    ],
+    [
+      "purchase_line_items",
+      "UPDATE"
+    ],
+    [
+      "purchase_payment_allocations",
+      "DELETE"
+    ],
+    [
+      "purchase_payment_allocations",
+      "INSERT"
+    ],
+    [
+      "purchase_payment_allocations",
+      "SELECT"
+    ],
+    [
+      "purchase_payment_allocations",
+      "UPDATE"
+    ],
+    [
+      "purchase_payments",
+      "DELETE"
+    ],
+    [
+      "purchase_payments",
+      "INSERT"
+    ],
+    [
+      "purchase_payments",
+      "SELECT"
+    ],
+    [
+      "purchase_payments",
+      "UPDATE"
+    ],
+    [
+      "reconciliation_matches",
+      "DELETE"
+    ],
+    [
+      "reconciliation_matches",
+      "INSERT"
+    ],
+    [
+      "reconciliation_matches",
+      "SELECT"
+    ],
+    [
+      "reconciliation_matches",
+      "UPDATE"
+    ],
+    [
+      "reconciliation_runs",
+      "DELETE"
+    ],
+    [
+      "reconciliation_runs",
+      "INSERT"
+    ],
+    [
+      "reconciliation_runs",
+      "SELECT"
+    ],
+    [
+      "reconciliation_runs",
+      "UPDATE"
+    ],
+    [
+      "reconciliation_variances",
+      "DELETE"
+    ],
+    [
+      "reconciliation_variances",
+      "INSERT"
+    ],
+    [
+      "reconciliation_variances",
+      "SELECT"
+    ],
+    [
+      "reconciliation_variances",
+      "UPDATE"
+    ]
+  ],
+  "policies": [
+    [
+      "business_profiles",
+      "business_profiles_admin"
+    ],
+    [
+      "business_profiles",
+      "business_profiles_tenant"
+    ],
+    [
+      "business_profiles",
+      "business_profiles_worker"
+    ],
+    [
+      "documents",
+      "documents_admin"
+    ],
+    [
+      "documents",
+      "documents_tenant"
+    ],
+    [
+      "documents",
+      "documents_worker"
+    ],
+    [
+      "financial_summaries",
+      "fin_summaries_admin"
+    ],
+    [
+      "financial_summaries",
+      "fin_summaries_tenant"
+    ],
+    [
+      "financial_summaries",
+      "fin_summaries_worker"
+    ],
+    [
+      "financial_transactions",
+      "fin_tx_admin"
+    ],
+    [
+      "financial_transactions",
+      "fin_tx_tenant"
+    ],
+    [
+      "global_users",
+      "global_users_owner_select"
+    ],
+    [
+      "global_users",
+      "global_users_platform_admin"
+    ],
+    [
+      "goods_receipt_lot_ledger",
+      "goods_receipt_lot_admin"
+    ],
+    [
+      "goods_receipt_lot_ledger",
+      "goods_receipt_lot_tenant"
+    ],
+    [
+      "gst_records",
+      "gst_records_admin"
+    ],
+    [
+      "gst_records",
+      "gst_records_tenant"
+    ],
+    [
+      "gst_records",
+      "gst_records_worker"
+    ],
+    [
+      "gst_registrations",
+      "gst_reg_platform_admin"
+    ],
+    [
+      "gst_registrations",
+      "gst_reg_tenant_isolation"
+    ],
+    [
+      "gstr2b_imports",
+      "gstr2b_imports_admin"
+    ],
+    [
+      "gstr2b_imports",
+      "gstr2b_imports_tenant"
+    ],
+    [
+      "gstr2b_snapshots",
+      "gstr2b_snapshots_admin"
+    ],
+    [
+      "gstr2b_snapshots",
+      "gstr2b_snapshots_tenant"
+    ],
+    [
+      "gstr2b_source_documents",
+      "gstr2b_docs_admin"
+    ],
+    [
+      "gstr2b_source_documents",
+      "gstr2b_docs_tenant"
+    ],
+    [
+      "gstr2b_unbooked_candidates",
+      "gstr2b_unbooked_candidates_admin"
+    ],
+    [
+      "gstr2b_unbooked_candidates",
+      "gstr2b_unbooked_candidates_tenant"
+    ],
+    [
+      "gstr3b_filings",
+      "gstr3b_filings_admin"
+    ],
+    [
+      "gstr3b_filings",
+      "gstr3b_filings_tenant"
+    ],
+    [
+      "human_resolution_events",
+      "human_resolutions_admin"
+    ],
+    [
+      "human_resolution_events",
+      "human_resolutions_tenant"
+    ],
+    [
+      "ims_action_history",
+      "ims_history_admin"
+    ],
+    [
+      "ims_action_history",
+      "ims_history_tenant"
+    ],
+    [
+      "ims_document_actions",
+      "ims_actions_admin"
+    ],
+    [
+      "ims_document_actions",
+      "ims_actions_tenant"
+    ],
+    [
+      "invoice_line_items",
+      "invoice_lines_admin"
+    ],
+    [
+      "invoice_line_items",
+      "invoice_lines_ocr_writer_policy"
+    ],
+    [
+      "invoice_line_items",
+      "invoice_lines_tenant"
+    ],
+    [
+      "invoice_line_items",
+      "invoice_lines_worker"
+    ],
+    [
+      "invoices",
+      "invoices_admin"
+    ],
+    [
+      "invoices",
+      "invoices_ocr_writer_policy"
+    ],
+    [
+      "invoices",
+      "invoices_tenant"
+    ],
+    [
+      "invoices",
+      "invoices_worker"
+    ],
+    [
+      "itc_assessments",
+      "itc_assessments_admin"
+    ],
+    [
+      "itc_assessments",
+      "itc_assessments_tenant"
+    ],
+    [
+      "itc_ledger_entries",
+      "itc_ledger_admin"
+    ],
+    [
+      "itc_ledger_entries",
+      "itc_ledger_tenant"
+    ],
+    [
+      "itc_reavailment_events",
+      "itc_reavailments_admin"
+    ],
+    [
+      "itc_reavailment_events",
+      "itc_reavailments_tenant"
+    ],
+    [
+      "itc_reversal_events",
+      "itc_reversals_admin"
+    ],
+    [
+      "itc_reversal_events",
+      "itc_reversals_tenant"
+    ],
+    [
+      "organization_memberships",
+      "org_memberships_admin"
+    ],
+    [
+      "organization_memberships",
+      "org_memberships_tenant"
+    ],
+    [
+      "organization_memberships",
+      "org_memberships_view_owner"
+    ],
+    [
+      "organizations",
+      "org_platform_admin"
+    ],
+    [
+      "organizations",
+      "org_tenant_isolation"
+    ],
+    [
+      "purchase_documents",
+      "purchase_docs_admin"
+    ],
+    [
+      "purchase_documents",
+      "purchase_docs_tenant"
+    ],
+    [
+      "purchase_line_items",
+      "purchase_lines_admin"
+    ],
+    [
+      "purchase_line_items",
+      "purchase_lines_tenant"
+    ],
+    [
+      "purchase_payment_allocations",
+      "purchase_pay_alloc_admin"
+    ],
+    [
+      "purchase_payment_allocations",
+      "purchase_pay_alloc_tenant"
+    ],
+    [
+      "purchase_payments",
+      "purchase_payments_admin"
+    ],
+    [
+      "purchase_payments",
+      "purchase_payments_tenant"
+    ],
+    [
+      "receipt_remediation_audit",
+      "receipt_remediation_audit_admin"
+    ],
+    [
+      "receipt_remediation_audit",
+      "receipt_remediation_audit_tenant"
+    ],
+    [
+      "reconciliation_matches",
+      "recon_matches_admin"
+    ],
+    [
+      "reconciliation_matches",
+      "recon_matches_tenant"
+    ],
+    [
+      "reconciliation_runs",
+      "recon_runs_admin"
+    ],
+    [
+      "reconciliation_runs",
+      "recon_runs_tenant"
+    ],
+    [
+      "reconciliation_variances",
+      "recon_variances_admin"
+    ],
+    [
+      "reconciliation_variances",
+      "recon_variances_tenant"
+    ],
+    [
+      "scheme_matches",
+      "scheme_matches_admin"
+    ],
+    [
+      "scheme_matches",
+      "scheme_matches_tenant"
+    ],
+    [
+      "scheme_matches",
+      "scheme_matches_worker"
+    ],
+    [
+      "summary_transactions",
+      "summary_tx_admin"
+    ],
+    [
+      "summary_transactions",
+      "summary_tx_tenant"
+    ],
+    [
+      "worker_service_authorizations",
+      "worker_auth_admin"
+    ],
+    [
+      "worker_service_authorizations",
+      "worker_auth_ocr_writer"
+    ],
+    [
+      "worker_service_authorizations",
+      "worker_auth_queue_owner"
+    ],
+    [
+      "worker_service_authorizations",
+      "worker_auth_self_select"
+    ],
+    [
+      "worker_tasks",
+      "worker_tasks_ocr_writer_select_policy"
+    ],
+    [
+      "worker_tasks",
+      "worker_tasks_ocr_writer_update_policy"
+    ],
+    [
+      "worker_tasks",
+      "worker_tasks_platform_admin_policy"
+    ],
+    [
+      "worker_tasks",
+      "worker_tasks_queue_owner_policy"
+    ],
+    [
+      "worker_tasks",
+      "worker_tasks_tenant_select"
+    ],
+    [
+      "worker_tasks",
+      "worker_tasks_worker_select_policy"
+    ]
+  ],
+  "rls_flags": {
+    "alembic_version": {
+      "relrowsecurity": false,
+      "relforcerowsecurity": false
+    },
+    "business_profiles": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "documents": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "financial_summaries": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "financial_transactions": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "global_users": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "goods_receipt_lot_ledger": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "government_schemes": {
+      "relrowsecurity": false,
+      "relforcerowsecurity": false
+    },
+    "gst_records": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "gst_registrations": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "gstr2b_imports": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "gstr2b_snapshots": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "gstr2b_source_documents": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "gstr2b_unbooked_candidates": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "gstr3b_filings": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "human_resolution_events": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "ims_action_history": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "ims_document_actions": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "invoice_line_items": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "invoice_transition_rules": {
+      "relrowsecurity": false,
+      "relforcerowsecurity": false
+    },
+    "invoices": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "itc_assessments": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "itc_ledger_entries": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "itc_reavailment_events": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "itc_reversal_events": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "itc_rule_catalogue": {
+      "relrowsecurity": false,
+      "relforcerowsecurity": false
+    },
+    "organization_memberships": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "organizations": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "purchase_documents": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "purchase_line_items": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "purchase_payment_allocations": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "purchase_payments": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "receipt_remediation_audit": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "reconciliation_matches": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "reconciliation_runs": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "reconciliation_variances": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": false
+    },
+    "scheme_eligibility_rules": {
+      "relrowsecurity": false,
+      "relforcerowsecurity": false
+    },
+    "scheme_matches": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "summary_transactions": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "worker_service_authorizations": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    },
+    "worker_tasks": {
+      "relrowsecurity": true,
+      "relforcerowsecurity": true
+    }
+  }
+}

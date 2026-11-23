@@ -1106,33 +1106,7 @@ def evaluate_section_17_5_vehicle_and_repair_eligibility(
     }
 
 
-def _resolve_line_tax_allocation(line: dict, all_lines: list, total_invoice_tax: Decimal) -> tuple[Decimal, bool]:
-    """
-    Allocates tax to an individual line item from a purchase document.
-    Returns (allocated_tax, is_uncertain_allocation).
-
-    1. If there is only one line (or no itemization), allocated tax is total invoice tax (not uncertain).
-    2. If there are multiple lines and the line provides explicit tax amounts (e.g. tax_amount or cgst+sgst+igst),
-       use the explicit line tax (not uncertain).
-    3. If there are multiple lines and all lines provide taxable values (or line totals),
-       allocate proportionally: (total_invoice_tax * line_value / sum_of_line_values) (not uncertain).
-    4. If there are multiple lines with different statutory treatments but line-level tax and
-       proportional values are missing/zero, allocation cannot be deterministically resolved
-       without improperly reversing tax belonging to eligible lines -> returns (Decimal("0.00"), True).
-    """
-    if len(all_lines) <= 1:
-        return total_invoice_tax, False
-
-    # Check explicit line tax
-    for tax_key in ["tax_amount", "total_tax", "line_tax"]:
-        if line.get(tax_key) is not None:
-            try:
-                val = Decimal(str(line[tax_key]))
-                if val >= Decimal("0.00"):
-                    return val, False
-            except Exception:
-                pass
-
+def _extract_explicit_line_tax(line: dict) -> Optional[Decimal]:
     comp_keys = [
         ("cgst_amount", "central_tax"),
         ("sgst_amount", "state_ut_tax"),
@@ -1150,35 +1124,139 @@ def _resolve_line_tax_allocation(line: dict, all_lines: list, total_invoice_tax:
             except Exception:
                 pass
     if has_comp and comp_sum >= Decimal("0.00"):
-        return comp_sum, False
+        return comp_sum
 
-    # Check proportional allocation using line taxable / total values
-    val_keys = ["taxable_value", "taxable_amount", "total_amount", "line_total", "total_value", "item_total"]
-    all_have_vals = True
-    line_val = None
-    total_val = Decimal("0.00")
-    for l in all_lines:
-        found_val = None
-        for vk in val_keys:
-            if l.get(vk) is not None:
-                try:
-                    found_val = Decimal(str(l[vk]))
-                    break
-                except Exception:
-                    pass
-        if found_val is None or found_val < Decimal("0.00"):
-            all_have_vals = False
-            break
-        total_val += found_val
-        if l is line:
-            line_val = found_val
+    for tax_key in ["tax_amount", "total_tax", "line_tax"]:
+        if line.get(tax_key) is not None:
+            try:
+                val = Decimal(str(line[tax_key]))
+                if val >= Decimal("0.00"):
+                    return val
+            except Exception:
+                pass
+    return None
 
-    if all_have_vals and line_val is not None and total_val > Decimal("0.00"):
-        allocated = (total_invoice_tax * line_val / total_val).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        return allocated, False
 
-    # Multi-line item without line-level tax or taxable value -> uncertain
-    return Decimal("0.00"), True
+def _extract_pure_taxable_value(line: dict) -> Optional[Decimal]:
+    # Strictly pure taxable values only: do NOT accept total_amount or line_total as they may include GST!
+    for val_key in ["taxable_value", "taxable_amount"]:
+        if line.get(val_key) is not None:
+            try:
+                val = Decimal(str(line[val_key]))
+                if val >= Decimal("0.00"):
+                    return val
+            except Exception:
+                pass
+    return None
+
+
+def _extract_line_rate(line: dict, fallback_header_rate: Optional[Decimal] = None) -> Optional[Decimal]:
+    for r_key in ["gst_rate", "tax_rate", "rate", "tax_percentage", "gst_pct"]:
+        if line.get(r_key) is not None:
+            raw = str(line[r_key]).strip().rstrip("%")
+            try:
+                rate_val = Decimal(raw)
+                if Decimal("0.00") <= rate_val < Decimal("1.00"):
+                    return (rate_val * Decimal("100")).quantize(Decimal("0.01"))
+                elif rate_val >= Decimal("1.00"):
+                    return rate_val.quantize(Decimal("0.01"))
+                elif rate_val == Decimal("0.00"):
+                    return Decimal("0.00")
+            except Exception:
+                pass
+    return fallback_header_rate
+
+
+def resolve_invoice_tax_allocations(
+    all_lines: list,
+    total_invoice_tax: Decimal,
+    header_rate: Optional[Decimal] = None
+) -> tuple[Dict[int, Decimal], bool, str]:
+    """
+    Rigorously resolves and validates tax allocations across all invoice line items.
+
+    Statutory Requirements:
+    1. Single line: 100% of invoice tax allocated.
+    2. Explicit line taxes: Verified line-level components (cgst, sgst, igst, cess or tax_amount).
+       Must reconcile against total invoice tax within a 5-paise rounding tolerance.
+       Rounding difference is reconciled to the largest item.
+       If explicit line taxes do not add up to invoice tax, routes to CA review.
+    3. Rate-aware proportional allocation:
+       - Uses strictly pure taxable values (taxable_value / taxable_amount); never total_amount / line_total.
+       - Accounts for the applicable rate and tax head on each line.
+       - Reconciles rounding differences across all lines so sum equals invoice tax exactly.
+       - If rates are omitted/unknown across mixed lines, or theoretical taxes do not reconcile, routes to CA review.
+    """
+    if len(all_lines) <= 1:
+        return {0: total_invoice_tax}, False, "Single line item; 100% tax allocated."
+
+    # 1. Prefer explicit line-level tax components
+    explicit_taxes = [_extract_explicit_line_tax(l) for l in all_lines]
+    if all(t is not None for t in explicit_taxes):
+        sum_explicit = sum(explicit_taxes)
+        diff = total_invoice_tax - sum_explicit
+        if abs(diff) <= Decimal("0.05"):
+            allocated = list(explicit_taxes)
+            max_idx = allocated.index(max(allocated))
+            allocated[max_idx] += diff
+            return {i: allocated[i] for i in range(len(all_lines))}, False, "Explicit line taxes reconciled."
+        else:
+            return {}, True, f"Sum of explicit line taxes ({sum_explicit}) does not reconcile with total invoice tax ({total_invoice_tax}). Discrepancy: {diff}."
+
+    # 2. Rate-Aware Proportional Allocation
+    pure_taxables = [_extract_pure_taxable_value(l) for l in all_lines]
+    if any(tv is None for tv in pure_taxables):
+        return {}, True, "One or more line items lack pure taxable value (total_amount / line_total excluded as potential GST-inclusive amounts)."
+
+    sum_taxable = sum(pure_taxables)
+    if sum_taxable <= Decimal("0.00"):
+        return {}, True, "Sum of pure taxable values is zero or negative."
+
+    rates = [_extract_line_rate(l, fallback_header_rate=header_rate) for l in all_lines]
+    if any(r is None for r in rates):
+        return {}, True, "Applicable GST rates are missing on one or more line items with mixed statutory treatments."
+
+    theoretical_taxes = [
+        (tv * rate / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        for tv, rate in zip(pure_taxables, rates)
+    ]
+    sum_theoretical = sum(theoretical_taxes)
+
+    if sum_theoretical > Decimal("0.00"):
+        diff = total_invoice_tax - sum_theoretical
+        if abs(diff) <= Decimal("0.05"):
+            allocated = list(theoretical_taxes)
+            max_idx = allocated.index(max(allocated))
+            allocated[max_idx] += diff
+            return {i: allocated[i] for i in range(len(all_lines))}, False, "Rate-aware line tax computed and reconciled to invoice tax."
+        elif abs(diff) <= Decimal("1.00"):
+            raw_alloc = [
+                (total_invoice_tax * (t / sum_theoretical)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                for t in theoretical_taxes
+            ]
+            max_idx = raw_alloc.index(max(raw_alloc))
+            raw_alloc[max_idx] += (total_invoice_tax - sum(raw_alloc))
+            return {i: raw_alloc[i] for i in range(len(all_lines))}, False, "Rate-aware proportional allocation reconciled to invoice tax."
+        else:
+            return {}, True, f"Theoretical tax ({sum_theoretical}) from line rates and taxable values does not reconcile with invoice tax ({total_invoice_tax})."
+
+    return {}, True, "Unable to deterministically allocate tax across lines without guessing."
+
+
+def _resolve_line_tax_allocation(
+    line: dict,
+    all_lines: list,
+    total_invoice_tax: Decimal,
+    header_rate: Optional[Decimal] = None
+) -> tuple[Decimal, bool]:
+    alloc_map, is_uncertain, _ = resolve_invoice_tax_allocations(all_lines, total_invoice_tax, header_rate=header_rate)
+    if is_uncertain:
+        return Decimal("0.00"), True
+    try:
+        idx = all_lines.index(line)
+        return alloc_map.get(idx, Decimal("0.00")), False
+    except ValueError:
+        return Decimal("0.00"), True
 
 
 class StatutoryITCRiskEngine:
@@ -1465,7 +1543,8 @@ class StatutoryITCRiskEngine:
         for line in items:
             item_desc = (line.get("item_description") or "").lower()
             hsn = str(line.get("hsn_sac_code") or "")
-            line_tax, is_alloc_uncertain = _resolve_line_tax_allocation(line, items, total_tax)
+            top_rate = _extract_line_rate(purchase_doc)
+            line_tax, is_alloc_uncertain = _resolve_line_tax_allocation(line, items, total_tax, header_rate=top_rate)
 
             # Motor Vehicles 17(5)(a) & Repair/Maintenance 17(5)(ab)
             if (

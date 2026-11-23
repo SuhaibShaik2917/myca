@@ -597,17 +597,29 @@ def test_review_required_preservation_in_itc_engine_and_gstr3b():
 
 def test_multi_line_invoice_exception_and_blocked_catering():
     """
-    Edge Case: Multi-line purchase document containing:
+    Comprehensive Statutory Validation for Multi-Line Mixed Invoices:
     - Line 1: Vehicle repair qualifying for Section 17(5)(ab) manufacturer exception (is_blocked = False).
     - Line 2: Food & catering service (HSN 9963) blocked under Section 17(5)(b).
 
     Verifies:
-    1. Line-level tax allocation: When explicit line tax is provided, only the blocked line's
-       tax (₹2,000) is reversed, preserving the eligible line's tax (₹3,000).
-    2. Proportional allocation: When taxable values are provided, tax is allocated proportionally.
-    3. Missing data fallback: When multi-line invoice lacks line tax breakdown or itemized values,
-       calculation routes to REVIEW_REQUIRED with risk_reversal_amount = 0.00 rather than assuming
-       the entire invoice tax belongs to the blocked line.
+    1. Scenario A: Explicit Line-Level Tax Allocation:
+       - Exact line components (₹2,000 catering reversed out of ₹5,000 total invoice tax).
+    2. Scenario B1: Rate-Aware Proportional Allocation:
+       - Vehicle repair taxed at 18% (₹20,000 taxable -> ₹3,600 tax).
+       - Catering dinner taxed at 5% (₹10,000 taxable -> ₹500 tax).
+       - Total invoice tax = ₹4,100.
+       - Confirms catering reversal is ₹500.00, NOT ₹1,366.67 from an unweighted taxable value ratio.
+    3. Scenario B2: Explicit Line Tax Discrepancy Gate:
+       - Line taxes (₹3,000 + ₹1,500) fail to reconcile with invoice tax (₹5,000).
+       - Routes to REVIEW_REQUIRED with risk_reversal_amount = Decimal("0.00") for CA review.
+    4. Scenario C1: Missing Applicable GST Rates:
+       - Mixed statutory lines without rate specifications cannot be assumed equal;
+         routes to REVIEW_REQUIRED with risk_reversal_amount = Decimal("0.00").
+    5. Scenario C2: Disallowed GST-Inclusive Total Amount Basis:
+       - Only total_amount/line_total provided without pure taxable_value;
+         routes to REVIEW_REQUIRED with risk_reversal_amount = Decimal("0.00").
+    6. Scenario C3: Completely Missing Line Breakdown:
+       - Missing line-level tax and taxable values route to REVIEW_REQUIRED with 0.00 reversal.
     """
     from datetime import date
     from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
@@ -616,7 +628,7 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     engine = StatutoryITCRiskEngine()
     today = date(2026, 11, 23)
 
-    # 1. Scenario A: Explicit Line-Level Tax Allocation
+    # 1. Scenario A: Explicit Line-Level Tax Allocation (Reconciled)
     p_doc_explicit = {
         "id": "p_multi_line_explicit",
         "document_number": "INV-MULTI-001",
@@ -668,22 +680,113 @@ def test_multi_line_invoice_exception_and_blocked_catering():
 
     food_eval = next(e for e in evals_explicit if e.rule_code == "SEC_17_5_FOOD")
     assert food_eval.eligibility_status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR
-    # Crucial assertion: Line-level reversal is ₹2,000, NOT the entire invoice tax ₹5,000!
+    # Reversal is exactly the line tax of ₹2,000, preserving ₹3,000 eligible repair credit
     assert food_eval.risk_reversal_amount == Decimal("2000.00")
     assert food_eval.potential_itc == Decimal("2000.00")
 
-    # 2. Scenario B: Proportional Tax Allocation via Itemized Taxable Values
-    p_doc_prop = {
-        "id": "p_multi_line_prop",
+    # 2. Scenario B1: Rate-Aware Proportional Tax Allocation (Mixed 18% and 5% Rates)
+    p_doc_rate_aware = {
+        "id": "p_multi_line_rate_aware",
         "document_number": "INV-MULTI-002",
         "document_date": "2026-11-01",
-        "cgst_amount": Decimal("3000.00"),
-        "sgst_amount": Decimal("3000.00"),
+        "cgst_amount": Decimal("2050.00"),
+        "sgst_amount": Decimal("2050.00"),
         "igst_amount": Decimal("0.00"),
         "cess_amount": Decimal("0.00"),
-        "total_invoice_value": Decimal("36000.00"),
+        "total_invoice_value": Decimal("34100.00"),
         "goods_receipt_date": "2026-11-02",
         "goods_receipt_note_ref": "GRN-MULTI-2",
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "taxable_value": Decimal("20000.00"),
+                "gst_rate": Decimal("18.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "taxable_value": Decimal("10000.00"),
+                "gst_rate": Decimal("5.00")
+            }
+        ]
+    }
+
+    g_doc_rate_aware = {
+        "id": "g_multi_2",
+        "section_name": "B2B",
+        "itc_availability": "available",
+        "central_tax": Decimal("2050.00"),
+        "state_ut_tax": Decimal("2050.00"),
+        "integrated_tax": Decimal("0.00"),
+        "cess_amount": Decimal("0.00"),
+        "document_number": "INV-MULTI-002",
+        "document_date": "2026-11-01"
+    }
+
+    evals_rate = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_rate_aware,
+        gstr2b_doc=g_doc_rate_aware,
+        evaluation_date=today
+    )
+
+    food_eval_rate = next(e for e in evals_rate if e.rule_code == "SEC_17_5_FOOD")
+    # Rate-aware calculation: ₹10,000 @ 5% = ₹500.00 (NOT ₹1,366.67 from an unweighted ratio!)
+    assert food_eval_rate.eligibility_status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR
+    assert food_eval_rate.risk_reversal_amount == Decimal("500.00")
+    assert food_eval_rate.potential_itc == Decimal("500.00")
+
+    # 3. Scenario B2: Explicit Line Tax Discrepancy Gate
+    p_doc_mismatch = {
+        "id": "p_multi_line_mismatch",
+        "document_number": "INV-MULTI-002B",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2500.00"),
+        "sgst_amount": Decimal("2500.00"),
+        "total_invoice_value": Decimal("30000.00"),
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "tax_amount": Decimal("3000.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "tax_amount": Decimal("1500.00")  # 3000 + 1500 = 4500 != 5000 invoice tax
+            }
+        ]
+    }
+
+    evals_mismatch = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_mismatch,
+        gstr2b_doc=g_doc_explicit,
+        evaluation_date=today
+    )
+    food_eval_mismatch = next(e for e in evals_mismatch if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_mismatch.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_mismatch.risk_reversal_amount == Decimal("0.00")
+
+    # 4. Scenario C1: Missing Applicable Rates on Mixed Statutory Lines
+    p_doc_no_rate = {
+        "id": "p_multi_line_no_rate",
+        "document_number": "INV-MULTI-003A",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2050.00"),
+        "sgst_amount": Decimal("2050.00"),
+        "total_invoice_value": Decimal("34100.00"),
         "line_items": [
             {
                 "item_description": "Factory vehicle test track repair",
@@ -700,37 +803,63 @@ def test_multi_line_invoice_exception_and_blocked_catering():
                 "item_description": "Executive corporate catering dinner",
                 "hsn_sac_code": "996331",
                 "taxable_value": Decimal("10000.00")
+                # Missing rate: cannot assume uniform rates across catering and vehicle repair!
             }
         ]
     }
 
-    g_doc_prop = {
-        "id": "g_multi_2",
-        "section_name": "B2B",
-        "itc_availability": "available",
-        "central_tax": Decimal("3000.00"),
-        "state_ut_tax": Decimal("3000.00"),
-        "integrated_tax": Decimal("0.00"),
-        "cess_amount": Decimal("0.00"),
-        "document_number": "INV-MULTI-002",
-        "document_date": "2026-11-01"
-    }
-
-    evals_prop = engine.evaluate_itc_eligibility(
-        purchase_doc=p_doc_prop,
-        gstr2b_doc=g_doc_prop,
+    evals_no_rate = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_no_rate,
+        gstr2b_doc=g_doc_rate_aware,
         evaluation_date=today
     )
+    food_eval_no_rate = next(e for e in evals_no_rate if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_no_rate.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_no_rate.risk_reversal_amount == Decimal("0.00")
 
-    food_eval_prop = next(e for e in evals_prop if e.rule_code == "SEC_17_5_FOOD")
-    # Proportional calculation: 6000 * 10000 / 30000 = 2000.00
-    assert food_eval_prop.risk_reversal_amount == Decimal("2000.00")
-    assert food_eval_prop.potential_itc == Decimal("2000.00")
+    # 5. Scenario C2: Disallowed GST-Inclusive Total Amount Basis
+    p_doc_inclusive = {
+        "id": "p_multi_line_inclusive",
+        "document_number": "INV-MULTI-003B",
+        "document_date": "2026-11-01",
+        "cgst_amount": Decimal("2050.00"),
+        "sgst_amount": Decimal("2050.00"),
+        "total_invoice_value": Decimal("34100.00"),
+        "line_items": [
+            {
+                "item_description": "Factory vehicle test track repair",
+                "hsn_sac_code": "998729",
+                "total_amount": Decimal("23600.00"),  # total_amount/line_total excluded
+                "gst_rate": Decimal("18.00"),
+                "facts": {
+                    "is_vehicle_manufacturer": True,
+                    "manufacturing_license": True,
+                    "relates_to_manufactured_vehicles": True,
+                    "is_factual_context_verified": True
+                }
+            },
+            {
+                "item_description": "Executive corporate catering dinner",
+                "hsn_sac_code": "996331",
+                "total_amount": Decimal("10500.00"),
+                "gst_rate": Decimal("5.00")
+            }
+        ]
+    }
 
-    # 3. Scenario C: Missing Line-Level Data Fallback (Uncertain Allocation -> Review Required)
+    evals_inclusive = engine.evaluate_itc_eligibility(
+        purchase_doc=p_doc_inclusive,
+        gstr2b_doc=g_doc_rate_aware,
+        evaluation_date=today
+    )
+    food_eval_inclusive = next(e for e in evals_inclusive if e.rule_code == "SEC_17_5_FOOD")
+    assert food_eval_inclusive.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
+    assert food_eval_inclusive.risk_reversal_amount == Decimal("0.00")
+
+    # 6. Scenario C3: Completely Missing Line-Level Data Fallback
     p_doc_missing = {
         "id": "p_multi_line_missing",
-        "document_number": "INV-MULTI-003",
+        "document_number": "INV-MULTI-003C",
         "document_date": "2026-11-01",
         "cgst_amount": Decimal("2500.00"),
         "sgst_amount": Decimal("2500.00"),
@@ -753,7 +882,6 @@ def test_multi_line_invoice_exception_and_blocked_catering():
             {
                 "item_description": "Executive corporate catering dinner",
                 "hsn_sac_code": "996331"
-                # Neither tax_amount nor taxable_value provided
             }
         ]
     }
@@ -765,7 +893,6 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     )
 
     food_eval_missing = next(e for e in evals_missing if e.rule_code == "SEC_17_5_FOOD")
-    # Must NOT assume entire invoice tax is blocked; routes to REVIEW_REQUIRED with 0 reversal
     assert food_eval_missing.eligibility_status == ITCEligibilityEnum.REVIEW_REQUIRED
     assert food_eval_missing.risk_reversal_amount == Decimal("0.00")
     assert food_eval_missing.potential_itc == Decimal("5000.00")

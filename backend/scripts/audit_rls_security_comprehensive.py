@@ -286,8 +286,10 @@ def audit_m1_m5_cross_tenant_isolation():
             VALUES (:id, :org_id, '112025', 100000, 50000, 50000);
         """), {"id": summary_id_a, "org_id": org_a})
 
-        # Fetch a valid scheme_id from government_schemes
-        scheme_id = db.execute(text("SELECT id FROM public.government_schemes LIMIT 1;")).scalar()
+        # Fetch valid scheme_ids from government_schemes
+        scheme_ids = db.execute(text("SELECT id FROM public.government_schemes ORDER BY id LIMIT 5;")).scalars().all()
+        scheme_id = scheme_ids[0]
+        scheme_id_d = scheme_ids[1] if len(scheme_ids) > 1 else scheme_ids[0]
         match_id_a = str(uuid.uuid4())
         db.execute(text("""
             INSERT INTO public.scheme_matches (id, org_id, scheme_id, match_score, status)
@@ -382,78 +384,98 @@ def audit_m1_m5_cross_tenant_isolation():
                 else:
                     raise
 
-        # Step D: Cross-tenant Insert Attempts (inserting org_a record while authenticated as org_b across ALL 11 Domains)
+        # Step D: Cross-tenant Insert Verification (Positive Alpha Proof + Beta Spoofing Rejection)
+        print("  --> Starting Step D: Cross-Tenant INSERT Verification across all 11 Tenant Domains...")
         insert_tamper_targets = [
-            ("business_profiles", """
-                INSERT INTO public.business_profiles (id, org_id, business_type, industry_sector, turnover_bracket, annual_turnover)
-                VALUES (:id, :org_a, 'Private Limited', 'Automotive', 'under_5cr', 10000);
-            """),
-            ("invoices", """
-                INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_amount, status)
-                VALUES (:id, :org_a, :prof_a, 'INV-TAMPER-001', '2025-11-01', 'Tamper', 1000, 'uploaded');
-            """),
-            ("documents", """
-                INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
-                VALUES (:id, :org_a, 'invoice', 'tamper.pdf', 10, 'application/pdf', '/tmp/t.pdf', '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
-            """),
-            ("gst_registrations", """
-                INSERT INTO public.gst_registrations (id, org_id, gstin, legal_name, trade_name, state_code, registration_type, is_active)
-                VALUES (:id, :org_a, '27TAMPER0000A1Z5', 'Tamper Entity', 'Tamper Trade', '27', 'regular', true);
-            """),
-            ("purchase_documents", """
-                INSERT INTO public.purchase_documents (
-                    id, org_id, registration_id, document_type, document_number, document_date,
-                    financial_period, supplier_gstin, supplier_legal_name, recipient_gstin, place_of_supply, total_invoice_value
-                ) VALUES (
-                    :id, :org_a, :reg_a, 'tax_invoice', 'PUR-TAMPER', '2025-11-01',
-                    '112025', '27AAAAA0000A1Z5', 'Supplier Tamper', '27AAAAA0000A1ZT', '27', 1000
-                );
-            """),
-            ("itc_ledger_entries", """
-                INSERT INTO public.itc_ledger_entries (id, org_id, purchase_doc_id, event_type, tax_period, cgst_amount, sgst_amount, igst_amount, cess_amount, total_tax)
-                VALUES (:id, :org_a, :purch_a, 'AVAIL', '112025', 500, 500, 0, 0, 1000);
-            """),
-            ("gst_records", """
-                INSERT INTO public.gst_records (id, org_id, gstin, return_type, tax_period, filing_status, total_taxable_value, total_tax_paid)
-                VALUES (:id, :org_a, '27AAAAA0000A1ZT', 'GSTR-3B', '112025', 'pending', 1000, 100);
-            """),
-            ("financial_transactions", """
-                INSERT INTO public.financial_transactions (id, org_id, transaction_date, amount, transaction_type, category, counterparty)
-                VALUES (:id, :org_a, '2025-11-01', 1000, 'credit', 'sales', 'Tamper Client');
-            """),
-            ("gstr3b_filings", """
-                INSERT INTO public.gstr3b_filings (id, org_id, registration_id, tax_period, filing_status, maker_id)
-                VALUES (:id, :org_a, :reg_a, '112025', 'DRAFT', :user_b);
-            """),
-            ("financial_summaries", """
-                INSERT INTO public.financial_summaries (id, org_id, summary_period, total_inflow, total_outflow, net_cash_flow)
-                VALUES (:id, :org_a, '112025', 0, 0, 0);
-            """),
-            ("scheme_matches", """
-                INSERT INTO public.scheme_matches (id, org_id, scheme_id, match_score, status)
-                VALUES (:id, :org_a, :scheme_id, 80.0, 'recommended');
-            """),
+            ("business_profiles",
+             "INSERT INTO public.business_profiles (id, org_id, business_type, industry_sector, turnover_bracket, annual_turnover) VALUES (:id, :org_id, 'Private Limited', 'Manufacturing', 'under_5cr', 50000);",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u}),
+
+            ("invoices",
+             "INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_amount, status) VALUES (:id, :org_id, :prof_id, :inv_num, '2025-11-01', 'Counterparty', 1000, 'uploaded');",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u, "prof_id": prof_id_a, "inv_num": f"INV-{uuid.uuid4().hex[:8]}"}),
+
+            ("documents",
+             "INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum) VALUES (:id, :org_id, 'invoice', 'doc.pdf', 100, 'application/pdf', '/tmp/doc.pdf', :sha256);",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u, "sha256": f"{uuid.uuid4().hex}{uuid.uuid4().hex}"}),
+
+            ("gst_registrations",
+             "INSERT INTO public.gst_registrations (id, org_id, gstin, legal_name, trade_name, state_code, registration_type, is_primary) VALUES (:id, :org_id, :gstin, 'Legal Name', 'Trade Name', '27', 'regular', false);",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u, "gstin": f"27{pan_a}{random.choice('23456789')}Z{random.choice(string.ascii_uppercase)}"}),
+
+            ("purchase_documents",
+             "INSERT INTO public.purchase_documents (id, org_id, registration_id, document_type, document_number, document_date, financial_period, supplier_gstin, supplier_legal_name, recipient_gstin, place_of_supply, total_invoice_value) VALUES (:id, :org_id, :reg_id, 'tax_invoice', :doc_num, '2025-11-01', '112025', '27AAAAA0000A1Z5', 'Supplier', '27AAAAA0000A1ZT', '27', 5000);",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u, "reg_id": reg_id_a, "doc_num": f"PUR-{uuid.uuid4().hex[:8]}"}),
+
+            ("itc_ledger_entries",
+             "INSERT INTO public.itc_ledger_entries (id, org_id, purchase_doc_id, event_type, tax_period, cgst_amount, sgst_amount, igst_amount, cess_amount, total_tax) VALUES (:id, :org_id, :purch_id, 'AVAIL', '112025', 250, 250, 0, 0, 500);",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u, "purch_id": purch_id_a}),
+
+            ("gst_records",
+             "INSERT INTO public.gst_records (id, org_id, gstin, return_type, tax_period, filing_status, total_taxable_value, total_tax_paid) VALUES (:id, :org_id, '27AAAAA0000A1ZT', 'GSTR-3B', :tax_period, 'pending', 1000, 100);",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u, "tax_period": f"0{random.randint(1,9)}2028"}),
+
+            ("financial_transactions",
+             "INSERT INTO public.financial_transactions (id, org_id, transaction_date, amount, transaction_type, category, counterparty) VALUES (:id, :org_id, '2025-11-01', 1000, 'credit', 'sales', 'Counterparty');",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u}),
+
+            ("gstr3b_filings",
+             "INSERT INTO public.gstr3b_filings (id, org_id, registration_id, tax_period, filing_status, maker_id) VALUES (:id, :org_id, :reg_id, :tax_period, 'DRAFT', :user_id);",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u, "reg_id": reg_id_a, "user_id": user_a, "tax_period": f"0{random.randint(1,9)}2028"}),
+
+            ("financial_summaries",
+             "INSERT INTO public.financial_summaries (id, org_id, summary_period, total_inflow, total_outflow, net_cash_flow) VALUES (:id, :org_id, :summary_period, 1000, 500, 500);",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u, "summary_period": f"0{random.randint(1,9)}2028"}),
+
+            ("scheme_matches",
+             "INSERT INTO public.scheme_matches (id, org_id, scheme_id, match_score, status) VALUES (:id, :org_id, :scheme_id, 90.0, 'recommended');",
+             lambda u: {"id": str(uuid.uuid4()), "org_id": u, "scheme_id": scheme_id_d}),
         ]
 
-        for tbl, insert_sql in insert_tamper_targets:
-            cross_insert_blocked = False
-            savepoint = db.begin_nested()
+        for tbl, sql, param_gen in insert_tamper_targets:
+            # Phase 1: Prove positive INSERT succeeds under Tenant Alpha context
+            set_tenant_context(db, org_id=org_a, user_id=user_a)
+            alpha_params = param_gen(org_a)
+            sp_a = db.begin_nested()
+            db.execute(text(sql), alpha_params)
+            sp_a.commit()
+            # Verify row actually exists in table
+            row_chk = db.execute(text(f"SELECT id FROM public.{tbl} WHERE id = :id"), {"id": alpha_params["id"]}).fetchone()
+            assert row_chk is not None, f"Failed positive baseline: row not found in {tbl} after Alpha insert!"
+
+            # Phase 2: Switch to Tenant Beta and attempt spoofed INSERT with org_a
+            set_tenant_context(db, org_id=org_b, user_id=user_b)
+            spoofed_params = param_gen(org_a)  # Spoofing Tenant Alpha's org_id
+            sp_b = db.begin_nested()
+            spoofed_blocked = False
+            sqlstate = None
+            classification = None
+            err_msg = ""
             try:
-                db.execute(text(insert_sql), {
-                    "id": str(uuid.uuid4()),
-                    "org_a": org_a,
-                    "prof_a": prof_id_a,
-                    "reg_a": reg_id_a,
-                    "purch_a": purch_id_a,
-                    "user_b": user_b,
-                    "scheme_id": scheme_id
-                })
-                savepoint.commit()
-            except Exception:
-                cross_insert_blocked = True
-                savepoint.rollback()
-            assert cross_insert_blocked, f"CRITICAL RLS BREACH: Org B was able to insert records into Org A's {tbl}!"
-            print(f"  [Cross-Tenant INSERT] PASS: Spoofed insert into {tbl} rejected by RLS WITH CHECK.")
+                db.execute(text(sql), spoofed_params)
+                sp_b.commit()
+            except Exception as e:
+                spoofed_blocked = True
+                sp_b.rollback()
+                orig = getattr(e, "orig", e)
+                sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+                err_msg = str(orig) or str(e)
+                err_lower = err_msg.lower()
+                if sqlstate == "42501" and ("violates row-level security policy" in err_lower or "row-level security policy" in err_lower):
+                    classification = "RLS_WITH_CHECK_VIOLATION"
+                elif sqlstate == "42501" and "permission denied for table" in err_lower:
+                    classification = "LEAST_PRIVILEGE_IMMUTABLE_DENIAL"
+                else:
+                    raise AssertionError(
+                        f"CRITICAL TEST FLAW on table {tbl}: Spoofed insert failed with unexpected error!\n"
+                        f"SQLSTATE: {sqlstate}\n"
+                        f"Error: {err_msg}\n"
+                        f"Expected SQLSTATE 42501 (RLS policy violation or permission denial)."
+                    )
+
+            assert spoofed_blocked, f"CRITICAL RLS BREACH: Org B was able to insert records into Org A's {tbl}!"
+            assert classification in ("RLS_WITH_CHECK_VIOLATION", "LEAST_PRIVILEGE_IMMUTABLE_DENIAL")
+            print(f"  [Cross-Tenant INSERT] PASS: {tbl:<24} | Alpha positive insert OK | Beta spoof rejected (SQLSTATE {sqlstate}: {classification})")
 
         # Step E: Null tenant context isolation
         db.execute(text("SELECT set_config('app.current_org', '', false), set_config('app.current_user', '', false);"))

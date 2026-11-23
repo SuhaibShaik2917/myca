@@ -1,27 +1,5 @@
-"""
-Migration Rollback and Baseline Verification Script
-
-Rigorously verifies:
-1. Baseline Capture at 0019_m3_gstr3b_filings:
-   - Captures exact snapshot of all role_table_grants for app_service_user
-   - Captures exact snapshot of all pg_policies
-   - Captures exact snapshot of all relrowsecurity and relforcerowsecurity in pg_class
-2. Upgrade to 0021_enforce_tenant_force_rls (head):
-   - Confirms all 36 tenant tables have both relrowsecurity=True and relforcerowsecurity=True
-   - Confirms all 8 new policies added by 0020 are present (96 total policies)
-   - Confirms app_service_user has strictly SELECT on reference catalogues
-3. Downgrade to 0020_m4_m5_grants_and_policies:
-   - Confirms 21 tenant tables successfully reverted to relforcerowsecurity=False
-   - Confirms all 8 policies of 0020 remain active in 0020
-   - Confirms reference catalogues retain SELECT privilege
-4. Downgrade to 0019_m3_gstr3b_filings (Baseline Comparison):
-   - Compares current role_table_grants against captured 0019 baseline (must match 100%)
-   - Compares current pg_policies against captured 0019 baseline (must match 100%)
-   - Compares current RLS flags against captured 0019 baseline (must match 100%)
-   - Confirms all 8 policies from 0020 are completely removed
-5. Re-Upgrade to 0021_enforce_tenant_force_rls (head):
-   - Confirms full restoration of head state with all 36 tables having FORCE RLS enabled.
-"""
+import os
+import json
 import subprocess
 import sys
 import psycopg
@@ -105,16 +83,37 @@ def capture_database_state(conn):
 
         return {"grants": grants, "policies": policies, "rls_flags": rls_flags}
 
+def load_trusted_0019_reference():
+    json_path = os.path.join(os.path.dirname(__file__), "baseline_0019_reference.json")
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"Independent reference catalog file not found: {json_path}")
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    trusted_grants = {tuple(x) for x in data["grants"]}
+    trusted_policies = {tuple(x) for x in data["policies"]}
+    trusted_rls = {k: (v["relrowsecurity"], v["relforcerowsecurity"]) for k, v in data["rls_flags"].items()}
+    return {
+        "grants": trusted_grants,
+        "policies": trusted_policies,
+        "rls_flags": trusted_rls
+    }
+
 def main():
     conn = psycopg.connect(DB_ADMIN_URL)
     conn.autocommit = True
 
-    print("=== Step 1: Establish & Capture Baseline at 0019_m3_gstr3b_filings ===")
+    trusted_ref = load_trusted_0019_reference()
+    print(f"Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json:")
+    print(f"  {len(trusted_ref['grants'])} grants, {len(trusted_ref['policies'])} policies, {len(trusted_ref['rls_flags'])} tables.")
+
+    print("\n=== Step 1: Establish Baseline at 0019 & Verify Against Independent Reference ===")
     run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
     baseline_0019 = capture_database_state(conn)
-    print(f"  Captured 0019 Baseline: {len(baseline_0019['grants'])} grants, {len(baseline_0019['policies'])} policies, {len(baseline_0019['rls_flags'])} tables.")
-    assert len(baseline_0019["grants"]) == 79, f"Expected 79 grants at 0019, got {len(baseline_0019['grants'])}"
-    assert len(baseline_0019["policies"]) == 88, f"Expected 88 policies at 0019, got {len(baseline_0019['policies'])}"
+    print(f"  Captured 0019 Database State: {len(baseline_0019['grants'])} grants, {len(baseline_0019['policies'])} policies, {len(baseline_0019['rls_flags'])} tables.")
+    assert baseline_0019["grants"] == trusted_ref["grants"], f"Grants mismatch with independent reference! Diff: {baseline_0019['grants'] ^ trusted_ref['grants']}"
+    assert baseline_0019["policies"] == trusted_ref["policies"], f"Policies mismatch with independent reference! Diff: {baseline_0019['policies'] ^ trusted_ref['policies']}"
+    assert baseline_0019["rls_flags"] == trusted_ref["rls_flags"], "RLS flags mismatch with independent reference!"
+    print("  PASS: Initial downgrade to 0019 matches independent trusted reference snapshot 100% (79 grants, 88 policies, 41 tables).")
 
     print("\n=== Step 2: Upgrade to Head (0021_enforce_tenant_force_rls) ===")
     run_cmd(["alembic", "upgrade", "head"])
@@ -156,25 +155,25 @@ def main():
         assert len(matching) == 0, f"Policy {p_name} was NOT removed on rollback to 0019!"
     print("  PASS: All 8 policies from 0020 were cleanly dropped.")
 
-    # B. Compare exact grants against captured 0019 baseline
+    # B. Compare exact grants against captured 0019 baseline and independent trusted reference
     missing_grants = baseline_0019["grants"] - rolled_back_state["grants"]
     extra_grants = rolled_back_state["grants"] - baseline_0019["grants"]
     assert len(missing_grants) == 0, f"Rollback corrupted baseline grants! Missing: {missing_grants}"
     assert len(extra_grants) == 0, f"Rollback left extra grants! Extra: {extra_grants}"
-    assert rolled_back_state["grants"] == baseline_0019["grants"]
-    print("  PASS: Exact match on all 79 role_table_grants for app_service_user.")
+    assert rolled_back_state["grants"] == trusted_ref["grants"], "Rollback grants mismatch with independent reference snapshot!"
+    print("  PASS: Exact match on all 79 role_table_grants against independent reference.")
 
-    # C. Compare exact policies against captured 0019 baseline
+    # C. Compare exact policies against captured 0019 baseline and independent trusted reference
     missing_policies = baseline_0019["policies"] - rolled_back_state["policies"]
     extra_policies = rolled_back_state["policies"] - baseline_0019["policies"]
     assert len(missing_policies) == 0, f"Rollback corrupted baseline policies! Missing: {missing_policies}"
     assert len(extra_policies) == 0, f"Rollback left extra policies! Extra: {extra_policies}"
-    assert rolled_back_state["policies"] == baseline_0019["policies"]
-    print("  PASS: Exact match on all 88 policies in pg_policies.")
+    assert rolled_back_state["policies"] == trusted_ref["policies"], "Rollback policies mismatch with independent reference snapshot!"
+    print("  PASS: Exact match on all 88 policies against independent reference.")
 
-    # D. Compare exact table RLS flags against captured 0019 baseline
-    assert rolled_back_state["rls_flags"] == baseline_0019["rls_flags"]
-    print("  PASS: Exact match on all table RLS and FORCE RLS flags.")
+    # D. Compare exact table RLS flags against captured 0019 baseline and independent trusted reference
+    assert rolled_back_state["rls_flags"] == trusted_ref["rls_flags"], "Rollback RLS flags mismatch with independent reference snapshot!"
+    print("  PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.")
 
     print("\n=== Step 5: Re-Upgrade to Head (0021_enforce_tenant_force_rls) ===")
     run_cmd(["alembic", "upgrade", "head"])
@@ -185,7 +184,7 @@ def main():
     print("  PASS: Re-upgrade to head completely restored production security state.")
 
     conn.close()
-    print("\nALL MIGRATION ROLLBACK & BASELINE RESTORATION INVARIANTS 100% VERIFIED!")
+    print("\nALL MIGRATION ROLLBACK & INDEPENDENT BASELINE REFERENCE INVARIANTS 100% VERIFIED!")
 
 if __name__ == "__main__":
     main()

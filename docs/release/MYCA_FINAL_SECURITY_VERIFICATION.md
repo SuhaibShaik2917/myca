@@ -132,8 +132,10 @@ Executed via `backend/scripts/audit_rls_security_comprehensive.py`:
 - While authenticated as `Tenant Beta`, DELETE attempts were executed on `Tenant Alpha`'s records across all tables:
   - `invoices`, `documents`, `gst_registrations`, `purchase_documents`, `gst_records`, `financial_transactions`, `gstr3b_filings`, `financial_summaries`, `business_profiles`, `scheme_matches`: **0 rows deleted** (RLS isolation enforced) [PASS]
   - `itc_ledger_entries`: blocked by **least-privilege grant denial** (immutable statutory ledger) [PASS]
-- Cross-tenant INSERT attempts with spoofed `org_id` were executed under `Tenant Beta` across all 11 core tenant domain tables:
-  - Attempted spoofed inserts into `business_profiles`, `invoices`, `documents`, `gst_registrations`, `purchase_documents`, `itc_ledger_entries`, `gst_records`, `financial_transactions`, `gstr3b_filings`, `financial_summaries`, and `scheme_matches` were rejected by PostgreSQL RLS `WITH CHECK` constraints (`ProgrammingError`) [PASS]
+- Cross-tenant INSERT verification executed via two-phase testing across all 11 core tenant domain tables:
+  - **Phase 1 (Positive Alpha Baseline):** Proved that valid INSERT statements for all 11 domain tables succeed under valid Tenant Alpha context (`app.current_org = org_a`, `app.current_user = user_a`) and verified that the row exists in `public.<table_name>` [PASS].
+  - **Phase 2 (Spoofed Beta Rejection):** Re-executed the identical valid statement structure under Tenant Beta (`app.current_org = org_b`, `app.current_user = user_b`) with spoofed `org_id = org_a`.
+  - **Specific SQLSTATE & Policy Assertion:** All 11 domain tables (`business_profiles`, `invoices`, `documents`, `gst_registrations`, `purchase_documents`, `itc_ledger_entries`, `gst_records`, `financial_transactions`, `gstr3b_filings`, `financial_summaries`, `scheme_matches`) specifically raised SQLSTATE `42501` (`insufficient_privilege`) with message `new row violates row-level security policy for table ...` and were classified as `RLS_WITH_CHECK_VIOLATION` [PASS].
 
 ### 3.3 Null Context Leakage Protection
 - When tenant session variables (`app.current_org` and `app.current_user`) were cleared:
@@ -159,8 +161,8 @@ When a caller supplies a valid JWT token for Tenant A but attempts to spoof `X-O
 
 ## 5. MIGRATION ROLLBACK SAFETY & BASELINE VERIFICATION
 
-Migration downgrade safety and baseline restoration verified via `backend/scripts/verify_migration_rollback_state.py`:
-- **Step 1 (Establish Baseline at 0019):** Downgraded to `0019_m3_gstr3b_filings` to capture exact baseline: **79 role_table_grants** for `app_service_user`, **88 policies** in `pg_policies`, and **41 tables**.
+Migration downgrade safety and baseline restoration verified via `backend/scripts/verify_migration_rollback_state.py` against independent reference catalog snapshot (`baseline_0019_reference.json`):
+- **Step 1 (Establish Baseline at 0019 & Verify Against Independent Reference):** Downgraded to `0019_m3_gstr3b_filings`: compared live database catalog state against independent reference snapshot `baseline_0019_reference.json`: **79 role_table_grants** for `app_service_user`, **88 policies** in `pg_policies`, and **41 tables** (100% exact match).
 - **Step 2 (Upgrade to Head 0021):** Upgraded to `0021_enforce_tenant_force_rls`: **105 grants**, **96 policies**, and confirmed all 36 tenant tables have both `relrowsecurity = True` and `relforcerowsecurity = True`.
 - **Step 3 (Downgrade to 0020):** Downgraded to `0020_m4_m5_grants_and_policies`: confirmed 21 tenant tables successfully reverted to `relforcerowsecurity = False` while retaining all 8 new policies.
 - **Step 4 (Downgrade to 0019 & Baseline Comparison):** Downgraded to `0019_m3_gstr3b_filings`:
