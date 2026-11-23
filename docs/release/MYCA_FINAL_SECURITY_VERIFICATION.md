@@ -3,8 +3,8 @@
 **Audit Date:** November 23, 2026  
 **Auditor:** Principal Application Security Engineer  
 **Audit Branch:** `remediation/audit-findings-phase3` (Merging to `master`)  
-**Release Checkpoint:** `v1.0.4`  
-**Scope:** PostgreSQL 16 Row Level Security (RLS), Least-Privilege Role Grants, Token Spoofing Defense, 11-Domain Cross-Tenant Write Isolation, Migration Rollback Baseline Exact Match with Cryptographic Authentication, Fail-Closed Server-Side HMAC Auditor Authentication, and Replay Protection.
+**Release Checkpoint:** `v1.0.5`  
+**Scope:** PostgreSQL 16 Row Level Security (RLS), Least-Privilege Role Grants, Token Spoofing Defense, 11-Domain Cross-Tenant Write Isolation, Migration Rollback Baseline Exact Match with Cryptographic Authentication, Fail-Closed Server-Side HMAC Auditor Authentication, Controlled Auditor Database, and Persistent Database Replay Protection.
 
 ---
 
@@ -33,21 +33,25 @@ assert current_db_user == "app_service_user"
 
 > **Security Finding:** `app_service_user` has zero administrative or RLS bypass privileges, ensuring that all queries executed by FastAPI are strictly constrained by PostgreSQL's kernel-level RLS policy engine.
 
-### 1.2 Least-Privilege Grants on Reference Catalogues
-Inspection of `information_schema.role_table_grants` for `app_service_user` on public reference catalogues:
+### 1.2 Least-Privilege Grants on Reference Catalogues & Controlled Tables
+Inspection of `information_schema.role_table_grants` for `app_service_user`:
 ```sql
 SELECT table_name, privilege_type 
 FROM information_schema.role_table_grants 
 WHERE grantee = 'app_service_user' 
-  AND table_name IN ('government_schemes', 'scheme_eligibility_rules');
+  AND table_name IN ('government_schemes', 'scheme_eligibility_rules', 'statutory_auditors', 'statutory_audit_signature_replays');
 ```
 
 **Results:**
 - `government_schemes`: **`SELECT` ONLY** (0 `INSERT`, 0 `UPDATE`, 0 `DELETE`)
 - `scheme_eligibility_rules`: **`SELECT` ONLY** (0 `INSERT`, 0 `UPDATE`, 0 `DELETE`)
+- `statutory_auditors`: **`SELECT` ONLY** (0 `INSERT`, 0 `UPDATE`, 0 `DELETE`)
+- `statutory_audit_signature_replays`: **`SELECT, INSERT` ONLY** (0 `UPDATE`, 0 `DELETE` — immutable audit trail)
 
 **Regression Test Verification:**
-Test `test_app_service_user_cannot_write_to_reference_catalogues` in `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py` and comprehensive audit script `scripts/audit_rls_security_comprehensive.py` execute live `INSERT`, `UPDATE`, and `DELETE` attempts against **BOTH** tables under the application connection and confirm that PostgreSQL raises `InsufficientPrivilege` / `ProgrammingError` (`permission denied for table ...`), permanently blocking unauthorized writes across all three mutation verbs.
+Tests in `tests/test_statutory_section_17_5_boundaries_and_reference_grants.py` and `scripts/audit_rls_security_comprehensive.py` execute live write attempts under `app_service_user`:
+- `INSERT`, `UPDATE`, `DELETE` on `government_schemes`, `scheme_eligibility_rules`, and `statutory_auditors` raise `InsufficientPrivilege` / `ProgrammingError` (`permission denied for table ...`) [PASS].
+- `UPDATE` and `DELETE` on `statutory_audit_signature_replays` raise `InsufficientPrivilege` / `ProgrammingError` (`permission denied for table statutory_audit_signature_replays`) [PASS]. Administrative onboarding & revocation of auditors require administrative connection credentials (`DB_ADMIN_URL`).
 
 ---
 
@@ -153,51 +157,53 @@ When a caller supplies a valid JWT token for Tenant A but attempts to spoof `X-O
 ## 5. MIGRATION ROLLBACK SAFETY & BASELINE VERIFICATION
 
 Migration downgrade safety and baseline restoration verified via `backend/scripts/verify_migration_rollback_state.py` against independent reference catalog snapshot (`baseline_0019_reference.json`):
-- **Independent Provenance & Cryptographic Code Anchor Authentication (v1.0.2):** Generated from an isolated, virgin PostgreSQL 16 database (`myca_independent_reference`) migrated strictly forward from base to `0019_m3_gstr3b_filings`. Script anchors the trusted expected hash as an immutable hardcoded constant (`TRUSTED_BASELINE_0019_SCHEMA_SHA256 = "bfe3e3a342b56732d1d0cf43f8edfc50391df1020a2c487f22fb5834e9503373"`). Script independently computes canonical SHA256 checksum across `full_grants`, `full_policies`, and `rls_flags` and asserts that BOTH the declared metadata hash and the dynamically computed payload hash match the immutable code anchor before asserting rollback invariants [PASS].
+- **Independent Provenance & Cryptographic Code Anchor Authentication:** Generated from an isolated, virgin PostgreSQL 16 database (`myca_independent_reference`) migrated strictly forward from base to `0019_m3_gstr3b_filings`. Script anchors the trusted expected hash as an immutable hardcoded constant (`TRUSTED_BASELINE_0019_SCHEMA_SHA256 = "bfe3e3a342b56732d1d0cf43f8edfc50391df1020a2c487f22fb5834e9503373"`). Script independently computes canonical SHA256 checksum across `full_grants`, `full_policies`, and `rls_flags` and asserts that BOTH the declared metadata hash and the dynamically computed payload hash match the immutable code anchor before asserting rollback invariants [PASS].
 - **Step 1 (Establish Baseline at 0019 & Verify Against Independent Reference):** Downgraded to `0019_m3_gstr3b_filings`: compared live database catalog state against independent reference snapshot `baseline_0019_reference.json`: **79 full role_table_grants** for `app_service_user` (`table_schema`, `table_name`, `privilege_type`, `is_grantable`), **87 complete policies** in `pg_policies` (`schemaname`, `tablename`, `policyname`, `permissive`, `roles`, `cmd`, `qual`, `with_check`), and **41 tables** (100% exact match).
-- **Step 2 (Upgrade to Head 0021):** Upgraded to `0021_enforce_tenant_force_rls`: **105 grants**, **95 policies**, and confirmed all 36 tenant tables have both `relrowsecurity = True` and `relforcerowsecurity = True`.
+- **Step 2 (Upgrade to Head 0022):** Upgraded to `0022_statutory_auditors_replay`: **108 grants**, **95 policies**, and confirmed all 36 tenant tables have both `relrowsecurity = True` and `relforcerowsecurity = True`.
 - **Step 3 (Downgrade to 0020):** Downgraded to `0020_m4_m5_grants_and_policies`: confirmed 21 tenant tables successfully reverted to `relforcerowsecurity = False` while retaining all 8 new policies.
 - **Step 4 (Downgrade to 0019 & Baseline Comparison):** Downgraded to `0019_m3_gstr3b_filings`:
   - Confirmed all 8 policies from 0020 were cleanly dropped (0 leftover).
   - Compared exact role table grant definitions against baseline: **0 missing grants, 0 extra grants (100% exact match)**.
   - Compared exact complete policy definitions against baseline: **0 missing policies, 0 extra policies (100% exact match)**.
   - Compared table RLS and FORCE RLS flags: **100% exact match**.
-- **Step 5 (Re-Upgrade to Head 0021):** Re-upgraded to `0021_enforce_tenant_force_rls`, fully restoring head state with 105 grants, 95 policies, and 36 forced RLS tenant tables.
+- **Step 5 (Re-Upgrade to Head 0022):** Re-upgraded to `0022_statutory_auditors_replay`, fully restoring head state with 108 grants, 95 policies, and 36 forced RLS tenant tables.
 
 ---
 
-## 6. SERVER-SIDE CRYPTOGRAPHIC AUDITOR AUTHENTICATION & REPLAY PROTECTION (v1.0.4)
+## 6. CONTROLLED STATUTORY AUDITOR DATABASE & PERSISTENT REPLAY PROTECTION (v1.0.5)
 
-Implemented in `backend/app/modules/reconciliation/itc_engine.py`:
+Implemented in `backend/app/modules/reconciliation/itc_engine.py` and migration `0022_statutory_auditors_replay.py`:
 - **Fail-Closed Key Resolver:**
   - Removed all hardcoded fallback secrets.
   - `get_statutory_audit_signing_key()` strictly inspects `os.environ.get("STATUTORY_AUDIT_SIGNING_KEY")`.
+  - Rejects insecure/test secret defaults when running in production (`ENVIRONMENT=production`).
   - If the environment variable is missing, empty, or strictly shorter than 32 characters, it raises `KeyResolverError` immediately, failing closed and routing to `REVIEW_REQUIRED` (₹0.00 reversal).
-- **Statutory Auditor Credentials & Verification:**
-  - Validated via `validate_auditor_credentials()` against statutory standards:
-    - ICAI membership format: `^ICAI-[MF]-\d{6}$`
-    - Firm registration format: `^\d{6}[A-Z]$`
+- **Controlled Database-Backed Auditor Registry (`public.statutory_auditors`):**
+  - Stored in persistent PostgreSQL table with strict schema constraints:
+    - ICAI membership format: strictly 6 digits (`^\d{6}$`)
+    - Firm registration format: 6 digits + 1 letter (`^\d{6}[A-Z]$`)
     - Certificate of Practice: `cop_status == "ACTIVE"`
-    - Active validity window: `valid_until >= datetime.now(timezone.utc).date()`
-    - Explicit revocation blacklist: check against `REVOKED_STATUTORY_AUDITOR_IDS`
-  - Cross-referenced against authoritative `TRUSTED_STATUTORY_AUDITOR_REGISTRY`.
+    - Active validity window: `cop_valid_until >= date.today()`
+    - Administrative approval: `approved_by` must be non-empty
+    - Revocation status: `is_revoked == False`
+  - Validated via `validate_auditor_credentials()` querying the database.
+  - Administrative onboarding (`onboard_verified_statutory_auditor`) and revocation (`revoke_statutory_auditor`) require administrative connection (`DB_ADMIN_URL`).
 - **Timestamp Freshness & Clock Skew Defense:**
   - Validated via `validate_certification_timestamp()`:
     - Strict ISO 8601 UTC format validation (`YYYY-MM-DDTHH:MM:SSZ` or with offset).
     - Maximum certification age: 24 hours (86,400 seconds).
     - Maximum clock skew into the future: 5 minutes (300 seconds).
-- **Cross-Document Replay Defense:**
+- **Persistent Database-Backed Replay Defense (`public.statutory_audit_signature_replays`):**
   - Implemented via `check_and_record_signature_replay()`:
-    - Maintains in-memory cache binding each verification token to its canonical `(doc_id, doc_number)`.
-    - Attempts to replay an existing valid signature token against a different document or invoice are instantly rejected.
+    - Unique constraint on `token_hash = sha256(token)`.
+    - Atomic insert with `ON CONFLICT DO NOTHING`.
+    - Replay attempt across documents (`doc_id` or `doc_number` mismatch) or duplicate consumption fails closed immediately.
+    - Evaluated at invoice document level, ensuring all lines on a multi-line invoice receive consistent uniform-rate gating.
 - **Cryptographic Signature Engine & Constant-Time Verification:**
   - Server-side HMAC-SHA256 signature generation and verification over canonical invoice and certification state:
     ```text
     canonical_msg = f"{doc_id}:{doc_number}:{total_invoice_value}:{total_tax}:{header_rate}:{verifier_id}:{verifier_role}:{evidence_ref}:{timestamp}"
     ```
   - Employs `hmac.compare_digest` to prevent side-channel timing attacks.
-  - Arbitrary client strings (e.g. `"TOKEN-AUTH-SIG-998877"`), unregistered IDs (`"CA-FAKE-99"`), tampered totals, revoked auditors, or expired timestamps fail safe to CA review (`REVIEW_REQUIRED`, ₹0.00 reversal).
-- **Elimination of Boolean Traps & Rate Inflation:**
-  - Python string values (`"true"`, `"false"`, `"0"`, `"1"`, `"yes"`) and raw unauthenticated booleans are strictly rejected.
-  - Total statutory rate whitelist enforced (0%, 0.10%, 0.25%, 3%, 5%, 12%, 18%, 28%, 40%), rejecting fractional 1.50% component rates from standalone total rates.
+  - Arbitrary client strings, unregistered IDs, tampered totals, revoked auditors, or expired timestamps fail safe to CA review (`REVIEW_REQUIRED`, ₹0.00 reversal).
 

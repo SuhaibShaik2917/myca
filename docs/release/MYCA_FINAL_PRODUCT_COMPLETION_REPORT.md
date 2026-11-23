@@ -6,7 +6,7 @@
 **Release Verdict:** **100% PRODUCT SCOPE COMPLETE — EXTERNAL RELEASE BLOCKERS REMAIN**  
 **Audit Head:** Engineering, Product, QA, Security, and Statutory Review Team  
 **Date:** November 23, 2026  
-**Git Commit / Tag:** `v1.0.4`  
+**Git Commit / Tag:** `v1.0.5`  
 
 ---
 
@@ -109,8 +109,9 @@ MyCA has reached **100% product feature implementation** across all canonical PR
 
 ---
 
-## 5. v1.0.4 Statutory & Security Closure
+## 5. v1.0.5 Statutory, Database-Backed Auditor Verification & CI Resolution Closure
 
-1. **Exact Statutory Tariff Subheadings:** Strict implementation of 8-digit tariff classifications under Notifications 19/2025 and 01/2026 (with Corrigendum G.S.R. 339(E)), capping aerated waters at 28%, differentiating unmanufactured tobacco vs. refuse, and restricting 40% rates strictly to designated subheadings.
-2. **Fail-Closed HMAC Auditor Security:** Completely eliminated default HMAC fallback secrets; enforces dynamic credential validation against ICAI membership, firm registration, and active COP, accompanied by timestamp freshness checks and signature replay protection.
-3. **CI Pipeline Production Parity:** Fully automated GitHub Actions CI featuring a dedicated PostgreSQL 16 service container, live schema migration, automated test execution (263 tests), migration rollback verification, and comprehensive RLS isolation auditing.
+1. **Exact Statutory Tariff Subheadings for Heading 2202:** Strict implementation of exact tariff classifications under Notification 01/2026-IT (Rate): soya milk drinks `2202 99 10` (12%), fruit juices `2202 99 21` / `2202 99 29` (5%), milk-containing drinks `2202 99 30` (12%), and tender coconut / specified milk drinks `2202 99 31` / `2202 99 39` (5%). Incomplete subheadings fail safe to CA review (`AMBIGUOUS_TARIFF`).
+2. **Controlled Database-Backed Auditor Verification (`public.statutory_auditors`):** Eliminated in-memory mock dictionary; verifies authentic 6-digit ICAI membership numbers, FRN, active COP status, and administrative approval metadata. Administrative onboarding and revocation require admin credentials (`DB_ADMIN_URL`).
+3. **Persistent Database-Backed Replay Defense (`public.statutory_audit_signature_replays`):** Unique constraint on `token_hash = sha256(token)` preventing cross-document reuse and duplicate token consumption; evaluated at document level across multi-line items.
+4. **CI Pipeline TCP Resolution & Socket Elimination:** Fixed Alembic database URL resolution in `alembic.ini` and `env.py` to use TCP `localhost:5432`, eliminated Unix socket connection strings from test fixtures, and sanitized CI secret naming (`MYCA_CI_TEST_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.5_MIN32CHAR`). Full 263 tests passing, migration rollback verified against independent reference snapshot, and comprehensive RLS audit passed 100%.

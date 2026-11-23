@@ -41,8 +41,8 @@ from app.modules.reconciliation.matching_engine import DeterministicReconciliati
 from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
 from app.modules.reconciliation.gstr3b_itc import generate_gstr3b_table4_summary
 
-DB_ADMIN = "postgresql:///myca?user=postgres"
-DB_APP = "postgresql:///myca?user=app_service_user"
+DB_ADMIN = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
+DB_APP = os.environ.get("DATABASE_URL", "postgresql://app_service_user:secret@localhost:5432/myca")
 
 client = TestClient(app)
 

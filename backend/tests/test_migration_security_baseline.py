@@ -1,3 +1,4 @@
+import os
 import pytest
 import psycopg
 import uuid
@@ -19,11 +20,11 @@ def random_gstin(pan=None):
 def random_email():
     return f"user_{uuid.uuid4().hex[:10]}@test.com"
 
-DB_ADMIN = "postgresql:///myca?user=postgres"
-DB_WORKER = "postgresql:///myca?user=worker_service_user"
-DB_WORKER_1 = "postgresql:///myca?user=worker_service_user_1"
-DB_WORKER_2 = "postgresql:///myca?user=worker_service_user_2"
-DB_APP = "postgresql:///myca?user=app_service_user"
+DB_ADMIN = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
+DB_WORKER = os.environ.get("DATABASE_WORKER_URL", "postgresql://worker_service_user:secret@localhost:5432/myca")
+DB_WORKER_1 = os.environ.get("DATABASE_WORKER_URL", "postgresql://worker_service_user_1:secret@localhost:5432/myca")
+DB_WORKER_2 = os.environ.get("DATABASE_WORKER_URL", "postgresql://worker_service_user_2:secret@localhost:5432/myca")
+DB_APP = os.environ.get("DATABASE_URL", "postgresql://app_service_user:secret@localhost:5432/myca")
 
 # -------------------------------------------------------------
 # Baseline Security & Transitive Privilege Checks

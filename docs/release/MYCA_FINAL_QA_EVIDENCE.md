@@ -3,7 +3,7 @@
 **Audit Date:** November 23, 2026  
 **Environment:** Linux (WSL Ubuntu 24.04 / Python 3.12.3 / PostgreSQL 16.11 / Node.js v24.14)  
 **Branch:** `remediation/audit-findings-phase3` (Merging to `master`)  
-**Git Checkpoints:** Baseline `9f97516`, Audit Phase 1 `d421f0e`, Phase 2 Baseline `9961014`, v1.0.0 `56dc543`, v1.0.1 `eaa451a`, v1.0.2 `abbc575`, v1.0.3 `49b33ae`, Release Checkpoint `v1.0.4`  
+**Git Checkpoints:** Baseline `9f97516`, Audit Phase 1 `d421f0e`, Phase 2 Baseline `9961014`, v1.0.0 `56dc543`, v1.0.1 `eaa451a`, v1.0.2 `abbc575`, v1.0.3 `49b33ae`, v1.0.4 `d9e4288`, Release Checkpoint `v1.0.5`  
 
 ---
 
@@ -56,14 +56,14 @@ tests/test_milestone4_credit_builder.py .....                            [ 94%]
 tests/test_milestone5_scheme_navigator.py .....                          [ 96%]
 tests/test_statutory_section_17_5_boundaries_and_reference_grants.py .......... [100%]
 
-============================ 263 passed in 20.76s =============================
+============================ 263 passed in 21.97s =============================
 ```
 
 - **Total Test Items:** 263
 - **Passed:** 263
 - **Failed:** 0
 - **Errors:** 0
-- **Duration:** 20.76 seconds
+- **Duration:** 21.97 seconds
 - **Pass Rate:** 100.0%
 
 ---
@@ -156,9 +156,9 @@ PYTHONPATH=. /opt/myca-venv/bin/python3 scripts/verify_migration_rollback_state.
   Captured 0019 Database State: 79 grants, 87 policies, 41 tables.
   PASS: Initial downgrade to 0019 matches independent trusted reference snapshot 100% on full definitions (79 grants, 87 policies, 41 tables).
 
-=== Step 2: Upgrade to Head (0021_enforce_tenant_force_rls) ===
-  Head State (0021): 105 grants, 95 policies.
-PASS: Head state (0021) completely verified.
+=== Step 2: Upgrade to Head (0022_statutory_auditors_replay) ===
+  Head State (0022): 108 grants, 95 policies.
+PASS: Head state (0022) completely verified.
 
 === Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===
   State at 0020: 105 grants, 95 policies.
@@ -170,7 +170,7 @@ PASS: Downgrade to 0020 completely verified.
   PASS: Exact match on all 87 complete policy definitions (including cmd, roles, qual, with_check) against independent reference.
   PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.
 
-=== Step 5: Re-Upgrade to Head (0021_enforce_tenant_force_rls) ===
+=== Step 5: Re-Upgrade to Head (0022_statutory_auditors_replay) ===
   PASS: Re-upgrade to head completely restored production security state.
 
 ALL MIGRATION ROLLBACK & INDEPENDENT BASELINE REFERENCE INVARIANTS 100% VERIFIED!
@@ -199,22 +199,26 @@ computing gzip size...
 dist/index.html                   0.48 kB │ gzip:   0.33 kB
 dist/assets/index-CXHqnTlf.css   29.39 kB │ gzip:   5.62 kB
 dist/assets/index-DBkuh5Fw.js   420.23 kB │ gzip: 107.43 kB
-✓ built in 2.41s
+✓ built in 7.79s
 ```
 - TypeScript: 0 errors
-- Vite: 1,583 modules transformed in 2.41s
+- Vite: 1,583 modules transformed in 7.79s
 
 ---
 
-## 5. CONTINUOUS INTEGRATION (CI) AUTOMATION (v1.0.4)
+## 5. CONTINUOUS INTEGRATION (CI) AUTOMATION (v1.0.5)
 
 File: `.github/workflows/ci.yml`
 - **PostgreSQL 16 Service Container:** Provisions official `postgres:16` container with health checks (`pg_isready`), dedicated application database `myca`, and administrative password credentials.
+- **TCP Database Resolution & Environment Override:**
+  - `alembic.ini` configured with TCP URL `postgresql://postgres@localhost:5432/myca`.
+  - `alembic/env.py` dynamically resolves `DB_ADMIN_URL` and `DATABASE_URL` environment variables.
+  - Eliminated all raw Unix socket connection strings from test fixtures.
 - **Environment & Key Configuration:**
-  - `STATUTORY_AUDIT_SIGNING_KEY` injected via environment with 64-character entropy, satisfying fail-closed key resolution requirements.
+  - `STATUTORY_AUDIT_SIGNING_KEY` injected via environment with sanitized key name `MYCA_CI_TEST_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.5_MIN32CHAR`.
   - Runtime and administrative database URLs configured for non-superuser `app_service_user`.
 - **Database Provisioning & Alembic Migrations:**
-  - Executes `alembic upgrade head` to apply all migrations up to `0021_enforce_tenant_force_rls`.
+  - Executes `alembic upgrade head` to apply all migrations up to `0022_statutory_auditors_replay`.
   - Configures dedicated `app_service_user` with restricted grants and verified passwords.
 - **Full Test Suite & Audit Script Execution:**
   - Replaced legacy `--collect-only` with live test execution:

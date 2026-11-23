@@ -41,9 +41,9 @@ from app.schemas.invoice_brain import (
     GSTR_WORKING_DRAFT_DISCLAIMER, GSTR3B_WORKING_SUMMARY_DISCLAIMER
 )
 
-DB_ADMIN = "postgresql:///myca?user=postgres"
-DB_APP = "postgresql:///myca?user=app_service_user"
-DB_WORKER = "postgresql:///myca?user=worker_service_user"
+DB_ADMIN = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
+DB_APP = os.environ.get("DATABASE_URL", "postgresql://app_service_user:secret@localhost:5432/myca")
+DB_WORKER = os.environ.get("DATABASE_WORKER_URL", "postgresql://worker_service_user:secret@localhost:5432/myca")
 
 client = TestClient(app)
 

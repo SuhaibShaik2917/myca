@@ -106,7 +106,7 @@ def audit_database_roles_and_rls_enforcement():
                 SELECT table_name, privilege_type 
                 FROM information_schema.role_table_grants 
                 WHERE grantee = 'app_service_user' 
-                  AND table_name IN ('government_schemes', 'scheme_eligibility_rules');
+                  AND table_name IN ('government_schemes', 'scheme_eligibility_rules', 'statutory_auditors');
             """)
             grants = cur.fetchall()
             for g_tbl, g_priv in grants:
@@ -184,6 +184,53 @@ def audit_catalogue_write_denials_under_app_service_user():
             db.rollback()
             assert "permission denied" in str(e).lower() or "insufficientprivilege" in str(e).lower() or "programmingerror" in str(e).lower()
         print("  scheme_eligibility_rules DELETE denied [PASS]")
+
+        # H. Write denials on statutory_auditors
+        try:
+            db.execute(text("INSERT INTO public.statutory_auditors (auditor_id, membership_no, name, role, cop_valid_until, approved_by) VALUES ('HACK', '999999', 'Fake', 'CHARTERED_ACCOUNTANT', '2028-01-01', 'Hacker');"))
+            db.commit()
+            raise AssertionError("CRITICAL: INSERT succeeded on statutory_auditors!")
+        except Exception as e:
+            db.rollback()
+            assert "permission denied" in str(e).lower() or "insufficientprivilege" in str(e).lower() or "programmingerror" in str(e).lower()
+        print("  statutory_auditors INSERT denied [PASS]")
+
+        try:
+            db.execute(text("UPDATE public.statutory_auditors SET name = 'Hacked' WHERE auditor_id = 'CA-ICAI-098765';"))
+            db.commit()
+            raise AssertionError("CRITICAL: UPDATE succeeded on statutory_auditors!")
+        except Exception as e:
+            db.rollback()
+            assert "permission denied" in str(e).lower() or "insufficientprivilege" in str(e).lower() or "programmingerror" in str(e).lower()
+        print("  statutory_auditors UPDATE denied [PASS]")
+
+        try:
+            db.execute(text("DELETE FROM public.statutory_auditors WHERE auditor_id = 'CA-ICAI-098765';"))
+            db.commit()
+            raise AssertionError("CRITICAL: DELETE succeeded on statutory_auditors!")
+        except Exception as e:
+            db.rollback()
+            assert "permission denied" in str(e).lower() or "insufficientprivilege" in str(e).lower() or "programmingerror" in str(e).lower()
+        print("  statutory_auditors DELETE denied [PASS]")
+
+        # I. Mutation denials on statutory_audit_signature_replays (Immutable ledger: UPDATE/DELETE denied)
+        try:
+            db.execute(text("UPDATE public.statutory_audit_signature_replays SET doc_id = 'Hacked';"))
+            db.commit()
+            raise AssertionError("CRITICAL: UPDATE succeeded on statutory_audit_signature_replays!")
+        except Exception as e:
+            db.rollback()
+            assert "permission denied" in str(e).lower() or "insufficientprivilege" in str(e).lower() or "programmingerror" in str(e).lower()
+        print("  statutory_audit_signature_replays UPDATE denied [PASS]")
+
+        try:
+            db.execute(text("DELETE FROM public.statutory_audit_signature_replays;"))
+            db.commit()
+            raise AssertionError("CRITICAL: DELETE succeeded on statutory_audit_signature_replays!")
+        except Exception as e:
+            db.rollback()
+            assert "permission denied" in str(e).lower() or "insufficientprivilege" in str(e).lower() or "programmingerror" in str(e).lower()
+        print("  statutory_audit_signature_replays DELETE denied [PASS]")
 
     finally:
         db.close()

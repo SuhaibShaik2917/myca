@@ -16,6 +16,14 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
+# Dynamic database URL override from DB_ADMIN_URL or DATABASE_URL
+env_db_url = os.environ.get("DB_ADMIN_URL") or os.environ.get("DATABASE_URL")
+if env_db_url:
+    cleaned_url = env_db_url
+    if cleaned_url.startswith("postgresql+psycopg://"):
+        cleaned_url = cleaned_url.replace("postgresql+psycopg://", "postgresql://")
+    config.set_main_option("sqlalchemy.url", cleaned_url)
+
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
     context.configure(

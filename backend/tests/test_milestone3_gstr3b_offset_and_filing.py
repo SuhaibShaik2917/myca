@@ -1,3 +1,4 @@
+import os
 import pytest
 from decimal import Decimal
 import uuid
@@ -11,7 +12,7 @@ from app.modules.gstr3b.service import (
     file_gstr3b_to_gsp_sandbox, get_gstr3b_status, GSTR3BServiceError
 )
 
-DB_ADMIN = "postgresql:///myca?user=postgres"
+DB_ADMIN = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
 
 import random
 import string

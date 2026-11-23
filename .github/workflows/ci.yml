@@ -43,7 +43,7 @@ jobs:
       DATABASE_URL: postgresql://app_service_user:secret@localhost:5432/myca
       DATABASE_WORKER_URL: postgresql://worker_service_user:secret@localhost:5432/myca
       DB_ADMIN_URL: postgresql://postgres:postgrespassword@localhost:5432/myca
-      STATUTORY_AUDIT_SIGNING_KEY: "MYCA_PROD_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.4_SECURE_2026_MIN32CHAR"
+      STATUTORY_AUDIT_SIGNING_KEY: "MYCA_CI_TEST_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.5_MIN32CHAR"
       SECRET_KEY: "myca_jwt_test_secret_key_minimum_32_characters_long_for_security"
       ENVIRONMENT: development
       PYTHONPATH: .

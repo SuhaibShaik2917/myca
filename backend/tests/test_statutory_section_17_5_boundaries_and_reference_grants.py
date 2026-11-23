@@ -5,7 +5,9 @@ Regression & Statutory Verification Test Suite:
 3. Goods Transport Vehicles, Passenger Transport Permits, and Ambiguous Facts
 4. Section 17(5)(ab) Vehicle Repairs, Driving Schools, Manufacturers & Insurers
 """
+import os
 import uuid
+from datetime import datetime, timezone, timedelta
 import pytest
 from decimal import Decimal
 from sqlalchemy import text
@@ -1002,16 +1004,17 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     # 9. Scenario D3: Document-Level Rate (18.00%) WITH Authenticated Verified Uniformity Gate
     # When is_uniform_rate_verified is True AND certified by authorized verifier metadata
     # with an authentic cryptographic HMAC-SHA256 signature, valid statutory header rate is applied
+    d3_ts = datetime.now(timezone.utc).isoformat()
     d3_sig = generate_auditor_verification_signature(
         doc_id="p_multi_line_uniform_verified",
         doc_number="INV-MULTI-004C",
         total_invoice_value=Decimal("35400.00"),
         total_tax=Decimal("5400.00"),
         header_rate=Decimal("18.00"),
-        verifier_id="CA-AUDITOR-01",
+        verifier_id="CA-ICAI-098765",
         verifier_role="CHARTERED_ACCOUNTANT",
         evidence_ref="DOC-RATE-AUDIT-2026-11",
-        timestamp="2026-11-23T10:00:00Z"
+        timestamp=d3_ts
     )
     p_doc_uniform_verified = {
         "id": "p_multi_line_uniform_verified",
@@ -1025,10 +1028,10 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         "rate_verification_metadata": {
             "is_verified": True,
             "verifier_role": "CHARTERED_ACCOUNTANT",
-            "verifier_id": "CA-AUDITOR-01",
+            "verifier_id": "CA-ICAI-098765",
             "evidence_ref": "DOC-RATE-AUDIT-2026-11",
             "authorization_token": d3_sig,
-            "verification_timestamp": "2026-11-23T10:00:00Z"
+            "verification_timestamp": d3_ts
         },
         "line_items": [
             {
@@ -1379,16 +1382,17 @@ def test_multi_line_invoice_exception_and_blocked_catering():
     assert food_eval_hsn_mismatch.risk_reversal_amount == Decimal("0.00")
 
     # 14. Scenario D8: Structured Verification Record Acceptance
+    d8_ts = datetime.now(timezone.utc).isoformat()
     d8_sig = generate_auditor_verification_signature(
         doc_id="p_multi_structured_verified",
         doc_number="INV-STRUCTURED-VERIFIED",
         total_invoice_value=Decimal("35400.00"),
         total_tax=Decimal("5400.00"),
         header_rate=Decimal("18.00"),
-        verifier_id="CA-AUDITOR-01",
+        verifier_id="CA-ICAI-098765",
         verifier_role="CHARTERED_ACCOUNTANT",
         evidence_ref="DOC-RATE-AUDIT-2026-11",
-        timestamp="2026-11-23T10:00:00Z"
+        timestamp=d8_ts
     )
     p_doc_structured_verified = {
         "id": "p_multi_structured_verified",
@@ -1401,10 +1405,10 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         "is_uniform_rate_verified": {
             "is_verified": True,
             "verifier_role": "CHARTERED_ACCOUNTANT",
-            "verifier_id": "CA-AUDITOR-01",
+            "verifier_id": "CA-ICAI-098765",
             "evidence_ref": "DOC-RATE-AUDIT-2026-11",
             "authorization_token": d8_sig,
-            "verification_timestamp": "2026-11-23T10:00:00Z"
+            "verification_timestamp": d8_ts
         },
         "line_items": [
             {
@@ -1665,22 +1669,65 @@ def test_statutory_tariff_effective_date_and_subheadings():
     assert valid is False
     assert "40% is prohibited" in msg
 
-    # Fruit juice / milk-based beverages (2202 90, 2202 99 10, 2202 99 21):
-    # Strictly 5% or 12%; 28% and 40% strictly rejected
-    valid, _ = validate_hsn_statutory_rate(Decimal("5.00"), "22029910", post_may_2026)
+    # Fruit juice / milk-based beverages under Notification No. 01/2026-IT (Rate):
+    # Positive and negative tests for each individual tariff item:
+    # 2202 99 10 — Soya milk drinks: strictly 12% (Schedule II; 5% prohibited)
+    valid, _ = validate_hsn_statutory_rate(Decimal("12.00"), "22029910", post_may_2026)
     assert valid is True
-    valid, _ = validate_hsn_statutory_rate(Decimal("12.00"), "22029921", post_may_2026)
-    assert valid is True
-    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "22029910", post_may_2026)
+    valid, msg = validate_hsn_statutory_rate(Decimal("5.00"), "22029910", post_may_2026)
     assert valid is False
-    assert "statutory rate is 5% or 12%" in msg
-    valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), "22029921", post_may_2026)
-    assert valid is False
+    assert "statutory rate is 12% strictly" in msg
 
-    # Broad heading 2202 without subheading: fails safe to review
-    valid, msg = validate_hsn_statutory_rate(Decimal("40.00"), "2202", post_may_2026)
+    # 2202 99 21 — Fruit pulp or juice drinks: strictly 5% (Schedule I; 12% prohibited)
+    valid, _ = validate_hsn_statutory_rate(Decimal("5.00"), "22029921", post_may_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("12.00"), "22029921", post_may_2026)
     assert valid is False
-    assert "AMBIGUOUS_TARIFF" in msg
+    assert "statutory rate is 5% strictly" in msg
+
+    # 2202 99 29 — Other fruit juice drinks: strictly 5% (Schedule I; 12% prohibited)
+    valid, _ = validate_hsn_statutory_rate(Decimal("5.00"), "22029929", post_may_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("12.00"), "22029929", post_may_2026)
+    assert valid is False
+    assert "statutory rate is 5% strictly" in msg
+
+    # 2202 99 30 — Beverages containing milk: strictly 12% (Schedule II; 5% prohibited)
+    valid, _ = validate_hsn_statutory_rate(Decimal("12.00"), "22029930", post_may_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("5.00"), "22029930", post_may_2026)
+    assert valid is False
+    assert "statutory rate is 12% strictly" in msg
+
+    # 2202 99 31 — Specified milk-containing drinks / tender coconut: strictly 5% (Schedule I; 12% prohibited)
+    valid, _ = validate_hsn_statutory_rate(Decimal("5.00"), "22029931", post_may_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("12.00"), "22029931", post_may_2026)
+    assert valid is False
+    assert "statutory rate is 5% strictly" in msg
+
+    # 2202 99 39 — Other beverages containing milk: strictly 5% (Schedule I; 12% prohibited)
+    valid, _ = validate_hsn_statutory_rate(Decimal("5.00"), "22029939", post_may_2026)
+    assert valid is True
+    valid, msg = validate_hsn_statutory_rate(Decimal("12.00"), "22029939", post_may_2026)
+    assert valid is False
+    assert "statutory rate is 5% strictly" in msg
+
+    # Rejection of 28% and 40% on fruit and milk beverages
+    for hsn_item in ["22029910", "22029921", "22029929", "22029930", "22029931", "22029939"]:
+        valid, _ = validate_hsn_statutory_rate(Decimal("28.00"), hsn_item, post_may_2026)
+        assert valid is False
+        valid, _ = validate_hsn_statutory_rate(Decimal("40.00"), hsn_item, post_may_2026)
+        assert valid is False
+
+    # Incomplete or broad parent codes (2202, 220290, 220299, 22029920) fail safe to AMBIGUOUS_TARIFF
+    for amb_2202 in ["2202", "220290", "220299", "22029920"]:
+        valid, msg = validate_hsn_statutory_rate(Decimal("5.00"), amb_2202, post_may_2026)
+        assert valid is False
+        assert "AMBIGUOUS_TARIFF" in msg
+        valid, msg = validate_hsn_statutory_rate(Decimal("12.00"), amb_2202, post_may_2026)
+        assert valid is False
+        assert "AMBIGUOUS_TARIFF" in msg
 
 
 # ============================================================================
@@ -1703,9 +1750,12 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
     from app.modules.reconciliation.itc_engine import (
         _is_strictly_verified_uniform_rate,
         generate_auditor_verification_signature,
-        TRUSTED_STATUTORY_AUDITOR_REGISTRY,
+        validate_auditor_credentials,
+        onboard_verified_statutory_auditor,
+        revoke_statutory_auditor,
         reset_audit_signature_cache_for_testing,
     )
+    from app.database import SessionLocal
 
     reset_audit_signature_cache_for_testing()
 
@@ -1719,7 +1769,7 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
     sgst = Decimal("9000.00")
     total_tax = cgst + sgst
     header_rate = Decimal("18.00")
-    verifier_id = "CA-AUDITOR-01"
+    verifier_id = "CA-ICAI-098765"
     verifier_role = "CHARTERED_ACCOUNTANT"
     evidence_ref = "AUDIT-CERT-2026-99"
     ts = datetime.now(timezone.utc).isoformat()
@@ -1768,7 +1818,7 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
     tampered_doc["total_invoice_value"] = Decimal("120000.00")
     assert _is_strictly_verified_uniform_rate(tampered_doc) is False
 
-    # 4. Unregistered auditor ID (not in TRUSTED_STATUTORY_AUDITOR_REGISTRY) -> Rejected
+    # 4. Unregistered auditor ID (not in controlled database) -> Rejected
     unreg_doc = dict(base_doc)
     unreg_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
     unreg_doc["rate_verification_metadata"]["verifier_id"] = "CA-FAKE-99"
@@ -1780,10 +1830,10 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
     unreg_doc["rate_verification_metadata"]["authorization_token"] = unreg_sig
     assert _is_strictly_verified_uniform_rate(unreg_doc) is False
 
-    # 5. Revoked auditor ID (in REVOKED_STATUTORY_AUDITOR_IDS) -> Rejected
+    # 5. Revoked auditor ID (in controlled database with is_revoked=true) -> Rejected
     revoked_doc = dict(base_doc)
     revoked_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
-    revoked_doc["rate_verification_metadata"]["verifier_id"] = "CA-REVOKED-99"
+    revoked_doc["rate_verification_metadata"]["verifier_id"] = "CA-REVOKED-011223"
     assert _is_strictly_verified_uniform_rate(revoked_doc) is False
 
     # 6. Role mismatch (auditor is CHARTERED_ACCOUNTANT but claims STATUTORY_AUDITOR) -> Rejected
@@ -1845,12 +1895,72 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
     future_doc["rate_verification_metadata"]["authorization_token"] = fut_sig
     assert _is_strictly_verified_uniform_rate(future_doc) is False
 
-    # 13. Replay Protection: Token issued for doc1 replayed on doc2 -> Rejected
+    # 13. Persistent Replay Protection: Token issued for doc1 replayed on doc2 -> Rejected
     doc2_doc = dict(base_doc)
     doc2_doc["id"] = "INV-DOC-AUTH-002"
     doc2_doc["document_number"] = "INV/2026/002"
     # Even if total tax and value match, token was already bound to doc1
     assert _is_strictly_verified_uniform_rate(doc2_doc) is False
+
+    # 14. Database-Backed Auditor Onboarding, Credential Validation & Revocation
+    # Note: app_service_user has strictly SELECT on public.statutory_auditors.
+    # Administrative onboarding requires admin credentials (DB_ADMIN_URL).
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    db_admin_url = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
+    admin_engine = create_engine(db_admin_url)
+    AdminSession = sessionmaker(bind=admin_engine)
+    admin_db = AdminSession()
+    app_db = SessionLocal()
+    try:
+        # A. Onboard new verified CA with genuine 6-digit ICAI number using admin_db
+        new_auditor = onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id="CA-TEST-654321",
+            membership_no="654321",
+            name="CA Vikram Malhotra",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by="ICAI-ADMIN-CHIEF-01",
+            firm_registration_no="654321N"
+        )
+        assert new_auditor["membership_no"] == "654321"
+
+        # B. Validate credentials succeed for newly onboarded CA using app_db (app_service_user)
+        is_valid, msg = validate_auditor_credentials("CA-TEST-654321", "CHARTERED_ACCOUNTANT", db=app_db)
+        assert is_valid is True, f"Failed validation: {msg}"
+        assert "654321" in msg
+
+        # C. Revoke the newly onboarded CA using admin_db
+        revoked = revoke_statutory_auditor(
+            db=admin_db,
+            auditor_id="CA-TEST-654321",
+            revoked_by="ICAI-DISCIPLINARY-BOARD",
+            reason="Notice 44/2026 Suspension"
+        )
+        assert revoked is True
+
+        # D. Validate credentials now FAIL for revoked CA using app_db
+        is_valid, msg = validate_auditor_credentials("CA-TEST-654321", "CHARTERED_ACCOUNTANT", db=app_db)
+        assert is_valid is False
+        assert "REVOKED_AUDITOR" in msg
+
+        # E. Invalid non-6-digit membership numbers raise ValueError
+        try:
+            onboard_verified_statutory_auditor(
+                db=admin_db,
+                auditor_id="CA-BAD-01",
+                membership_no="12345",  # 5 digits (invalid)
+                name="Bad",
+                role="CHARTERED_ACCOUNTANT",
+                approved_by="Admin"
+            )
+            assert False, "Must reject non-6-digit membership number"
+        except ValueError:
+            pass
+    finally:
+        admin_db.close()
+        app_db.close()
 
 
 # ============================================================================
