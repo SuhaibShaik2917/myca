@@ -1,16 +1,15 @@
-import json
 import os
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
-from jose import JWTError, jwt
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import text
 
 from app.config import settings
 from app.core.security import create_access_token
 from app.database import SessionLocal, verify_and_resolve_tenant_membership
+from app.modules.auth.idp_verifier import validate_idp_token
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -35,34 +34,62 @@ class IdpTokenExchangeRequest(BaseModel):
     user_email: Optional[str] = None
 
 
+def is_demo_token_allowed() -> bool:
+    """
+    Determines if demo token generation is permitted.
+    Demo tokens are disabled by default across all environments.
+    They are only permitted when:
+    1. The environment is explicitly designated as local/test ('development' or 'test').
+    2. ALLOW_DEMO_TOKENS is explicitly set to true.
+    """
+    raw_env = os.getenv("ENVIRONMENT") or getattr(settings, "ENVIRONMENT", "")
+    env = str(raw_env).strip().lower() if raw_env else ""
+    if env not in ("development", "test"):
+        return False
+    
+    allow_flag = getattr(settings, "ALLOW_DEMO_TOKENS", False) or (
+        os.getenv("ALLOW_DEMO_TOKENS", "").strip().lower() in ("true", "1", "yes")
+    )
+    return bool(allow_flag)
+
+
 @router.post("/demo-token", response_model=DemoTokenResponse)
 def issue_demo_token(payload: DemoTokenRequest) -> DemoTokenResponse:
     """
-    Hackathon/demo token issuer. Strictly prohibited in production.
+    Development/test demo token issuer. Strictly prohibited in production and staging.
 
-    Verifies active organization membership, then issues a short-lived signed
-    access token. In production (ENVIRONMENT=production), this endpoint is
-    disabled unconditionally with HTTP 403 to prevent unauthenticated admin
-    token acquisition.
+    Disabled by default. Permitted exclusively in designated local/test environments
+    when ALLOW_DEMO_TOKENS=true is explicitly configured. An unset, invalid, production,
+    or staging environment strictly fails closed with HTTP 403 Forbidden.
     """
-    env = (os.getenv("ENVIRONMENT") or settings.ENVIRONMENT or "development").strip().lower()
-    if env == "production":
+    raw_env = os.getenv("ENVIRONMENT") or getattr(settings, "ENVIRONMENT", "")
+    env = str(raw_env).strip().lower() if raw_env else "unspecified"
+    
+    if env not in ("development", "test"):
         raise HTTPException(
-            status_code=403,
-            detail="DEMO_TOKEN_PROHIBITED_IN_PRODUCTION: /auth/demo-token is strictly disabled in production environments. Production requests must authenticate via an authorized identity provider.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"DEMO_TOKEN_PROHIBITED: /auth/demo-token is strictly disabled in '{env}' environment. "
+                   "Production and staging requests must authenticate via an authorized Identity Provider.",
+        )
+
+    if not is_demo_token_allowed():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="DEMO_TOKEN_DISABLED_BY_DEFAULT: /auth/demo-token is disabled by default. "
+                   "It can only be enabled in designated local/test environments via explicit ALLOW_DEMO_TOKENS=true configuration.",
         )
 
     try:
         uuid.UUID(payload.user_id)
         uuid.UUID(payload.org_id)
     except (ValueError, AttributeError, TypeError):
-        raise HTTPException(status_code=401, detail="Invalid user_id or org_id")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid user_id or org_id")
 
     db = SessionLocal()
     try:
         if not verify_and_resolve_tenant_membership(db, payload.user_id, payload.org_id):
             raise HTTPException(
-                status_code=403,
+                status_code=status.HTTP_403_FORBIDDEN,
                 detail="User does not possess active membership in the requested organization",
             )
     finally:
@@ -81,60 +108,42 @@ def issue_demo_token(payload: DemoTokenRequest) -> DemoTokenResponse:
 def exchange_idp_token(payload: IdpTokenExchangeRequest) -> DemoTokenResponse:
     """
     Production authenticated login flow via federated Identity Provider (IdP).
-    Verifies IdP assertion, matches authenticated email to registered active user in
-    public.global_users, verifies active tenant membership in public.organization_memberships,
-    and returns a cryptographically signed MyCA access token.
+    Rigorously validates IdP token signature, algorithm confusion defenses, issuer,
+    audience, expiration, and claims.
+    
+    Matches verified identity claim to an active registered user in public.global_users,
+    verifies active tenant membership in public.organization_memberships, and issues
+    a cryptographically signed MyCA access token.
     """
     try:
         uuid.UUID(payload.org_id)
     except (ValueError, AttributeError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid org_id format")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid org_id format")
 
-    env = (os.getenv("ENVIRONMENT") or settings.ENVIRONMENT or "development").strip().lower()
-    idp_issuer = os.getenv("MYCA_IDP_ISSUER")
-    idp_pubkey = os.getenv("MYCA_IDP_PUBLIC_KEY")
+    raw_env = os.getenv("ENVIRONMENT") or getattr(settings, "ENVIRONMENT", "")
+    env = str(raw_env).strip().lower() if raw_env else "development"
 
-    if env == "production" and not (idp_issuer and idp_pubkey):
-        raise HTTPException(
-            status_code=503,
-            detail="IDP_INTEGRATION_UNAVAILABLE: External Identity Provider trust anchor is not configured in this production environment.",
-        )
-
-    # In test/development mode, verify test IdP token signature or structured claims
-    verified_email = None
-    if idp_pubkey:
-        try:
-            claims = jwt.decode(payload.idp_token, idp_pubkey, algorithms=["RS256", "ES256", "HS256"])
-            verified_email = claims.get("email") or claims.get("sub")
-        except JWTError as exc:
-            raise HTTPException(status_code=401, detail=f"INVALID_IDP_TOKEN: {str(exc)}")
-    elif env in ("development", "test"):
-        # Permitted test assertion parser for unit and integration testing
-        try:
-            claims = jwt.decode(payload.idp_token, settings.SECRET_KEY, algorithms=["HS256"])
-            verified_email = claims.get("email") or claims.get("sub")
-        except JWTError:
-            # Fallback for structured test payloads in non-production
-            if payload.user_email and "@" in payload.user_email:
-                verified_email = payload.user_email
-            else:
-                raise HTTPException(status_code=401, detail="INVALID_IDP_TOKEN: Signature verification failed")
-    else:
-        raise HTTPException(status_code=401, detail="AUTHENTICATION_FAILED: Unverifiable IdP token")
-
+    # Cryptographically validate the IdP token and its claims (fails closed on invalid/untrusted tokens)
+    verified_claims = validate_idp_token(payload.idp_provider, payload.idp_token, env=env)
+    
+    # Extract identity strictly from verified token claims (never from unauthenticated payload fields)
+    verified_email = (verified_claims.get("email") or verified_claims.get("sub") or "").strip().lower()
     if not verified_email:
-        raise HTTPException(status_code=401, detail="INVALID_IDP_TOKEN: Missing authenticated user email")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="INVALID_IDP_TOKEN: Token did not contain a verified email or subject claim.",
+        )
 
     db = SessionLocal()
     try:
         user_row = db.execute(
             text("SELECT id, email, is_active FROM public.global_users WHERE email = :email;"),
-            {"email": verified_email.strip().lower()},
+            {"email": verified_email},
         ).fetchone()
 
         if not user_row:
             raise HTTPException(
-                status_code=401,
+                status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"UNREGISTERED_IDP_USER: User with email '{verified_email}' is not registered in MyCA.",
             )
 
@@ -143,14 +152,14 @@ def exchange_idp_token(payload: IdpTokenExchangeRequest) -> DemoTokenResponse:
 
         if not is_active:
             raise HTTPException(
-                status_code=403,
+                status_code=status.HTTP_403_FORBIDDEN,
                 detail="SUSPENDED_USER: User account is inactive or suspended.",
             )
 
         if not verify_and_resolve_tenant_membership(db, user_id, payload.org_id):
             raise HTTPException(
-                status_code=403,
-                detail="User does not possess active membership in the requested organization",
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="TENANT_MEMBERSHIP_REQUIRED: User does not possess active membership in the requested organization.",
             )
     finally:
         db.close()

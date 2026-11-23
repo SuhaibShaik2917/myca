@@ -187,7 +187,54 @@ def load_trusted_0019_reference():
         "computed_sha256": actual_hash
     }
 
+def assert_disposable_database_environment(db_url: str):
+    """
+    CRITICAL SAFETY GUARD:
+    Refuses to execute destructive rollback operations against production, staging,
+    or any database not explicitly designated as disposable for testing.
+    """
+    # 1. Environment check
+    env = (os.getenv("ENVIRONMENT") or "").strip().lower()
+    if env in ("production", "staging"):
+        raise RuntimeError(
+            f"CRITICAL SAFETY ABORT: verify_migration_rollback_state.py cannot run in '{env}' environment! "
+            "Destructive migration rollback is strictly prohibited in production and staging."
+        )
+
+    # 2. Disposable database marker check
+    disposable_flag = (os.getenv("ALLOW_DISPOSABLE_DATABASE_ROLLBACK") or "").strip().lower()
+    if disposable_flag not in ("true", "1", "yes"):
+        raise RuntimeError(
+            "CRITICAL SAFETY ABORT: verify_migration_rollback_state.py executes destructive database operations "
+            "(Alembic downgrades, test seeding, and baseline drops). To prevent accidental execution against non-disposable "
+            "databases, you must explicitly set ALLOW_DISPOSABLE_DATABASE_ROLLBACK=true in a designated test/ci environment."
+        )
+
+    # 3. Connection URL safety inspection
+    from urllib.parse import urlparse
+    parsed = urlparse(db_url)
+    hostname = (parsed.hostname or "").lower()
+    dbname = (parsed.path or "").lstrip("/").lower()
+
+    # Database host check: must be local/test instance
+    allowed_hosts = {"localhost", "127.0.0.1", "postgres", "db", "test-db", ""}
+    if hostname not in allowed_hosts:
+        raise RuntimeError(
+            f"CRITICAL SAFETY ABORT: Database host '{hostname}' is not an authorized local/test disposable host. "
+            "Destructive rollback verification is strictly prohibited against external or cloud targets."
+        )
+
+    # Database name check: strictly prohibit targets containing production or live keywords
+    forbidden_markers = ["prod", "production", "live"]
+    for marker in forbidden_markers:
+        if marker in dbname or marker in hostname:
+            raise RuntimeError(
+                f"CRITICAL SAFETY ABORT: Database target '{dbname or hostname}' contains production identifier '{marker}'. "
+                "Destructive rollback verification is strictly forbidden against production targets."
+            )
+
 def main():
+    assert_disposable_database_environment(DB_ADMIN_URL)
     conn = psycopg.connect(DB_ADMIN_URL)
     conn.autocommit = True
 

@@ -49,6 +49,8 @@ jobs:
       STATUTORY_AUDIT_SIGNING_KEY: "MYCA_CI_TEST_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.6_MIN32CHAR"
       SECRET_KEY: "myca_jwt_test_secret_key_minimum_32_characters_long_for_security"
       ENVIRONMENT: development
+      ALLOW_DEMO_TOKENS: "true"
+      ALLOW_DISPOSABLE_DATABASE_ROLLBACK: "true"
       PYTHONPATH: .
     steps:
       - uses: actions/checkout@v4
