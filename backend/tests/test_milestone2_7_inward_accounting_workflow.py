@@ -27,7 +27,7 @@ from app.modules.reconciliation.rcm_service import validate_rcm_and_gta_eligibil
 
 client = TestClient(app)
 
-DB_ADMIN = "postgresql://postgres:postgres@localhost:5432/myca"
+from tests.test_db_config import DB_ADMIN
 
 
 @pytest.fixture

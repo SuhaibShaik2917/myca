@@ -16,7 +16,7 @@ from app.modules.scheme_navigator.service import (
     get_or_create_business_profile, upsert_business_profile
 )
 
-DB_ADMIN = os.environ.get("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/myca")
+from tests.test_db_config import DB_ADMIN
 
 @pytest.fixture
 def m5_tenant():

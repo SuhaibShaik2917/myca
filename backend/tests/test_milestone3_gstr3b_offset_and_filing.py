@@ -12,7 +12,7 @@ from app.modules.gstr3b.service import (
     file_gstr3b_to_gsp_sandbox, get_gstr3b_status, GSTR3BServiceError
 )
 
-DB_ADMIN = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
+from tests.test_db_config import DB_ADMIN
 
 import random
 import string

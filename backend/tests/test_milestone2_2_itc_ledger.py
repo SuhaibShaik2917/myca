@@ -17,8 +17,7 @@ from app.modules.reconciliation.itc_engine import StatutoryITCRiskEngine
 from app.modules.reconciliation.schemas import ITCEligibilityEnum
 from app.modules.reconciliation.gstr3b_itc import generate_gstr3b_table4_summary
 
-DB_ADMIN = "postgresql://postgres:postgres@localhost:5432/myca"
-DB_APP = "postgresql://app_service_user:app_service_secret@localhost:5432/myca"
+from tests.test_db_config import DB_ADMIN, DB_APP
 
 client = TestClient(app)
 

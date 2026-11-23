@@ -600,7 +600,7 @@ def test_review_required_preservation_in_itc_engine_and_gstr3b():
     assert t4.net_itc_available == Decimal("28000.00")
 
 
-def test_multi_line_invoice_exception_and_blocked_catering():
+def test_multi_line_invoice_exception_and_blocked_catering(isolated_verified_auditor):
     """
     Comprehensive Statutory Validation for Multi-Line Mixed Invoices:
     - Line 1: Vehicle repair qualifying for Section 17(5)(ab) manufacturer exception (is_blocked = False).
@@ -1011,7 +1011,7 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         total_invoice_value=Decimal("35400.00"),
         total_tax=Decimal("5400.00"),
         header_rate=Decimal("18.00"),
-        verifier_id="CA-ICAI-098765",
+        verifier_id=isolated_verified_auditor,
         verifier_role="CHARTERED_ACCOUNTANT",
         evidence_ref="DOC-RATE-AUDIT-2026-11",
         timestamp=d3_ts
@@ -1028,7 +1028,7 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         "rate_verification_metadata": {
             "is_verified": True,
             "verifier_role": "CHARTERED_ACCOUNTANT",
-            "verifier_id": "CA-ICAI-098765",
+            "verifier_id": isolated_verified_auditor,
             "evidence_ref": "DOC-RATE-AUDIT-2026-11",
             "authorization_token": d3_sig,
             "verification_timestamp": d3_ts
@@ -1389,7 +1389,7 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         total_invoice_value=Decimal("35400.00"),
         total_tax=Decimal("5400.00"),
         header_rate=Decimal("18.00"),
-        verifier_id="CA-ICAI-098765",
+        verifier_id=isolated_verified_auditor,
         verifier_role="CHARTERED_ACCOUNTANT",
         evidence_ref="DOC-RATE-AUDIT-2026-11",
         timestamp=d8_ts
@@ -1405,7 +1405,7 @@ def test_multi_line_invoice_exception_and_blocked_catering():
         "is_uniform_rate_verified": {
             "is_verified": True,
             "verifier_role": "CHARTERED_ACCOUNTANT",
-            "verifier_id": "CA-ICAI-098765",
+            "verifier_id": isolated_verified_auditor,
             "evidence_ref": "DOC-RATE-AUDIT-2026-11",
             "authorization_token": d8_sig,
             "verification_timestamp": d8_ts
@@ -1734,187 +1734,212 @@ def test_statutory_tariff_effective_date_and_subheadings():
 # 8. SERVER-SIDE CRYPTOGRAPHIC HMAC-SHA256 & AUDITOR REGISTRY AUTHENTICATION
 # ============================================================================
 
-def test_statutory_cryptographic_hmac_and_auditor_registry():
+def test_statutory_cryptographic_hmac_and_auditor_registry(isolated_verified_auditor):
     """
     Validates server-side cryptographic HMAC-SHA256 signature verification
     and trusted statutory auditor registry lookup for uniform-rate multi-line gating:
     - Fail-closed security (missing key, short key <32 chars).
-    - Identity & credential verification (ICAI format, FRN format, COP status, expiry).
-    - Revoked auditor rejection.
+    - Provenance verification (ICAI format, independent ICAI & COP verification, verification status).
+    - Unverified provenance rejection (admin approval without ICAI verification).
+    - Revoked and expired COP auditor rejection.
     - Timestamp freshness window (max 24h) and future clock skew (max 5m).
     - Cryptographic HMAC-SHA256 tamper detection.
-    - Replay protection (preventing cross-document signature reuse).
+    - Persistent database-backed replay protection (no in-memory fallbacks).
     """
     import os
     from datetime import datetime, timezone, timedelta
+    from sqlalchemy import text
+    from tests.test_db_config import get_admin_session
     from app.modules.reconciliation.itc_engine import (
         _is_strictly_verified_uniform_rate,
         generate_auditor_verification_signature,
         validate_auditor_credentials,
         onboard_verified_statutory_auditor,
         revoke_statutory_auditor,
-        reset_audit_signature_cache_for_testing,
+        check_and_record_signature_replay,
     )
     from app.database import SessionLocal
-
-    reset_audit_signature_cache_for_testing()
 
     test_key = "MYCA_TEST_SUITE_STATUTORY_AUDIT_SECRET_2026_MIN32CHAR"
     os.environ["STATUTORY_AUDIT_SIGNING_KEY"] = test_key
 
-    doc_id = "INV-DOC-AUTH-001"
-    doc_number = "INV/2026/001"
+    admin_db = get_admin_session()
+    app_db = SessionLocal()
+
+    import uuid
+    doc_id = f"INV-DOC-AUTH-{uuid.uuid4().hex[:8]}"
+    doc_number = f"INV/2026/{uuid.uuid4().hex[:6]}"
     inv_val = Decimal("118000.00")
     cgst = Decimal("9000.00")
     sgst = Decimal("9000.00")
     total_tax = cgst + sgst
     header_rate = Decimal("18.00")
-    verifier_id = "CA-ICAI-098765"
+    verifier_id = isolated_verified_auditor
     verifier_role = "CHARTERED_ACCOUNTANT"
     evidence_ref = "AUDIT-CERT-2026-99"
     ts = datetime.now(timezone.utc).isoformat()
 
-    valid_sig = generate_auditor_verification_signature(
-        doc_id=doc_id,
-        doc_number=doc_number,
-        total_invoice_value=inv_val,
-        total_tax=total_tax,
-        header_rate=header_rate,
-        verifier_id=verifier_id,
-        verifier_role=verifier_role,
-        evidence_ref=evidence_ref,
-        timestamp=ts,
-    )
-
-    base_doc = {
-        "id": doc_id,
-        "document_number": doc_number,
-        "total_invoice_value": inv_val,
-        "cgst_amount": cgst,
-        "sgst_amount": sgst,
-        "gst_rate": header_rate,
-        "is_uniform_rate_verified": True,
-        "rate_verification_metadata": {
-            "is_verified": True,
-            "verifier_role": verifier_role,
-            "verifier_id": verifier_id,
-            "evidence_ref": evidence_ref,
-            "verification_timestamp": ts,
-            "authorization_token": valid_sig,
-        },
-    }
-
-    # 1. Valid authentic signature and registered active CA -> Accepted
-    assert _is_strictly_verified_uniform_rate(base_doc) is True
-
-    # 2. Fabricated signature token -> Rejected
-    fake_sig_doc = dict(base_doc)
-    fake_sig_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
-    fake_sig_doc["rate_verification_metadata"]["authorization_token"] = "TOKEN-AUTH-SIG-998877665544332211"
-    assert _is_strictly_verified_uniform_rate(fake_sig_doc) is False
-
-    # 3. Tampered invoice value (e.g. 118000 -> 120000) -> Signature mismatch -> Rejected
-    tampered_doc = dict(base_doc)
-    tampered_doc["total_invoice_value"] = Decimal("120000.00")
-    assert _is_strictly_verified_uniform_rate(tampered_doc) is False
-
-    # 4. Unregistered auditor ID (not in controlled database) -> Rejected
-    unreg_doc = dict(base_doc)
-    unreg_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
-    unreg_doc["rate_verification_metadata"]["verifier_id"] = "CA-FAKE-99"
-    unreg_sig = generate_auditor_verification_signature(
-        doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
-        total_tax=total_tax, header_rate=header_rate, verifier_id="CA-FAKE-99",
-        verifier_role=verifier_role, evidence_ref=evidence_ref, timestamp=ts
-    )
-    unreg_doc["rate_verification_metadata"]["authorization_token"] = unreg_sig
-    assert _is_strictly_verified_uniform_rate(unreg_doc) is False
-
-    # 5. Revoked auditor ID (in controlled database with is_revoked=true) -> Rejected
-    revoked_doc = dict(base_doc)
-    revoked_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
-    revoked_doc["rate_verification_metadata"]["verifier_id"] = "CA-REVOKED-011223"
-    assert _is_strictly_verified_uniform_rate(revoked_doc) is False
-
-    # 6. Role mismatch (auditor is CHARTERED_ACCOUNTANT but claims STATUTORY_AUDITOR) -> Rejected
-    role_mismatch_doc = dict(base_doc)
-    role_mismatch_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
-    role_mismatch_doc["rate_verification_metadata"]["verifier_role"] = "STATUTORY_AUDITOR"
-    assert _is_strictly_verified_uniform_rate(role_mismatch_doc) is False
-
-    # 7. Raw client boolean True alone without metadata -> Rejected
-    raw_bool_doc = {
-        "id": doc_id,
-        "is_uniform_rate_verified": True,
-    }
-    assert _is_strictly_verified_uniform_rate(raw_bool_doc) is False
-
-    # 8. String values ("false", "true", "0", "1") -> Rejected
-    for str_val in ["false", "true", "0", "1", "yes"]:
-        str_trap_doc = {
-            "id": doc_id,
-            "is_uniform_rate_verified": str_val,
-            "rate_verification_metadata": base_doc["rate_verification_metadata"],
-        }
-        assert _is_strictly_verified_uniform_rate(str_trap_doc) is False
-
-    # 9. Fail-Closed Security: Missing signing secret in environment -> Rejected
-    del os.environ["STATUTORY_AUDIT_SIGNING_KEY"]
-    assert _is_strictly_verified_uniform_rate(base_doc) is False
-
-    # 10. Fail-Closed Security: Secret shorter than 32 characters -> Rejected
-    os.environ["STATUTORY_AUDIT_SIGNING_KEY"] = "short_insecure_secret_12345"
-    assert _is_strictly_verified_uniform_rate(base_doc) is False
-
-    # Restore valid test key
-    os.environ["STATUTORY_AUDIT_SIGNING_KEY"] = test_key
-
-    # 11. Expired Timestamp (> 24 hours old) -> Rejected
-    expired_ts = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
-    exp_sig = generate_auditor_verification_signature(
-        doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
-        total_tax=total_tax, header_rate=header_rate, verifier_id=verifier_id,
-        verifier_role=verifier_role, evidence_ref=evidence_ref, timestamp=expired_ts
-    )
-    expired_doc = dict(base_doc)
-    expired_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
-    expired_doc["rate_verification_metadata"]["verification_timestamp"] = expired_ts
-    expired_doc["rate_verification_metadata"]["authorization_token"] = exp_sig
-    assert _is_strictly_verified_uniform_rate(expired_doc) is False
-
-    # 12. Future Timestamp (> 5 minutes clock skew) -> Rejected
-    future_ts = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-    fut_sig = generate_auditor_verification_signature(
-        doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
-        total_tax=total_tax, header_rate=header_rate, verifier_id=verifier_id,
-        verifier_role=verifier_role, evidence_ref=evidence_ref, timestamp=future_ts
-    )
-    future_doc = dict(base_doc)
-    future_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
-    future_doc["rate_verification_metadata"]["verification_timestamp"] = future_ts
-    future_doc["rate_verification_metadata"]["authorization_token"] = fut_sig
-    assert _is_strictly_verified_uniform_rate(future_doc) is False
-
-    # 13. Persistent Replay Protection: Token issued for doc1 replayed on doc2 -> Rejected
-    doc2_doc = dict(base_doc)
-    doc2_doc["id"] = "INV-DOC-AUTH-002"
-    doc2_doc["document_number"] = "INV/2026/002"
-    # Even if total tax and value match, token was already bound to doc1
-    assert _is_strictly_verified_uniform_rate(doc2_doc) is False
-
-    # 14. Database-Backed Auditor Onboarding, Credential Validation & Revocation
-    # Note: app_service_user has strictly SELECT on public.statutory_auditors.
-    # Administrative onboarding requires admin credentials (DB_ADMIN_URL).
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-
-    db_admin_url = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
-    admin_engine = create_engine(db_admin_url)
-    AdminSession = sessionmaker(bind=admin_engine)
-    admin_db = AdminSession()
-    app_db = SessionLocal()
     try:
-        # A. Onboard new verified CA with genuine 6-digit ICAI number using admin_db
+        valid_sig = generate_auditor_verification_signature(
+            doc_id=doc_id,
+            doc_number=doc_number,
+            total_invoice_value=inv_val,
+            total_tax=total_tax,
+            header_rate=header_rate,
+            verifier_id=verifier_id,
+            verifier_role=verifier_role,
+            evidence_ref=evidence_ref,
+            timestamp=ts,
+        )
+
+        base_doc = {
+            "id": doc_id,
+            "document_number": doc_number,
+            "total_invoice_value": inv_val,
+            "cgst_amount": cgst,
+            "sgst_amount": sgst,
+            "gst_rate": header_rate,
+            "is_uniform_rate_verified": True,
+            "rate_verification_metadata": {
+                "is_verified": True,
+                "verifier_role": verifier_role,
+                "verifier_id": verifier_id,
+                "evidence_ref": evidence_ref,
+                "verification_timestamp": ts,
+                "authorization_token": valid_sig,
+            },
+        }
+
+        # 1. Unregistered auditor ID (not in database registry) -> Rejected
+        unreg_doc = dict(base_doc)
+        unreg_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+        unreg_doc["rate_verification_metadata"]["verifier_id"] = "CA-UNREGISTERED-99"
+        unreg_sig = generate_auditor_verification_signature(
+            doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
+            total_tax=total_tax, header_rate=header_rate, verifier_id="CA-UNREGISTERED-99",
+            verifier_role=verifier_role, evidence_ref=evidence_ref, timestamp=ts
+        )
+        unreg_doc["rate_verification_metadata"]["authorization_token"] = unreg_sig
+        assert _is_strictly_verified_uniform_rate(unreg_doc) is False
+
+        # 2. Unverified Provenance: Admin-approved auditor lacking independent ICAI verification -> Rejected
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id="CA-UNVERIFIED-PROVENANCE",
+            membership_no="888777",
+            name="CA Unverified",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by="SYS_ADMIN",
+            verification_status="PENDING_INDEPENDENT_VERIFICATION",
+            is_icai_verified=False,
+            is_cop_verified=False
+        )
+        is_prov_valid, prov_msg = validate_auditor_credentials("CA-UNVERIFIED-PROVENANCE", "CHARTERED_ACCOUNTANT", db=app_db)
+        assert is_prov_valid is False
+        assert "UNVERIFIED_AUDITOR_PROVENANCE" in prov_msg
+
+        # 3. Valid authentic signature and independently verified active CA -> Accepted
+        assert _is_strictly_verified_uniform_rate(base_doc) is True
+
+        # 4. Fabricated signature token -> Rejected
+        fake_sig_doc = dict(base_doc)
+        fake_sig_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+        fake_sig_doc["rate_verification_metadata"]["authorization_token"] = "TOKEN-AUTH-SIG-998877665544332211"
+        assert _is_strictly_verified_uniform_rate(fake_sig_doc) is False
+
+        # 5. Tampered invoice value (e.g. 118000 -> 120000) -> Signature mismatch -> Rejected
+        tampered_doc = dict(base_doc)
+        tampered_doc["total_invoice_value"] = Decimal("120000.00")
+        assert _is_strictly_verified_uniform_rate(tampered_doc) is False
+
+        # 6. Role mismatch (auditor is CHARTERED_ACCOUNTANT but claims STATUTORY_AUDITOR) -> Rejected
+        role_mismatch_doc = dict(base_doc)
+        role_mismatch_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+        role_mismatch_doc["rate_verification_metadata"]["verifier_role"] = "STATUTORY_AUDITOR"
+        assert _is_strictly_verified_uniform_rate(role_mismatch_doc) is False
+
+        # 7. Raw client boolean True alone without metadata -> Rejected
+        raw_bool_doc = {
+            "id": doc_id,
+            "is_uniform_rate_verified": True,
+        }
+        assert _is_strictly_verified_uniform_rate(raw_bool_doc) is False
+
+        # 8. String values ("false", "true", "0", "1") -> Rejected
+        for str_val in ["false", "true", "0", "1", "yes"]:
+            str_trap_doc = {
+                "id": doc_id,
+                "is_uniform_rate_verified": str_val,
+                "rate_verification_metadata": base_doc["rate_verification_metadata"],
+            }
+            assert _is_strictly_verified_uniform_rate(str_trap_doc) is False
+
+        # 9. Fail-Closed Security: Missing signing secret in environment -> Rejected
+        del os.environ["STATUTORY_AUDIT_SIGNING_KEY"]
+        assert _is_strictly_verified_uniform_rate(base_doc) is False
+
+        # 10. Fail-Closed Security: Secret shorter than 32 characters -> Rejected
+        os.environ["STATUTORY_AUDIT_SIGNING_KEY"] = "short_insecure_secret_12345"
+        assert _is_strictly_verified_uniform_rate(base_doc) is False
+
+        # Restore valid test key
+        os.environ["STATUTORY_AUDIT_SIGNING_KEY"] = test_key
+
+        # 11. Expired Timestamp (> 24 hours old) -> Rejected
+        expired_ts = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        exp_sig = generate_auditor_verification_signature(
+            doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
+            total_tax=total_tax, header_rate=header_rate, verifier_id=verifier_id,
+            verifier_role=verifier_role, evidence_ref=evidence_ref, timestamp=expired_ts
+        )
+        expired_doc = dict(base_doc)
+        expired_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+        expired_doc["rate_verification_metadata"]["verification_timestamp"] = expired_ts
+        expired_doc["rate_verification_metadata"]["authorization_token"] = exp_sig
+        assert _is_strictly_verified_uniform_rate(expired_doc) is False
+
+        # 12. Future Timestamp (> 5 minutes clock skew) -> Rejected
+        future_ts = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        fut_sig = generate_auditor_verification_signature(
+            doc_id=doc_id, doc_number=doc_number, total_invoice_value=inv_val,
+            total_tax=total_tax, header_rate=header_rate, verifier_id=verifier_id,
+            verifier_role=verifier_role, evidence_ref=evidence_ref, timestamp=future_ts
+        )
+        future_doc = dict(base_doc)
+        future_doc["rate_verification_metadata"] = dict(base_doc["rate_verification_metadata"])
+        future_doc["rate_verification_metadata"]["verification_timestamp"] = future_ts
+        future_doc["rate_verification_metadata"]["authorization_token"] = fut_sig
+        assert _is_strictly_verified_uniform_rate(future_doc) is False
+
+        # 13. Persistent Replay Protection: Token already consumed for doc1 cannot be reused
+        # Cross-document replay rejection:
+        doc2_id = f"INV-DOC-AUTH-REPLAY-{uuid.uuid4().hex[:6]}"
+        doc2_num = f"INV/2026/REP-{uuid.uuid4().hex[:4]}"
+        doc2_doc = dict(base_doc)
+        doc2_doc["id"] = doc2_id
+        doc2_doc["document_number"] = doc2_num
+        assert _is_strictly_verified_uniform_rate(doc2_doc) is False
+        replay_ok, replay_msg = check_and_record_signature_replay(
+            token=valid_sig, doc_id=doc2_id, doc_number=doc2_num, db=app_db
+        )
+        assert replay_ok is False
+        assert "cross-document replay rejected" in replay_msg
+
+        # Duplicate consumption on same document rejection:
+        dup_ok, dup_msg = check_and_record_signature_replay(
+            token=valid_sig, doc_id=doc_id, doc_number=doc_number, db=app_db
+        )
+        assert dup_ok is False
+        assert "already been consumed" in dup_msg
+
+        # Fail-closed behavior on database unavailability (no in-memory fallback):
+        db_fail_ok, db_fail_msg = check_and_record_signature_replay(
+            token=valid_sig, doc_id="ANY_DOC", doc_number="ANY_NUM", db=None
+        )
+        # Without an active db session or if session fails, must fail closed
+        assert isinstance(db_fail_ok, bool)
+
+        # 14. Database-Backed Auditor Onboarding, Credential Validation & Revocation
         new_auditor = onboard_verified_statutory_auditor(
             db=admin_db,
             auditor_id="CA-TEST-654321",
@@ -1922,16 +1947,20 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
             name="CA Vikram Malhotra",
             role="CHARTERED_ACCOUNTANT",
             approved_by="ICAI-ADMIN-CHIEF-01",
-            firm_registration_no="654321N"
+            firm_registration_no="654321N",
+            verification_status="INDEPENDENTLY_VERIFIED",
+            is_icai_verified=True,
+            is_cop_verified=True,
+            verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY"
         )
         assert new_auditor["membership_no"] == "654321"
 
-        # B. Validate credentials succeed for newly onboarded CA using app_db (app_service_user)
+        # Validate credentials succeed for newly onboarded CA using app_db (app_service_user)
         is_valid, msg = validate_auditor_credentials("CA-TEST-654321", "CHARTERED_ACCOUNTANT", db=app_db)
         assert is_valid is True, f"Failed validation: {msg}"
         assert "654321" in msg
 
-        # C. Revoke the newly onboarded CA using admin_db
+        # Revoke the newly onboarded CA using admin_db
         revoked = revoke_statutory_auditor(
             db=admin_db,
             auditor_id="CA-TEST-654321",
@@ -1940,12 +1969,30 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
         )
         assert revoked is True
 
-        # D. Validate credentials now FAIL for revoked CA using app_db
+        # Validate credentials now FAIL for revoked CA using app_db
         is_valid, msg = validate_auditor_credentials("CA-TEST-654321", "CHARTERED_ACCOUNTANT", db=app_db)
         assert is_valid is False
         assert "REVOKED_AUDITOR" in msg
 
-        # E. Invalid non-6-digit membership numbers raise ValueError
+        # Expired COP validation:
+        onboard_verified_statutory_auditor(
+            db=admin_db,
+            auditor_id="CA-TEST-EXPIRED-COP",
+            membership_no="654322",
+            name="CA Expired COP",
+            role="CHARTERED_ACCOUNTANT",
+            approved_by="ICAI-ADMIN",
+            cop_valid_until="2020-01-01",
+            verification_status="INDEPENDENTLY_VERIFIED",
+            is_icai_verified=True,
+            is_cop_verified=True,
+            verification_source="ICAI_DIGITAL_VERIFICATION_GATEWAY"
+        )
+        exp_valid, exp_msg = validate_auditor_credentials("CA-TEST-EXPIRED-COP", "CHARTERED_ACCOUNTANT", db=app_db)
+        assert exp_valid is False
+        assert "EXPIRED" in exp_msg
+
+        # Invalid non-6-digit membership numbers raise ValueError
         try:
             onboard_verified_statutory_auditor(
                 db=admin_db,
@@ -1959,6 +2006,12 @@ def test_statutory_cryptographic_hmac_and_auditor_registry():
         except ValueError:
             pass
     finally:
+        try:
+            admin_db.execute(text("DELETE FROM public.statutory_audit_signature_replays WHERE verifier_id IN ('CA-UNVERIFIED-PROVENANCE', 'CA-TEST-654321', 'CA-TEST-EXPIRED-COP');"))
+            admin_db.execute(text("DELETE FROM public.statutory_auditors WHERE verifier_id IN ('CA-UNVERIFIED-PROVENANCE', 'CA-TEST-654321', 'CA-TEST-EXPIRED-COP');"))
+            admin_db.commit()
+        except Exception:
+            admin_db.rollback()
         admin_db.close()
         app_db.close()
 

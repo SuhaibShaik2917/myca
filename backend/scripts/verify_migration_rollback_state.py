@@ -162,21 +162,21 @@ def main():
     assert baseline_0019["rls_flags"] == trusted_ref["rls_flags"], "RLS flags mismatch with independent reference!"
     print("  PASS: Initial downgrade to 0019 matches independent trusted reference snapshot 100% on full definitions (79 grants, 87 policies, 41 tables).")
 
-    print("\n=== Step 2: Upgrade to Head (0022_statutory_auditors_replay) ===")
+    print("\n=== Step 2: Upgrade to Head (0023_auditor_provenance) ===")
     run_cmd(["alembic", "upgrade", "head"])
     state_head = capture_database_state(conn)
-    print(f"  Head State (0022): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
-    assert len(state_head["grants"]) == 108, f"Expected 108 grants at 0022, got {len(state_head['grants'])}"
-    assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0022, got {len(state_head['policies'])}"
+    print(f"  Head State (0023): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
+    assert len(state_head["grants"]) == 108, f"Expected 108 grants at 0023, got {len(state_head['grants'])}"
+    assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0023, got {len(state_head['policies'])}"
 
     # Verify all 21 tables have relforcerowsecurity=True
     for tbl in TENANT_TABLES_21:
-        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0022"
+        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0023"
     # Verify all 8 0020 policies present
     for p_name in POLICIES_0020_8:
         matching = [p for p in state_head["policies"] if p[2] == p_name]
-        assert len(matching) == 1, f"Policy {p_name} missing at 0022"
-    print("PASS: Head state (0022) completely verified.")
+        assert len(matching) == 1, f"Policy {p_name} missing at 0023"
+    print("PASS: Head state (0023) completely verified.")
 
     print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
     run_cmd(["alembic", "downgrade", "0020_m4_m5_grants_and_policies"])
@@ -222,7 +222,7 @@ def main():
     assert rolled_back_state["rls_flags"] == trusted_ref["rls_flags"], "Rollback RLS flags mismatch with independent reference snapshot!"
     print("  PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.")
 
-    print("\n=== Step 5: Re-Upgrade to Head (0022_statutory_auditors_replay) ===")
+    print("\n=== Step 5: Re-Upgrade to Head (0023_auditor_provenance) ===")
     run_cmd(["alembic", "upgrade", "head"])
     final_head_state = capture_database_state(conn)
     assert final_head_state["grants"] == state_head["grants"]

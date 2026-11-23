@@ -15,7 +15,7 @@ from app.modules.ai_assistant.grounding_service import (
 )
 from app.modules.ai_assistant.gemini_client import answer_ai_query
 
-DB_ADMIN = os.environ.get("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/myca")
+from tests.test_db_config import DB_ADMIN
 
 @pytest.fixture
 def ai_tenant():

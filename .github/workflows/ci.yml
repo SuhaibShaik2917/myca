@@ -42,8 +42,11 @@ jobs:
     env:
       DATABASE_URL: postgresql://app_service_user:secret@localhost:5432/myca
       DATABASE_WORKER_URL: postgresql://worker_service_user:secret@localhost:5432/myca
+      DATABASE_WORKER_1_URL: postgresql://worker_service_user_1:secret@localhost:5432/myca
+      DATABASE_WORKER_2_URL: postgresql://worker_service_user_2:secret@localhost:5432/myca
       DB_ADMIN_URL: postgresql://postgres:postgrespassword@localhost:5432/myca
-      STATUTORY_AUDIT_SIGNING_KEY: "MYCA_CI_TEST_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.5_MIN32CHAR"
+      TEST_DATABASE_URL: postgresql://postgres:postgrespassword@localhost:5432/myca
+      STATUTORY_AUDIT_SIGNING_KEY: "MYCA_CI_TEST_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.6_MIN32CHAR"
       SECRET_KEY: "myca_jwt_test_secret_key_minimum_32_characters_long_for_security"
       ENVIRONMENT: development
       PYTHONPATH: .
@@ -65,7 +68,9 @@ jobs:
       - name: Apply Migrations & Provision Role Passwords
         run: |
           alembic upgrade head
-          PGPASSWORD=postgrespassword psql -h localhost -U postgres -d myca -c "ALTER ROLE app_service_user WITH PASSWORD 'secret'; ALTER ROLE worker_service_user WITH PASSWORD 'secret';"
+          PGPASSWORD=postgrespassword psql -h localhost -U postgres -d myca -c "ALTER ROLE app_service_user WITH PASSWORD 'secret'; ALTER ROLE worker_service_user WITH PASSWORD 'secret'; ALTER ROLE worker_service_user_1 WITH PASSWORD 'secret'; ALTER ROLE worker_service_user_2 WITH PASSWORD 'secret';"
+      - name: Run CI Database & Role Diagnostics
+        run: python scripts/diagnose_ci_database.py
       - name: Execute Full Pytest Suite
         run: python -m pytest tests/ -v --tb=short
       - name: Verify Migration Rollback & Baseline Provenance

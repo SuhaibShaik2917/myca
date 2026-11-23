@@ -1202,49 +1202,12 @@ def get_statutory_audit_signing_key() -> Optional[bytes]:
     return raw_key.encode("utf-8")
 
 
-# In-memory test registry fallback for offline mock test executions
-_TEST_STATUTORY_AUDITOR_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "CA-ICAI-098765": {
-        "auditor_id": "CA-ICAI-098765",
-        "name": "CA Rajesh Kumar",
-        "membership_no": "098765",
-        "firm_registration_no": "123456N",
-        "cop_status": "ACTIVE",
-        "cop_valid_until": "2028-03-31",
-        "role": "CHARTERED_ACCOUNTANT",
-        "approved_by": "ICAI-VERIFIED-ADMIN-OFFICER-SYS",
-        "is_revoked": False
-    },
-    "CA-ICAI-054321": {
-        "auditor_id": "CA-ICAI-054321",
-        "name": "CA Priya Sharma",
-        "membership_no": "054321",
-        "firm_registration_no": "654321W",
-        "cop_status": "ACTIVE",
-        "cop_valid_until": "2027-12-31",
-        "role": "TAX_AUDITOR",
-        "approved_by": "ICAI-VERIFIED-ADMIN-OFFICER-SYS",
-        "is_revoked": False
-    },
-    "CA-REVOKED-011223": {
-        "auditor_id": "CA-REVOKED-011223",
-        "name": "CA Suresh Gupta",
-        "membership_no": "011223",
-        "firm_registration_no": "112233S",
-        "cop_status": "SUSPENDED",
-        "cop_valid_until": "2024-03-31",
-        "role": "CHARTERED_ACCOUNTANT",
-        "approved_by": "ICAI-VERIFIED-ADMIN-OFFICER-SYS",
-        "is_revoked": True,
-        "revocation_reason": "ICAI Disciplinary Committee Order Ref DC/2025/088"
-    }
-}
-
-
 def get_verified_statutory_auditor(verifier_id: str, db: Optional[Any] = None) -> Optional[Dict[str, Any]]:
     """
     Retrieves and authenticates verified statutory auditor credentials from the controlled
     PostgreSQL database (public.statutory_auditors).
+    FAILS CLOSED: Never falls back to in-memory dictionaries. Database unavailability or absence
+    of record returns None immediately.
     """
     v_id = str(verifier_id or "").strip()
     if not v_id:
@@ -1256,49 +1219,54 @@ def get_verified_statutory_auditor(verifier_id: str, db: Optional[Any] = None) -
         try:
             session = SessionLocal()
             close_session = True
-        except Exception:
-            session = None
-
-    if session is not None:
-        try:
-            stmt = text("""
-                SELECT auditor_id, membership_no, firm_registration_no, name, role,
-                       cop_status, cop_valid_until, approved_by, approved_at,
-                       is_revoked, revoked_at, revocation_reason
-                FROM public.statutory_auditors
-                WHERE auditor_id = :vid OR membership_no = :vid;
-            """)
-            row = session.execute(stmt, {"vid": v_id}).fetchone()
-            if row:
-                m = row._mapping
-                return {
-                    "auditor_id": m["auditor_id"],
-                    "membership_no": m["membership_no"],
-                    "firm_registration_no": m["firm_registration_no"],
-                    "name": m["name"],
-                    "role": m["role"],
-                    "cop_status": m["cop_status"],
-                    "cop_valid_until": m["cop_valid_until"],
-                    "approved_by": m["approved_by"],
-                    "approved_at": m["approved_at"],
-                    "is_revoked": bool(m["is_revoked"]),
-                    "revoked_at": m["revoked_at"],
-                    "revocation_reason": m["revocation_reason"]
-                }
         except Exception as ex:
-            logger.warning(f"Database query on statutory_auditors failed: {ex}; falling back to test registry.")
-        finally:
-            if close_session:
-                session.close()
+            logger.error(f"DATABASE_UNAVAILABLE: Failed to obtain database session for auditor lookup: {ex}")
+            return None
 
-    # Fallback for offline / isolated unit test fixtures
-    if v_id in _TEST_STATUTORY_AUDITOR_REGISTRY:
-        return _TEST_STATUTORY_AUDITOR_REGISTRY[v_id]
-    for rec in _TEST_STATUTORY_AUDITOR_REGISTRY.values():
-        if rec.get("membership_no") == v_id:
-            return rec
+    if session is None:
+        logger.error("DATABASE_UNAVAILABLE: No database session available for statutory auditor verification; failing closed.")
+        return None
 
-    return None
+    try:
+        stmt = text("""
+            SELECT auditor_id, membership_no, firm_registration_no, name, role,
+                   cop_status, cop_valid_until, approved_by, approved_at,
+                   is_revoked, revoked_at, revocation_reason,
+                   verification_source, verification_status, is_icai_verified, is_cop_verified,
+                   verified_at, verification_evidence_ref
+            FROM public.statutory_auditors
+            WHERE auditor_id = :vid OR membership_no = :vid;
+        """)
+        row = session.execute(stmt, {"vid": v_id}).fetchone()
+        if row:
+            m = row._mapping
+            return {
+                "auditor_id": m["auditor_id"],
+                "membership_no": m["membership_no"],
+                "firm_registration_no": m["firm_registration_no"],
+                "name": m["name"],
+                "role": m["role"],
+                "cop_status": m["cop_status"],
+                "cop_valid_until": m["cop_valid_until"],
+                "approved_by": m["approved_by"],
+                "approved_at": m["approved_at"],
+                "is_revoked": bool(m["is_revoked"]),
+                "revoked_at": m["revoked_at"],
+                "revocation_reason": m["revocation_reason"],
+                "verification_source": m.get("verification_source", "MANUAL_REVIEW"),
+                "verification_status": m.get("verification_status", "PENDING_INDEPENDENT_VERIFICATION"),
+                "is_icai_verified": bool(m.get("is_icai_verified", False)),
+                "is_cop_verified": bool(m.get("is_cop_verified", False)),
+                "verified_at": m.get("verified_at"),
+                "verification_evidence_ref": m.get("verification_evidence_ref")
+            }
+        return None
+    except Exception as ex:
+        logger.error(f"DATABASE_QUERY_FAILURE: Query on statutory_auditors failed: {ex}; failing closed.")
+        return None
+    finally:
+        if close_session:
+            session.close()
 
 
 def onboard_verified_statutory_auditor(
@@ -1311,9 +1279,15 @@ def onboard_verified_statutory_auditor(
     firm_registration_no: Optional[str] = None,
     cop_status: str = "ACTIVE",
     cop_valid_until: Optional[date] = None,
+    verification_source: str = "MANUAL_REVIEW",
+    verification_status: str = "PENDING_INDEPENDENT_VERIFICATION",
+    is_icai_verified: bool = False,
+    is_cop_verified: bool = False,
+    verified_at: Optional[datetime] = None,
+    verification_evidence_ref: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Onboards an independently verified statutory auditor into the controlled database registry.
+    Onboards an auditor into the controlled database registry with explicit verification provenance.
     Validates genuine 6-digit ICAI membership number, FRN, COP validity, and records approver metadata.
     """
     if not re.match(r"^[0-9]{6}$", str(membership_no).strip()):
@@ -1327,9 +1301,12 @@ def onboard_verified_statutory_auditor(
     stmt = text("""
         INSERT INTO public.statutory_auditors (
             auditor_id, membership_no, firm_registration_no, name, role,
-            cop_status, cop_valid_until, approved_by, approved_at, is_revoked
+            cop_status, cop_valid_until, approved_by, approved_at, is_revoked,
+            verification_source, verification_status, is_icai_verified, is_cop_verified,
+            verified_at, verification_evidence_ref
         ) VALUES (
-            :aid, :mem, :frn, :name, :role, :cop, :until, :app_by, clock_timestamp(), false
+            :aid, :mem, :frn, :name, :role, :cop, :until, :app_by, clock_timestamp(), false,
+            :v_src, :v_stat, :icai_v, :cop_v, :v_at, :v_ref
         )
         ON CONFLICT (auditor_id) DO UPDATE SET
             membership_no = EXCLUDED.membership_no,
@@ -1342,8 +1319,15 @@ def onboard_verified_statutory_auditor(
             is_revoked = false,
             revoked_at = NULL,
             revocation_reason = NULL,
+            verification_source = EXCLUDED.verification_source,
+            verification_status = EXCLUDED.verification_status,
+            is_icai_verified = EXCLUDED.is_icai_verified,
+            is_cop_verified = EXCLUDED.is_cop_verified,
+            verified_at = EXCLUDED.verified_at,
+            verification_evidence_ref = EXCLUDED.verification_evidence_ref,
             updated_at = clock_timestamp()
-        RETURNING auditor_id, membership_no, name, role, cop_status, cop_valid_until, approved_by;
+        RETURNING auditor_id, membership_no, name, role, cop_status, cop_valid_until, approved_by,
+                  verification_source, verification_status, is_icai_verified, is_cop_verified;
     """)
     res = db.execute(stmt, {
         "aid": auditor_id.strip(),
@@ -1353,7 +1337,13 @@ def onboard_verified_statutory_auditor(
         "role": role.strip(),
         "cop": cop_status.strip(),
         "until": valid_until,
-        "app_by": approved_by.strip()
+        "app_by": approved_by.strip(),
+        "v_src": verification_source.strip(),
+        "v_stat": verification_status.strip(),
+        "icai_v": is_icai_verified,
+        "cop_v": is_cop_verified,
+        "v_at": verified_at,
+        "v_ref": verification_evidence_ref.strip() if verification_evidence_ref else None,
     }).fetchone()
     if hasattr(db, "commit"):
         db.commit()
@@ -1386,7 +1376,8 @@ def revoke_statutory_auditor(
 def validate_auditor_credentials(verifier_id: str, claimed_role: str, db: Optional[Any] = None) -> tuple[bool, str]:
     """
     Independently verifies auditor credentials against controlled database registry
-    and professional statutory standards (authentic 6-digit ICAI registration, FRN, active COP, approval).
+    and professional statutory standards (authentic 6-digit ICAI registration, FRN, active COP, approval,
+    and verified provenance).
     """
     v_id = str(verifier_id or "").strip()
     if not v_id:
@@ -1438,17 +1429,20 @@ def validate_auditor_credentials(verifier_id: str, claimed_role: str, db: Option
     if not profile.get("approved_by"):
         return False, "UNAUTHORIZED_ONBOARDING: Auditor has not been approved by an authorized administrative officer."
 
-    return True, f"Auditor {profile.get('name')} (ICAI #{mem_no}) independently verified active (Approved by {profile.get('approved_by')})."
+    # Verify independent ICAI & COP verification provenance
+    if (
+        not profile.get("is_icai_verified")
+        or not profile.get("is_cop_verified")
+        or profile.get("verification_status") != "INDEPENDENTLY_VERIFIED"
+    ):
+        v_status = profile.get("verification_status", "UNVERIFIED")
+        return False, (
+            f"UNVERIFIED_AUDITOR_PROVENANCE: Auditor '{v_id}' has verification status '{v_status}'. "
+            f"Administrator approval alone cannot be misrepresented as independent ICAI verification; "
+            f"statutory certification requires independent ICAI membership & COP verification."
+        )
 
-
-# In-memory replay tracking cache for offline test execution
-_OFFLINE_RECORDED_AUDIT_SIGNATURES: Dict[str, Dict[str, Any]] = {}
-
-
-def reset_audit_signature_cache_for_testing() -> None:
-    """Resets in-memory signature cache for test execution."""
-    global _OFFLINE_RECORDED_AUDIT_SIGNATURES
-    _OFFLINE_RECORDED_AUDIT_SIGNATURES.clear()
+    return True, f"Auditor {profile.get('name')} (ICAI #{mem_no}) independently verified active (Approved by {profile.get('approved_by')}, Verified via {profile.get('verification_source')})."
 
 
 def validate_certification_timestamp(
@@ -1497,6 +1491,8 @@ def check_and_record_signature_replay(
     """
     Enforces persistent database-backed replay protection with atomic conflict detection.
     Precludes cross-document reuse, duplicate consumption, and multi-worker race conditions.
+    Fails closed on database errors, missing session, missing table, or transaction failures;
+    in-memory fallbacks are strictly prohibited.
     """
     if not token or len(token) < 32:
         return False, "INVALID_TOKEN: Signature token is missing or insufficient length."
@@ -1505,79 +1501,88 @@ def check_and_record_signature_replay(
     exp_dt = expires_at or (datetime.now(timezone.utc) + timedelta(days=1))
     rate_val = Decimal(str(certified_rate or 0)).quantize(Decimal("0.01"))
     tax_val = Decimal(str(total_tax or 0)).quantize(Decimal("0.01"))
+    did_str = str(doc_id).strip()
+    dnum_str = str(doc_number).strip()
+    vid_str = str(verifier_id).strip()
 
-    # 1. Attempt database persistence
+    # Acquire active database session (fail closed if unavailable)
     session = db
     close_session = False
-    if session is None and SessionLocal is not None:
-        try:
-            session = SessionLocal()
-            close_session = True
-        except Exception:
-            session = None
+    if session is None:
+        if SessionLocal is not None:
+            try:
+                session = SessionLocal()
+                close_session = True
+            except Exception as ex:
+                logger.error(f"Failed to acquire database session for replay check: {ex}")
+                return False, f"DATABASE_UNAVAILABLE: Failed to acquire database session: {ex}"
+        else:
+            return False, "DATABASE_UNAVAILABLE: Active database session required for replay verification; in-memory fallback is prohibited."
 
-    if session is not None:
-        try:
-            stmt_check = text("""
-                SELECT doc_id, doc_number, verifier_id, expires_at 
-                FROM public.statutory_audit_signature_replays 
-                WHERE token_hash = :th;
-            """)
-            existing = session.execute(stmt_check, {"th": token_hash}).fetchone()
-            if existing:
-                e_map = existing._mapping
-                if e_map["doc_id"] != doc_id or e_map["doc_number"] != doc_number:
+    try:
+        # Pre-check existing token record
+        stmt_check = text("""
+            SELECT doc_id, doc_number, verifier_id, expires_at 
+            FROM public.statutory_audit_signature_replays 
+            WHERE token_hash = :th;
+        """)
+        existing = session.execute(stmt_check, {"th": token_hash}).fetchone()
+        if existing:
+            e_map = existing._mapping
+            if e_map["doc_id"] != did_str or e_map["doc_number"] != dnum_str:
+                return False, (
+                    f"SIGNATURE_REPLAY_DETECTED: Signature token was previously certified for "
+                    f"document '{e_map['doc_id']}' ('{e_map['doc_number']}'); cross-document replay rejected."
+                )
+            return False, f"SIGNATURE_REPLAY_DETECTED: Signature token has already been consumed for document '{did_str}'."
+
+        # Atomic insert with ON CONFLICT DO NOTHING
+        stmt_ins = text("""
+            INSERT INTO public.statutory_audit_signature_replays (
+                token_hash, doc_id, doc_number, verifier_id, certified_rate, total_tax, recorded_at, expires_at
+            ) VALUES (
+                :th, :did, :dnum, :vid, :rate, :tax, clock_timestamp(), :exp
+            ) ON CONFLICT (token_hash) DO NOTHING;
+        """)
+        res = session.execute(stmt_ins, {
+            "th": token_hash,
+            "did": did_str,
+            "dnum": dnum_str,
+            "vid": vid_str,
+            "rate": rate_val,
+            "tax": tax_val,
+            "exp": exp_dt
+        })
+        if hasattr(session, "commit"):
+            session.commit()
+
+        if res.rowcount == 0:
+            # Concurrent collision detected
+            conflict_row = session.execute(stmt_check, {"th": token_hash}).fetchone()
+            if conflict_row:
+                c_map = conflict_row._mapping
+                if c_map["doc_id"] != did_str or c_map["doc_number"] != dnum_str:
                     return False, (
-                        f"SIGNATURE_REPLAY_DETECTED: Signature token was previously certified for "
-                        f"document '{e_map['doc_id']}' ('{e_map['doc_number']}'); cross-document replay rejected."
+                        f"SIGNATURE_REPLAY_DETECTED: Signature token was concurrently certified for "
+                        f"document '{c_map['doc_id']}' ('{c_map['doc_number']}'); cross-document replay rejected."
                     )
-                return False, f"SIGNATURE_REPLAY_DETECTED: Signature token has already been consumed for document '{doc_id}'."
+            return False, "CONCURRENT_REPLAY_DETECTED: Signature token was concurrently recorded by another transaction."
 
-            # Atomic insert with ON CONFLICT DO NOTHING
-            stmt_ins = text("""
-                INSERT INTO public.statutory_audit_signature_replays (
-                    token_hash, doc_id, doc_number, verifier_id, certified_rate, total_tax, recorded_at, expires_at
-                ) VALUES (
-                    :th, :did, :dnum, :vid, :rate, :tax, clock_timestamp(), :exp
-                ) ON CONFLICT (token_hash) DO NOTHING;
-            """)
-            res = session.execute(stmt_ins, {
-                "th": token_hash,
-                "did": str(doc_id).strip(),
-                "dnum": str(doc_number).strip(),
-                "vid": str(verifier_id).strip(),
-                "rate": rate_val,
-                "tax": tax_val,
-                "exp": exp_dt
-            })
-            if hasattr(session, "commit"):
-                session.commit()
-
-            if res.rowcount == 0:
-                return False, "CONCURRENT_REPLAY_DETECTED: Signature token was concurrently recorded by another process."
-
-            return True, "Signature token recorded successfully in persistent database."
-        except Exception as ex:
-            if hasattr(session, "rollback"):
+        return True, "Signature token recorded successfully in persistent database."
+    except Exception as ex:
+        if hasattr(session, "rollback"):
+            try:
                 session.rollback()
-            logger.warning(f"Database replay recording failed: {ex}; checking in-memory cache.")
-        finally:
-            if close_session:
+            except Exception:
+                pass
+        logger.error(f"Database replay verification transaction failed: {ex}")
+        return False, f"DATABASE_TRANSACTION_FAILURE: Persistent replay verification failed: {ex}"
+    finally:
+        if close_session:
+            try:
                 session.close()
-
-    # 2. In-memory cache fallback for offline testing
-    if token in _OFFLINE_RECORDED_AUDIT_SIGNATURES:
-        existing = _OFFLINE_RECORDED_AUDIT_SIGNATURES[token]
-        if existing.get("doc_id") != doc_id or existing.get("doc_number") != doc_number:
-            return False, f"SIGNATURE_REPLAY_DETECTED: Token was previously issued for document '{existing.get('doc_id')}'; cross-document replay rejected."
-        return False, f"SIGNATURE_REPLAY_DETECTED: Token has already been consumed for document '{doc_id}'."
-
-    _OFFLINE_RECORDED_AUDIT_SIGNATURES[token] = {
-        "doc_id": doc_id,
-        "doc_number": doc_number,
-        "recorded_at": datetime.now(timezone.utc).isoformat()
-    }
-    return True, "Signature token recorded in cache."
+            except Exception:
+                pass
 
 
 def generate_auditor_verification_signature(

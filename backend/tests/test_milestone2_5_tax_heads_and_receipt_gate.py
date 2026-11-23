@@ -31,8 +31,7 @@ from app.modules.reconciliation.schemas import ITCEligibilityEnum, ReceiptStatus
 
 client = TestClient(app)
 
-DB_ADMIN = "postgresql://postgres:postgres@localhost:5432/myca"
-DB_APP = "postgresql://app_service_user:app_service_secret@localhost:5432/myca"
+from tests.test_db_config import DB_ADMIN, DB_APP
 
 
 @pytest.fixture

@@ -36,7 +36,7 @@ from app.modules.reconciliation.schemas import ITCEligibilityEnum
 
 client = TestClient(app)
 
-DB_ADMIN = "postgresql://postgres:postgres@localhost:5432/myca"
+from tests.test_db_config import DB_ADMIN
 
 
 @pytest.fixture

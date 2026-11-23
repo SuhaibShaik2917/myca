@@ -15,7 +15,7 @@ from app.modules.credit_builder.service import (
     compute_financial_readiness_score, generate_loan_dossier
 )
 
-DB_ADMIN = os.environ.get("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/myca")
+from tests.test_db_config import DB_ADMIN
 
 @pytest.fixture
 def m4_tenant():
