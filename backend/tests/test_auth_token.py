@@ -19,8 +19,22 @@ import app.modules.auth.api as auth_api
 from app.modules.auth.idp_verifier import validate_idp_token
 
 
+def _resolve_test_org_id():
+    from tests.test_db_config import get_admin_session
+    from sqlalchemy import text
+    try:
+        db = get_admin_session()
+        row = db.execute(text("SELECT id FROM public.organizations LIMIT 1;")).fetchone()
+        db.close()
+        if row:
+            return str(row[0])
+    except Exception:
+        pass
+    return "7c157424-1b47-4f2d-8751-19fab9f7ae35"
+
+
 USER_ID = str(uuid.uuid4())
-ORG_ID = str(uuid.uuid4())
+ORG_ID = _resolve_test_org_id()
 
 
 def generate_test_rsa_keypair():
@@ -365,6 +379,7 @@ def test_idp_token_exchange_with_authentic_asymmetric_rsa_in_production(monkeypa
             "aud": "myca-prod-client-id",
             "email": "prod.auditor@firm.test",
             "email_verified": True,
+            "nonce": "test-rsa-prod-nonce-001",
         },
         key=priv_pem,
         algorithm="RS256",
@@ -373,6 +388,7 @@ def test_idp_token_exchange_with_authentic_asymmetric_rsa_in_production(monkeypa
     mock_db = MagicMock()
     mock_db.execute.return_value.fetchone.return_value = (USER_ID, "prod.auditor@firm.test", True)
     monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
+    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda db, nonce, org_id, idp_provider, email: True)
     monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: True)
 
     client = TestClient(app)
@@ -395,12 +411,18 @@ def test_idp_token_exchange_with_authentic_asymmetric_rsa_in_production(monkeypa
 def test_idp_token_exchange_rejects_suspended_user(monkeypatch):
     """Proves IdP exchange rejects inactive/suspended users."""
     from app.main import app
-    token = create_signed_test_jwt(payload_overrides={"email": "suspended@firm.test"})
+    token = create_signed_test_jwt(
+        payload_overrides={
+            "email": "suspended@firm.test",
+            "nonce": "test-suspended-nonce-001",
+        }
+    )
 
     mock_db = MagicMock()
     # is_active = False
     mock_db.execute.return_value.fetchone.return_value = (USER_ID, "suspended@firm.test", False)
     monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
+    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda db, nonce, org_id, idp_provider, email: True)
 
     client = TestClient(app)
     response = client.post(
@@ -418,11 +440,17 @@ def test_idp_token_exchange_rejects_suspended_user(monkeypatch):
 def test_idp_token_exchange_rejects_non_member_user(monkeypatch):
     """Proves IdP exchange rejects authenticated users without active tenant membership."""
     from app.main import app
-    token = create_signed_test_jwt(payload_overrides={"email": "nonmember@firm.test"})
+    token = create_signed_test_jwt(
+        payload_overrides={
+            "email": "nonmember@firm.test",
+            "nonce": "test-nonmember-nonce-001",
+        }
+    )
 
     mock_db = MagicMock()
     mock_db.execute.return_value.fetchone.return_value = (USER_ID, "nonmember@firm.test", True)
     monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
+    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda db, nonce, org_id, idp_provider, email: True)
     monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: False)
 
     client = TestClient(app)
@@ -436,3 +464,314 @@ def test_idp_token_exchange_rejects_non_member_user(monkeypatch):
     )
     assert response.status_code == 403
     assert "TENANT_MEMBERSHIP_REQUIRED" in response.json()["detail"]
+
+
+# =========================================================================
+# 5. v1.0.13 Single-Use IdP Nonce Replay Protection & Strict Validation Tests
+# =========================================================================
+
+def test_idp_nonce_endpoint_issues_tracked_nonce():
+    """Proves POST /api/v1/auth/idp-nonce issues an unpredictable active nonce with 5 min TTL."""
+    from app.main import app
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/auth/idp-nonce",
+        json={
+            "org_id": ORG_ID,
+            "idp_provider": "google",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "nonce" in data
+    assert len(data["nonce"]) >= 32
+    assert data["expires_in"] == 300
+    assert data["org_id"] == ORG_ID
+    assert data["idp_provider"] == "google"
+
+
+def test_idp_token_exchange_requires_nonce_claim():
+    """Proves token exchange strictly rejects IdP tokens missing a nonce claim."""
+    from app.main import app
+    client = TestClient(app)
+    # Token without nonce
+    token = create_signed_test_jwt(payload_overrides={"nonce": None})
+    response = client.post(
+        "/api/v1/auth/idp-exchange",
+        json={
+            "idp_provider": "google",
+            "idp_token": token,
+            "org_id": ORG_ID,
+        },
+    )
+    assert response.status_code == 401
+    assert "MISSING_IDP_NONCE" in response.json()["detail"]
+
+
+def test_idp_token_exchange_rejects_missing_email_claim():
+    """Proves token exchange strictly rejects tokens with missing email (never falls back to sub)."""
+    with pytest.raises(HTTPException) as excinfo:
+        validate_idp_token("google", create_signed_test_jwt(payload_overrides={"email": None, "sub": "attacker-sub"}), env="test")
+    assert excinfo.value.status_code == 401
+    assert "MISSING_EMAIL_CLAIM" in excinfo.value.detail or "INVALID_EMAIL" in excinfo.value.detail
+
+
+@pytest.mark.parametrize("invalid_email", ["", "   ", "notanemail", "noatsign.com"])
+def test_idp_token_exchange_rejects_invalid_email_format(invalid_email):
+    """Proves token exchange rejects malformed or empty email claims."""
+    with pytest.raises(HTTPException) as excinfo:
+        validate_idp_token("google", create_signed_test_jwt(payload_overrides={"email": invalid_email}), env="test")
+    assert excinfo.value.status_code == 401
+    assert "INVALID_EMAIL_FORMAT" in excinfo.value.detail or "INVALID_EMAIL_CLAIM" in excinfo.value.detail
+
+
+def test_idp_token_exchange_rejects_missing_email_verified_claim():
+    """Proves token exchange strictly rejects tokens missing the email_verified claim."""
+    with pytest.raises(HTTPException) as excinfo:
+        validate_idp_token("google", create_signed_test_jwt(payload_overrides={"email_verified": None}), env="test")
+    assert excinfo.value.status_code == 401
+    assert "MISSING_EMAIL_VERIFIED_CLAIM" in excinfo.value.detail
+
+
+@pytest.mark.parametrize("non_bool_value", ["true", "True", 1, 0, "1", "false", [], {}])
+def test_idp_token_exchange_rejects_non_boolean_email_verified(non_bool_value):
+    """Proves token exchange strictly requires email_verified to be Python bool True (rejects truthy strings/ints)."""
+    with pytest.raises(HTTPException) as excinfo:
+        validate_idp_token("google", create_signed_test_jwt(payload_overrides={"email_verified": non_bool_value}), env="test")
+    assert excinfo.value.status_code == 401
+    assert "UNVERIFIED_EMAIL" in excinfo.value.detail
+
+
+def test_idp_token_exchange_rejects_provider_issuer_mismatch():
+    """Proves token exchange strictly enforces provider-to-issuer binding."""
+    # Google provider but token issued by Microsoft
+    token = create_signed_test_jwt(payload_overrides={"iss": "https://login.microsoftonline.com/common/v2.0"})
+    with pytest.raises(HTTPException) as excinfo:
+        validate_idp_token("google", token, env="test")
+    assert excinfo.value.status_code == 401
+    assert "PROVIDER_ISSUER_MISMATCH" in excinfo.value.detail
+
+
+def test_idp_token_exchange_normalizes_email(monkeypatch):
+    """Proves that email claim is normalized (lowercased and whitespace trimmed) before user lookup."""
+    from app.main import app
+    client = TestClient(app)
+    
+    # Request nonce
+    nonce_resp = client.post("/api/v1/auth/idp-nonce", json={"org_id": ORG_ID, "idp_provider": "google"})
+    assert nonce_resp.status_code == 200
+    nonce = nonce_resp.json()["nonce"]
+
+    token = create_signed_test_jwt(
+        payload_overrides={
+            "email": "   Auditor.Normal@Firm.TEST   ",
+            "nonce": nonce,
+        }
+    )
+
+    lookup_email = []
+    mock_db = MagicMock()
+    def mock_execute(query, params=None):
+        if params and "email" in params:
+            lookup_email.append(params["email"])
+        mock_res = MagicMock()
+        mock_res.fetchone.return_value = (USER_ID, "auditor.normal@firm.test", True)
+        return mock_res
+    mock_db.execute = mock_execute
+
+    monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
+    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda db, nonce, org_id, idp_provider, email: True)
+    monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: True)
+
+    response = client.post(
+        "/api/v1/auth/idp-exchange",
+        json={
+            "idp_provider": "google",
+            "idp_token": token,
+            "org_id": ORG_ID,
+        },
+    )
+    assert response.status_code == 200
+    assert len(lookup_email) > 0
+    assert lookup_email[0] == "auditor.normal@firm.test"
+
+
+def test_end_to_end_idp_nonce_issuance_and_atomic_replay_prevention():
+    """
+    INTEGRATION REPLAY DEFENSE TEST:
+    Proves that a real database-tracked nonce can be consumed exactly once,
+    and subsequent replay attempts with the same token/nonce are rejected (HTTP 401 IDP_NONCE_REPLAY).
+    """
+    from app.main import app
+    client = TestClient(app)
+
+    # 1. Request an authentic login nonce
+    nonce_resp = client.post(
+        "/api/v1/auth/idp-nonce",
+        json={"org_id": ORG_ID, "idp_provider": "google"},
+    )
+    assert nonce_resp.status_code == 200
+    nonce = nonce_resp.json()["nonce"]
+
+    # 2. Forge signed token with the issued nonce and registered user email
+    user_email = f"ci_replay_{uuid.uuid4().hex[:8]}@myca.test"
+    token = create_signed_test_jwt(
+        payload_overrides={
+            "email": user_email,
+            "nonce": nonce,
+        }
+    )
+
+    # Provision user and membership in DB for exchange
+    from tests.test_db_config import get_admin_session
+    from sqlalchemy import text
+    admin_db = get_admin_session()
+    try:
+        admin_db.execute(
+            text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:id, :email, 'Replay Test User', true) ON CONFLICT (email) DO NOTHING;"),
+            {"id": USER_ID, "email": user_email}
+        )
+        u_id = admin_db.execute(text("SELECT id FROM public.global_users WHERE email = :email;"), {"email": user_email}).fetchone()[0]
+        admin_db.execute(
+            text("INSERT INTO public.organization_memberships (id, org_id, user_id, role, status) VALUES (gen_random_uuid(), :oid, :uid, 'owner', 'active') ON CONFLICT (org_id, user_id) DO UPDATE SET status='active';"),
+            {"oid": ORG_ID, "uid": u_id}
+        )
+        admin_db.commit()
+    finally:
+        admin_db.close()
+
+    # 3. First exchange must SUCCEED (200 OK)
+    resp1 = client.post(
+        "/api/v1/auth/idp-exchange",
+        json={"idp_provider": "google", "idp_token": token, "org_id": ORG_ID},
+    )
+    assert resp1.status_code == 200, f"Expected 200 on first exchange, got: {resp1.text}"
+    assert "access_token" in resp1.json()
+
+    # 4. Immediate REPLAY with same token and nonce must FAIL with 401 IDP_NONCE_REPLAY
+    resp2 = client.post(
+        "/api/v1/auth/idp-exchange",
+        json={"idp_provider": "google", "idp_token": token, "org_id": ORG_ID},
+    )
+    assert resp2.status_code == 401
+    assert "IDP_NONCE_REPLAY" in resp2.json()["detail"]
+
+
+def test_idp_exchange_rejects_expired_nonce():
+    """Proves exchange rejects nonces whose expiration timestamp has passed."""
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import consume_idp_login_nonce
+    from sqlalchemy import text
+
+    expired_nonce = f"EXPIRED-TEST-NONCE-{uuid.uuid4().hex[:8]}"
+    db = SessionLocal()
+    try:
+        db.execute(text("""
+            INSERT INTO public.idp_authentication_nonces (
+                nonce, org_id, idp_provider, status, created_at, expires_at
+            ) VALUES (
+                :nonce, :org_id, 'google', 'ACTIVE', NOW() - INTERVAL '10 minutes', NOW() - INTERVAL '5 minutes'
+            ) ON CONFLICT (nonce) DO UPDATE SET status = 'ACTIVE', expires_at = NOW() - INTERVAL '5 minutes';
+        """), {"nonce": expired_nonce, "org_id": ORG_ID})
+        db.commit()
+
+        with pytest.raises(HTTPException) as excinfo:
+            consume_idp_login_nonce(db, expired_nonce, ORG_ID, "google", "user@test.com")
+        assert excinfo.value.status_code == 401
+        assert "EXPIRED_IDP_NONCE" in excinfo.value.detail
+    finally:
+        db.close()
+
+
+def test_idp_exchange_rejects_nonce_context_mismatch():
+    """Proves exchange rejects nonces bound to a different organization or provider."""
+    from tests.test_db_config import get_admin_session
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import consume_idp_login_nonce, create_idp_login_nonce
+    from sqlalchemy import text
+
+    other_org = str(uuid.uuid4())
+    admin_db = get_admin_session()
+    try:
+        admin_db.execute(
+            text("INSERT INTO public.organizations (id, legal_name, pan) VALUES (:id, 'Other Org Legal', 'XYZAB9876C') ON CONFLICT DO NOTHING;"),
+            {"id": other_org}
+        )
+        admin_db.commit()
+    finally:
+        admin_db.close()
+
+    db = SessionLocal()
+    try:
+        result = create_idp_login_nonce(db, ORG_ID, "google")
+        nonce = result["nonce"]
+
+        # 1. Reject org mismatch
+        with pytest.raises(HTTPException) as excinfo1:
+            consume_idp_login_nonce(db, nonce, other_org, "google", "user@test.com")
+        assert excinfo1.value.status_code == 401
+        assert "NONCE_CONTEXT_MISMATCH" in excinfo1.value.detail
+
+        # 2. Reject provider mismatch
+        with pytest.raises(HTTPException) as excinfo2:
+            consume_idp_login_nonce(db, nonce, ORG_ID, "azuread", "user@test.com")
+        assert excinfo2.value.status_code == 401
+        assert "NONCE_CONTEXT_MISMATCH" in excinfo2.value.detail
+    finally:
+        db.close()
+
+
+# =========================================================================
+# 6. Staging Environment Hardening Configuration Tests
+# =========================================================================
+
+def test_settings_prohibits_default_secret_key_in_staging(monkeypatch):
+    """Proves Settings rejects default or insecure SECRET_KEY in staging environment."""
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://app:secure_pass@staging-db.internal:5432/myca_staging")
+    monkeypatch.setenv("DATABASE_WORKER_URL", "postgresql://worker:secure_pass@staging-db.internal:5432/myca_staging")
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="staging",
+            SECRET_KEY="myca_jwt_test_secret_key_minimum_32_characters_long_for_security",
+            DATABASE_URL="postgresql://app:secure_pass@staging-db.internal:5432/myca_staging",
+            DATABASE_WORKER_URL="postgresql://worker:secure_pass@staging-db.internal:5432/myca_staging",
+            _env_file=None,
+        )
+    assert "default or test SECRET_KEY is strictly prohibited" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("insecure_db_url", [
+    "postgresql://app_service_user:secret@staging-db.internal:5432/myca_staging",
+    "postgresql://app:pass@localhost:5432/myca_staging",
+    "postgresql://app:pass@127.0.0.1:5432/myca_staging",
+])
+def test_settings_prohibits_insecure_database_url_in_staging(monkeypatch, insecure_db_url):
+    """Proves Settings rejects default passwords or localhost URLs in staging environment."""
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DATABASE_WORKER_URL", "postgresql://worker:secure_pass@staging-db.internal:5432/myca_staging")
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="staging",
+            SECRET_KEY="staging_secure_random_key_with_high_entropy_32_chars!",
+            DATABASE_URL=insecure_db_url,
+            DATABASE_WORKER_URL="postgresql://worker:secure_pass@staging-db.internal:5432/myca_staging",
+            _env_file=None,
+        )
+    assert "Insecure or default DATABASE_URL" in str(excinfo.value) or "must target a remote/dedicated host" in str(excinfo.value)
+
+
+def test_settings_prohibits_allow_demo_tokens_in_staging(monkeypatch):
+    """Proves Settings strictly rejects ALLOW_DEMO_TOKENS=True in staging environment."""
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DATABASE_WORKER_URL", "postgresql://worker:secure_pass@staging-db.internal:5432/myca_staging")
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="staging",
+            SECRET_KEY="staging_secure_random_key_with_high_entropy_32_chars!",
+            DATABASE_URL="postgresql://app:secure_pass@staging-db.internal:5432/myca_staging",
+            DATABASE_WORKER_URL="postgresql://worker:secure_pass@staging-db.internal:5432/myca_staging",
+            ALLOW_DEMO_TOKENS=True,
+            _env_file=None,
+        )
+    assert "ALLOW_DEMO_TOKENS cannot be enabled in production or staging" in str(excinfo.value)

@@ -5,7 +5,7 @@ import subprocess
 import sys
 import psycopg
 
-DB_ADMIN_URL = os.environ.get("DB_ADMIN_URL", "postgresql://postgres@localhost:5432/myca")
+DB_ADMIN_URL = os.environ.get("DB_ADMIN_URL")
 
 TENANT_TABLES_21 = [
     "gst_registrations",
@@ -191,14 +191,20 @@ def assert_disposable_database_environment(db_url: str):
     """
     CRITICAL SAFETY GUARD:
     Refuses to execute destructive rollback operations against production, staging,
-    or any database not explicitly designated as disposable for testing.
+    development, or any database not explicitly designated as disposable for testing.
     """
-    # 1. Environment check
-    env = (os.getenv("ENVIRONMENT") or "").strip().lower()
-    if env in ("production", "staging"):
+    if not db_url:
         raise RuntimeError(
-            f"CRITICAL SAFETY ABORT: verify_migration_rollback_state.py cannot run in '{env}' environment! "
-            "Destructive migration rollback is strictly prohibited in production and staging."
+            "CRITICAL SAFETY ABORT: DB_ADMIN_URL environment variable is required and cannot be empty. "
+            "Explicit disposable database connection string must be provided."
+        )
+
+    # 1. Environment check: strictly enforce test or ci
+    env = (os.getenv("ENVIRONMENT") or "").strip().lower()
+    if env not in ("test", "ci"):
+        raise RuntimeError(
+            f"CRITICAL SAFETY ABORT: verify_migration_rollback_state.py cannot run in '{env or 'UNSET'}' environment! "
+            "Destructive migration rollback is strictly restricted to designated 'test' or 'ci' environments."
         )
 
     # 2. Disposable database marker check
@@ -224,7 +230,14 @@ def assert_disposable_database_environment(db_url: str):
             "Destructive rollback verification is strictly prohibited against external or cloud targets."
         )
 
-    # Database name check: strictly prohibit targets containing production or live keywords
+    # Database name check: strictly prohibit protected development, admin, or production targets
+    forbidden_names = {"myca", "postgres", "template1", "development", "myca_dev", "app", "main"}
+    if dbname in forbidden_names:
+        raise RuntimeError(
+            f"CRITICAL SAFETY ABORT: Database target '{dbname}' is a protected persistent database name. "
+            "Destructive rollback verification requires a designated disposable database (e.g. 'myca_test')."
+        )
+
     forbidden_markers = ["prod", "production", "live"]
     for marker in forbidden_markers:
         if marker in dbname or marker in hostname:
@@ -233,10 +246,35 @@ def assert_disposable_database_environment(db_url: str):
                 "Destructive rollback verification is strictly forbidden against production targets."
             )
 
+    disposable_markers = ["test", "disposable", "scratch", "tmp"]
+    if not any(marker in dbname for marker in disposable_markers):
+        raise RuntimeError(
+            f"CRITICAL SAFETY ABORT: Database target '{dbname}' does not contain disposable markers ('test', 'disposable', 'scratch', 'tmp'). "
+            "Destructive rollback verification is strictly restricted to disposable test databases."
+        )
+
 def main():
     assert_disposable_database_environment(DB_ADMIN_URL)
     conn = psycopg.connect(DB_ADMIN_URL)
     conn.autocommit = True
+
+    # Assert active connected database identity from PostgreSQL engine
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_database();")
+        active_db = cur.fetchone()[0].lower()
+        forbidden_names = {"myca", "postgres", "template1", "development", "myca_dev", "app", "main"}
+        if active_db in forbidden_names:
+            raise RuntimeError(
+                f"CRITICAL SAFETY ABORT: Connected PostgreSQL database '{active_db}' is a protected persistent database! "
+                "Destructive rollback verification aborted to protect database integrity."
+            )
+        disposable_markers = ["test", "disposable", "scratch", "tmp"]
+        if not any(m in active_db for m in disposable_markers):
+            raise RuntimeError(
+                f"CRITICAL SAFETY ABORT: Connected PostgreSQL database '{active_db}' is missing required disposable name markers. "
+                "Destructive rollback verification aborted."
+            )
+        print(f"Safety check verified: Connected to designated disposable database '{active_db}'.")
 
     trusted_ref = load_trusted_0019_reference()
     print("=== Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json ===")
@@ -249,6 +287,7 @@ def main():
     run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS public.statutory_gateway_nonce_registry CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS public.idp_authentication_nonces CASCADE;")
     classify_and_verify_auditor_state(conn, "Step 1: Baseline 0019", "TABLE_NOT_PRESENT")
     baseline_0019 = capture_database_state(conn)
     print(f"  Captured 0019 Database State: {len(baseline_0019['grants'])} grants, {len(baseline_0019['policies'])} policies, {len(baseline_0019['rls_flags'])} tables.")
@@ -261,15 +300,15 @@ def main():
     run_cmd(["alembic", "upgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 1b: Fresh Historical Upgrade 0022", "LEGACY_SEEDS_PRESENT_IN_HISTORICAL_0022")
 
-    print("\n=== Step 2: Upgrade to Head (0026_gateway_nonce_and_audit) ===")
+    print("\n=== Step 2: Upgrade to Head (0027_idp_auth_nonces) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2: Head 0026", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2: Head 0027", "AUDITORS_VERIFIED_CLEAN")
     state_head = capture_database_state(conn)
-    print(f"  Head State (0026): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
-    assert len(state_head["grants"]) == 112, f"Expected 112 grants at 0026, got {len(state_head['grants'])}"
-    assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0026, got {len(state_head['policies'])}"
+    print(f"  Head State (0027): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
+    assert len(state_head["grants"]) == 115, f"Expected 115 grants at 0027, got {len(state_head['grants'])}"
+    assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0027, got {len(state_head['policies'])}"
 
-    # Verify nonce index and nonce registry table exist at 0026
+    # Verify nonce index, nonce registry table, and idp_authentication_nonces table exist at 0027
     with conn.cursor() as cur:
         cur.execute("""
             SELECT 1 FROM pg_indexes 
@@ -277,23 +316,38 @@ def main():
               AND tablename = 'statutory_auditors' 
               AND indexname = 'uq_statutory_auditors_gateway_nonce';
         """)
-        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0026"
+        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0027"
 
         cur.execute("""
             SELECT 1 FROM information_schema.tables 
             WHERE table_schema = 'public' 
               AND table_name = 'statutory_gateway_nonce_registry';
         """)
-        assert cur.fetchone() is not None, "statutory_gateway_nonce_registry table missing at 0026"
+        assert cur.fetchone() is not None, "statutory_gateway_nonce_registry table missing at 0027"
+
+        cur.execute("""
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+              AND table_name = 'idp_authentication_nonces';
+        """)
+        assert cur.fetchone() is not None, "idp_authentication_nonces table missing at 0027"
+
+        # Verify grants for app_service_user on idp_authentication_nonces
+        cur.execute("""
+            SELECT privilege_type FROM information_schema.role_table_grants
+            WHERE grantee = 'app_service_user' AND table_name = 'idp_authentication_nonces';
+        """)
+        idp_privs = {r[0] for r in cur.fetchall()}
+        assert idp_privs == {"SELECT", "INSERT", "UPDATE"}, f"Expected SELECT, INSERT, UPDATE on idp_authentication_nonces, got {idp_privs}"
 
     # Verify all 21 tables have relforcerowsecurity=True
     for tbl in TENANT_TABLES_21:
-        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0026"
+        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0027"
     # Verify all 8 0020 policies present
     for p_name in POLICIES_0020_8:
         matching = [p for p in state_head["policies"] if p[2] == p_name]
-        assert len(matching) == 1, f"Policy {p_name} missing at 0026"
-    print("PASS: Head state (0026) completely verified.")
+        assert len(matching) == 1, f"Policy {p_name} missing at 0027"
+    print("PASS: Head state (0027) completely verified.")
 
     print("\n=== Step 2-POPULATED: Populated-Record Migration Downgrade & Nonce Preservation Test ===")
     test_pop_aid = "CA-POPULATED-ROLLBACK-TEST"
@@ -301,12 +355,19 @@ def main():
     test_pop_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     test_pop_sref = "SESS-POPULATED-TEST-001"
     test_pop_nonce = "POPULATED-GATEWAY-NONCE-ROLLBACK-TEST-001"
+    test_idp_nonce = "POPULATED-IDP-NONCE-ROLLBACK-TEST-001"
 
     with conn.cursor() as cur:
         # Clean any prior residue
+        cur.execute("DELETE FROM public.idp_authentication_nonces WHERE nonce = %s;", (test_idp_nonce,))
         cur.execute("DELETE FROM public.statutory_gateway_nonce_registry WHERE nonce = %s;", (test_pop_nonce,))
         cur.execute("DELETE FROM public.statutory_auditor_verification_events WHERE auditor_id = %s;", (test_pop_aid,))
         cur.execute("DELETE FROM public.statutory_auditors WHERE auditor_id = %s;", (test_pop_aid,))
+
+        # Get an existing organization id for foreign key
+        cur.execute("SELECT id FROM public.organizations LIMIT 1;")
+        org_row = cur.fetchone()
+        test_org_id = org_row[0]
 
         # Seed populated MANUAL_DOCUMENT_REVIEWED record and audit event
         cur.execute("""
@@ -345,7 +406,17 @@ def main():
             );
         """, (test_pop_nonce, test_pop_mem))
 
-    print("  Populated 1 MANUAL_DOCUMENT_REVIEWED auditor record, 1 audit event, and 1 consumed gateway nonce.")
+        # Seed consumed IdP login nonce
+        cur.execute("""
+            INSERT INTO public.idp_authentication_nonces (
+                nonce, org_id, idp_provider, status, created_at, expires_at, consumed_at, consumed_by_email
+            ) VALUES (
+                %s, %s, 'google', 'CONSUMED',
+                clock_timestamp(), clock_timestamp() + interval '5 minutes', clock_timestamp(), 'auditor_pop@example.com'
+            );
+        """, (test_idp_nonce, test_org_id))
+
+    print("  Populated 1 MANUAL_DOCUMENT_REVIEWED auditor record, 1 audit event, 1 gateway nonce, and 1 IdP authentication nonce.")
 
     # Execute populated downgrade to 0025
     print("  Executing Alembic downgrade to 0025 on populated database...")
@@ -384,10 +455,21 @@ def main():
         nonce_row = cur.fetchone()
         assert nonce_row is not None, "CRITICAL DEFECT: Gateway nonce was DELETED or dropped on downgrade! (Replay vulnerability)"
         assert nonce_row[0] == test_pop_nonce, "Gateway nonce corrupted on downgrade!"
-    print("  PASS: Downgrade to 0025 safely preserved all evidence, audit events, AND consumed gateway nonce history.")
 
-    # Execute re-upgrade to Head (0026)
-    print("  Executing Alembic re-upgrade to Head (0026)...")
+        # CRITICAL REPLAY DEFENSE CHECK: Verify IdP authentication nonce is 100% preserved across downgrade
+        cur.execute("""
+            SELECT nonce, idp_provider, status, consumed_by_email
+            FROM public.idp_authentication_nonces
+            WHERE nonce = %s;
+        """, (test_idp_nonce,))
+        idp_nonce_row = cur.fetchone()
+        assert idp_nonce_row is not None, "CRITICAL DEFECT: IdP authentication nonce was DELETED or dropped on downgrade! (Replay vulnerability)"
+        assert idp_nonce_row[0] == test_idp_nonce, "IdP nonce corrupted on downgrade!"
+        assert idp_nonce_row[2] == "CONSUMED", f"IdP nonce status modified on downgrade! Got: {idp_nonce_row[2]}"
+    print("  PASS: Downgrade to 0025 safely preserved all evidence, audit events, consumed gateway nonces, AND IdP authentication nonces.")
+
+    # Execute re-upgrade to Head (0027)
+    print("  Executing Alembic re-upgrade to Head (0027)...")
     run_cmd(["alembic", "upgrade", "head"])
 
     # Verify re-upgrade restored MANUAL_DOCUMENT_REVIEWED status & preserved nonce replay defense
@@ -402,7 +484,7 @@ def main():
         assert row_restored[1] == test_pop_sha, "Evidence SHA-256 mismatch after re-upgrade!"
         assert row_restored[2] == test_pop_sref, "Reviewer session ref mismatch after re-upgrade!"
 
-        # Verify consumed nonce is still present and actively blocks replay
+        # Verify consumed gateway nonce is still present and actively blocks replay
         cur.execute("""
             SELECT nonce FROM public.statutory_gateway_nonce_registry WHERE nonce = %s;
         """, (test_pop_nonce,))
@@ -422,11 +504,39 @@ def main():
             assert "duplicate key" in str(exc).lower() or "unique" in str(exc).lower() or "primary key" in str(exc).lower(), f"Unexpected error on duplicate nonce replay: {exc}"
             print("  PASS: Replay attack presenting same gateway nonce after re-upgrade rejected by persistent PostgreSQL nonce registry constraint.")
 
+        # Verify consumed IdP nonce is still present and actively blocks replay
+        cur.execute("""
+            SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = %s;
+        """, (test_idp_nonce,))
+        assert cur.fetchone() is not None, "IdP authentication nonce missing after re-upgrade!"
+
+        try:
+            cur.execute("""
+                INSERT INTO public.idp_authentication_nonces (
+                    nonce, org_id, idp_provider, status, created_at, expires_at, consumed_at, consumed_by_email
+                ) VALUES (
+                    %s, %s, 'google', 'ACTIVE',
+                    clock_timestamp(), clock_timestamp() + interval '5 minutes', NULL, NULL
+                );
+            """, (test_idp_nonce, test_org_id))
+            raise AssertionError("Replay attack succeeded! IdP authentication nonces failed to reject duplicate nonce after re-upgrade.")
+        except Exception as exc:
+            assert "duplicate key" in str(exc).lower() or "unique" in str(exc).lower() or "primary key" in str(exc).lower(), f"Unexpected error on duplicate IdP nonce replay: {exc}"
+            print("  PASS: Replay attack presenting same IdP nonce after re-upgrade rejected by persistent PostgreSQL PRIMARY KEY constraint.")
+
         # Clean up test populated records before baseline rollback tests
+        cur.execute("DELETE FROM public.idp_authentication_nonces WHERE nonce = %s;", (test_idp_nonce,))
         cur.execute("DELETE FROM public.statutory_gateway_nonce_registry WHERE nonce = %s;", (test_pop_nonce,))
         cur.execute("DELETE FROM public.statutory_auditor_verification_events WHERE auditor_id = %s;", (test_pop_aid,))
         cur.execute("DELETE FROM public.statutory_auditors WHERE auditor_id = %s;", (test_pop_aid,))
-    print("PASS: Populated-state downgrade, evidence preservation, nonce replay defense, and re-upgrade completely verified.")
+    print("PASS: Populated-state downgrade, evidence preservation, nonce replay defense (gateway & IdP), and re-upgrade completely verified.")
+
+    print("\n=== Step 2a-0: Downgrade to 0026_gateway_nonce_and_audit & Verify ===")
+    run_cmd(["alembic", "downgrade", "0026_gateway_nonce_and_audit"])
+    classify_and_verify_auditor_state(conn, "Step 2a-0: Downgrade 0026", "AUDITORS_VERIFIED_CLEAN")
+    state_0026 = capture_database_state(conn)
+    assert len(state_0026["grants"]) == 112, f"Expected 112 grants at 0026, got {len(state_0026['grants'])}"
+    assert len(state_0026["policies"]) == 95, f"Expected 95 policies at 0026, got {len(state_0026['policies'])}"
 
     print("\n=== Step 2a: Downgrade to 0025_manual_review_and_nonce & Verify ===")
     run_cmd(["alembic", "downgrade", "0025_manual_review_and_nonce"])
@@ -469,9 +579,11 @@ def main():
     run_cmd(["alembic", "downgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 2c: Clean Downgrade 0022", "AUDITORS_VERIFIED_CLEAN")
 
-    print("\n=== Step 2d: Re-upgrade to Head (0026_gateway_nonce_and_audit) ===")
+    print("\n=== Step 2d: Re-upgrade to Head (0027_idp_auth_nonces) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0026", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0027", "AUDITORS_VERIFIED_CLEAN")
+    state_re_head = capture_database_state(conn)
+    assert len(state_re_head["grants"]) == 115, f"Expected 115 grants at 0027, got {len(state_re_head['grants'])}"
     print("PASS: Downgrade rollback and re-upgrade cycles verified with zero fake auditor identities.")
 
     print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
@@ -493,6 +605,7 @@ def main():
     run_cmd(["alembic", "downgrade", "0019_m3_gstr3b_filings"])
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS public.statutory_gateway_nonce_registry CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS public.idp_authentication_nonces CASCADE;")
     classify_and_verify_auditor_state(conn, "Step 4: Downgrade 0019", "TABLE_NOT_PRESENT")
     rolled_back_state = capture_database_state(conn)
 
@@ -522,14 +635,15 @@ def main():
     assert rolled_back_state["rls_flags"] == trusted_ref["rls_flags"], "Rollback RLS flags mismatch with independent reference snapshot!"
     print("  PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.")
 
-    print("\n=== Step 5: Re-Upgrade to Head (0026_gateway_nonce_and_audit) ===")
+    print("\n=== Step 5: Re-Upgrade to Head (0027_idp_auth_nonces) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0026", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0027", "AUDITORS_VERIFIED_CLEAN")
     final_head_state = capture_database_state(conn)
     assert final_head_state["grants"] == state_head["grants"]
     assert final_head_state["policies"] == state_head["policies"]
     assert final_head_state["rls_flags"] == state_head["rls_flags"]
-    print("  PASS: Re-upgrade to head completely restored production security state.")
+    assert len(final_head_state["grants"]) == 115
+    print("  PASS: Re-upgrade to head completely restored production security state (115 grants, 95 policies).")
 
     conn.close()
     print("\nALL MIGRATION ROLLBACK & INDEPENDENT BASELINE REFERENCE INVARIANTS 100% VERIFIED!")

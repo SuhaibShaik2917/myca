@@ -9,21 +9,34 @@ from app.config import settings
 ASYMMETRIC_ALGORITHMS = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
 DEFAULT_ALLOWED_PROVIDERS = {"google", "azuread", "okta", "auth0"}
 
+PROVIDER_ISSUER_PATTERNS = {
+    "google": ["https://accounts.google.com", "accounts.google.com"],
+    "azuread": ["login.microsoftonline.com", "sts.windows.net"],
+    "okta": ["okta.com"],
+    "auth0": ["auth0.com"],
+}
+
+
 def validate_idp_token(
     idp_provider: str,
     idp_token: str,
-    env: Optional[str] = None
+    env: Optional[str] = None,
+    expected_nonce: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Rigorously validates a federated Identity Provider (IdP) token.
-    
+
     Enforces:
-    1. Provider authorization against configured allowed providers.
+    1. Provider authorization against allowed providers and configured trust configuration.
     2. Strict token format (compact 3-part JWT).
     3. Production fail-closed trust anchor check (issuer, audience, and public key).
     4. Header inspection, algorithm verification, and algorithm confusion defense.
     5. Cryptographic signature verification using trusted public key.
-    6. Token expiration, freshness, issuer, audience, and email_verified claims.
+    6. Token expiration, not-before freshness, issuer, audience claims.
+    7. Provider-to-issuer binding check.
+    8. Strict email claim (non-empty string with '@'; no sub fallback).
+    9. Strict email_verified claim (must be present, boolean type, and True).
+    10. Nonce matching when an expected transaction nonce is supplied.
     """
     if env is None:
         raw_env = os.getenv("ENVIRONMENT") or getattr(settings, "ENVIRONMENT", "")
@@ -42,6 +55,13 @@ def validate_idp_token(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"UNSUPPORTED_IDP_PROVIDER: Provider '{idp_provider}' is not an authorized Identity Provider. Allowed: {sorted(list(allowed_providers))}",
+        )
+
+    configured_provider = getattr(settings, "MYCA_IDP_PROVIDER", None)
+    if configured_provider and provider_clean != configured_provider.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"PROVIDER_MISMATCH: Requested provider '{idp_provider}' does not match configured Identity Provider '{configured_provider}'.",
         )
 
     # 2. Token format validation
@@ -183,18 +203,50 @@ def validate_idp_token(
             detail=f"INVALID_IDP_SIGNATURE: Cryptographic signature verification failed: {str(exc)}",
         )
 
-    # 7. Strict Claims Content Checks
-    email = claims.get("email") or claims.get("sub")
-    if not email or "@" not in str(email):
+    # 7. Provider-to-Issuer binding check
+    token_iss = str(claims.get("iss", "")).strip().lower()
+    if provider_clean in PROVIDER_ISSUER_PATTERNS:
+        expected_patterns = PROVIDER_ISSUER_PATTERNS[provider_clean]
+        if not any(pattern in token_iss for pattern in expected_patterns):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"PROVIDER_ISSUER_MISMATCH: Token issuer '{claims.get('iss')}' is not a valid issuer for provider '{idp_provider}'.",
+            )
+
+    # 8. Strict Email Claim Check (Require actual email claim; do not use sub as email)
+    if "email" not in claims or claims.get("email") is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="INVALID_IDP_TOKEN: Missing or invalid email claim in verified token claims.",
+            detail="MISSING_EMAIL_CLAIM: IdP token must contain an explicit 'email' claim. Subject identifier fallback is strictly prohibited.",
+        )
+    email = claims.get("email")
+    if not isinstance(email, str) or not email.strip() or "@" not in email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="INVALID_EMAIL_FORMAT: IdP token contains a malformed or empty email claim.",
         )
 
-    if "email_verified" in claims and claims["email_verified"] is not True:
+    # 9. Strict email_verified Claim Check
+    # Must be explicitly present, must be boolean type, and must be strictly True
+    if "email_verified" not in claims or claims.get("email_verified") is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="UNVERIFIED_EMAIL: The email address asserted by the Identity Provider has not been verified.",
+            detail="MISSING_EMAIL_VERIFIED_CLAIM: IdP token must contain an explicit 'email_verified' claim.",
         )
+    email_verified = claims["email_verified"]
+    if not isinstance(email_verified, bool) or email_verified is not True:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="UNVERIFIED_EMAIL: The email address asserted by the Identity Provider is not verified (email_verified must be boolean True).",
+        )
+
+    # 10. Nonce Matching (if expected_nonce is supplied)
+    if expected_nonce is not None:
+        token_nonce = claims.get("nonce")
+        if not token_nonce or str(token_nonce).strip() != str(expected_nonce).strip():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"NONCE_MISMATCH: Token nonce '{token_nonce}' does not match authentication transaction nonce '{expected_nonce}'.",
+            )
 
     return claims

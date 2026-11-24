@@ -75,7 +75,14 @@ jobs:
         run: python scripts/diagnose_ci_database.py
       - name: Execute Full Pytest Suite
         run: python -m pytest tests/ -v --tb=short
+      - name: Create Disposable Database for Migration Rollback
+        run: |
+          PGPASSWORD=postgrespassword psql -h localhost -U postgres -d postgres -c "DROP DATABASE IF EXISTS myca_test;" -c "CREATE DATABASE myca_test WITH TEMPLATE myca;"
       - name: Verify Migration Rollback & Baseline Provenance
         run: python scripts/verify_migration_rollback_state.py
+        env:
+          DB_ADMIN_URL: postgresql://postgres:postgrespassword@localhost:5432/myca_test
+          ENVIRONMENT: test
+          ALLOW_DISPOSABLE_DATABASE_ROLLBACK: "true"
       - name: Execute Comprehensive RLS Security Audit
         run: python scripts/audit_rls_security_comprehensive.py

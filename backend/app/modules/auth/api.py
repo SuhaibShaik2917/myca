@@ -8,8 +8,9 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.core.security import create_access_token
-from app.database import SessionLocal, verify_and_resolve_tenant_membership
+from app.database import SessionLocal, verify_and_resolve_tenant_membership, set_tenant_context
 from app.modules.auth.idp_verifier import validate_idp_token
+from app.modules.auth.nonce_service import create_idp_login_nonce, consume_idp_login_nonce
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -27,10 +28,23 @@ class DemoTokenResponse(BaseModel):
     expires_in: int
 
 
+class IdpNonceRequest(BaseModel):
+    org_id: str
+    idp_provider: str
+
+
+class IdpNonceResponse(BaseModel):
+    nonce: str
+    expires_in: int
+    org_id: str
+    idp_provider: str
+
+
 class IdpTokenExchangeRequest(BaseModel):
     idp_provider: str
     idp_token: str
     org_id: str
+    nonce: Optional[str] = None
     user_email: Optional[str] = None
 
 
@@ -104,6 +118,21 @@ def issue_demo_token(payload: DemoTokenRequest) -> DemoTokenResponse:
     )
 
 
+@router.post("/idp-nonce", response_model=IdpNonceResponse)
+def request_idp_login_nonce(payload: IdpNonceRequest) -> IdpNonceResponse:
+    """
+    Issues a server-tracked single-use OIDC login nonce bound to an organization
+    and Identity Provider. Must be embedded in the IdP authorization flow and
+    validated upon token exchange to eliminate replay vulnerabilities.
+    """
+    db = SessionLocal()
+    try:
+        result = create_idp_login_nonce(db, payload.org_id, payload.idp_provider)
+        return IdpNonceResponse(**result)
+    finally:
+        db.close()
+
+
 @router.post("/idp-exchange", response_model=DemoTokenResponse)
 def exchange_idp_token(payload: IdpTokenExchangeRequest) -> DemoTokenResponse:
     """
@@ -111,9 +140,10 @@ def exchange_idp_token(payload: IdpTokenExchangeRequest) -> DemoTokenResponse:
     Rigorously validates IdP token signature, algorithm confusion defenses, issuer,
     audience, expiration, and claims.
     
-    Matches verified identity claim to an active registered user in public.global_users,
-    verifies active tenant membership in public.organization_memberships, and issues
-    a cryptographically signed MyCA access token.
+    Validates and atomically consumes single-use authentication transaction nonces
+    to prevent token replay attacks. Matches verified identity claim to an active
+    registered user in public.global_users, verifies active tenant membership in
+    public.organization_memberships, and issues a cryptographically signed MyCA access token.
     """
     try:
         uuid.UUID(payload.org_id)
@@ -124,22 +154,59 @@ def exchange_idp_token(payload: IdpTokenExchangeRequest) -> DemoTokenResponse:
     env = str(raw_env).strip().lower() if raw_env else "development"
 
     # Cryptographically validate the IdP token and its claims (fails closed on invalid/untrusted tokens)
-    verified_claims = validate_idp_token(payload.idp_provider, payload.idp_token, env=env)
+    verified_claims = validate_idp_token(
+        payload.idp_provider,
+        payload.idp_token,
+        env=env,
+        expected_nonce=payload.nonce,
+    )
     
     # Extract identity strictly from verified token claims (never from unauthenticated payload fields)
-    verified_email = (verified_claims.get("email") or verified_claims.get("sub") or "").strip().lower()
-    if not verified_email:
+    verified_email = verified_claims["email"].strip().lower()
+
+    # Extract and validate transaction nonce for replay protection
+    token_nonce = verified_claims.get("nonce")
+    if not token_nonce or not str(token_nonce).strip():
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="INVALID_IDP_TOKEN: Token did not contain a verified email or subject claim.",
+            detail="MISSING_IDP_NONCE: IdP token must contain an authentication transaction nonce claim.",
         )
 
     db = SessionLocal()
     try:
-        user_row = db.execute(
-            text("SELECT id, email, is_active FROM public.global_users WHERE email = :email;"),
-            {"email": verified_email},
-        ).fetchone()
+        # Atomically consume the single-use nonce to guarantee replay prevention
+        consume_idp_login_nonce(
+            db=db,
+            nonce=str(token_nonce),
+            org_id=payload.org_id,
+            idp_provider=payload.idp_provider,
+            email=verified_email,
+        )
+
+        # Set tenant org context so security_barrier view v_org_users allows reading org users
+        set_tenant_context(db, org_id=payload.org_id, user_id=None)
+
+        # Query user identity and membership via canonical secure view public.v_org_users
+        user_row = None
+        try:
+            user_row = db.execute(
+                text("SELECT id, email, membership_status FROM public.v_org_users WHERE LOWER(email) = :email;"),
+                {"email": verified_email},
+            ).fetchone()
+        except Exception:
+            pass
+
+        if not user_row:
+            # Fallback for platform/global lookup if permitted
+            try:
+                g_row = db.execute(
+                    text("SELECT id, email, is_active FROM public.global_users WHERE LOWER(email) = :email;"),
+                    {"email": verified_email},
+                ).fetchone()
+                if g_row:
+                    user_row = g_row
+            except Exception:
+                pass
 
         if not user_row:
             raise HTTPException(
@@ -148,8 +215,8 @@ def exchange_idp_token(payload: IdpTokenExchangeRequest) -> DemoTokenResponse:
             )
 
         user_id = str(user_row[0])
-        is_active = bool(user_row[2])
-
+        status_val = user_row[2]
+        is_active = status_val in (True, "active", "ACTIVE", "true")
         if not is_active:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

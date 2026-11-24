@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     ALLOW_DEMO_TOKENS: bool = False
     
     # Federated Identity Provider (IdP) Settings
+    MYCA_IDP_PROVIDER: Optional[str] = None
     MYCA_IDP_ISSUER: Optional[str] = None
     MYCA_IDP_AUDIENCE: Optional[str] = None
     MYCA_IDP_PUBLIC_KEY: Optional[str] = None
@@ -95,9 +96,10 @@ class Settings(BaseSettings):
         if not raw_env and hasattr(info, "data"):
             raw_env = info.data.get("ENVIRONMENT")
         env_norm = str(raw_env).strip().lower() if raw_env else "development"
-        if env_norm == "production":
-            if not v or "dev-insecure" in v or len(v) < 32:
-                raise ValueError("CRITICAL SECURITY ERROR: Production deployment requires a secure SECRET_KEY of at least 32 characters.")
+        if env_norm in ("production", "staging"):
+            insecure_markers = ("dev-insecure", "test_secret", "test-secret", "myca_jwt_test", "default")
+            if not v or any(marker in v.lower() for marker in insecure_markers) or len(v) < 32:
+                raise ValueError("CRITICAL SECURITY ERROR: Production and staging deployments require a secure SECRET_KEY of at least 32 characters (default or test SECRET_KEY is strictly prohibited).")
         return v
 
     @field_validator("DATABASE_URL", "DATABASE_WORKER_URL")
@@ -107,9 +109,9 @@ class Settings(BaseSettings):
         if not raw_env and hasattr(info, "data"):
             raw_env = info.data.get("ENVIRONMENT")
         env_norm = str(raw_env).strip().lower() if raw_env else "development"
-        if env_norm == "production":
+        if env_norm in ("production", "staging"):
             if not v or ":secret@" in v or "localhost" in v or "127.0.0.1" in v:
-                raise ValueError("CRITICAL SECURITY ERROR: Production deployment requires non-default database URLs.")
+                raise ValueError("CRITICAL SECURITY ERROR: Production and staging deployments require non-default database URLs (Insecure or default DATABASE_URL targeting localhost/secret is prohibited; must target a remote/dedicated host).")
         return v
 
     model_config = ConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
