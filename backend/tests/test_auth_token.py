@@ -1,8 +1,12 @@
 """Unit and integration tests for authentication, environment configuration, demo-token guards, and IdP verification."""
 
+import base64
+import hashlib
 import os
+import secrets
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,33 +25,51 @@ from app.modules.auth.idp_verifier import validate_idp_token
 
 def _ensure_org_exists(org_id: str):
     """Guarantees the specified organization exists in public.organizations for FK integrity."""
+    import random
     from tests.test_db_config import get_admin_session
     from sqlalchemy import text
+    admin_db = get_admin_session()
     try:
-        admin_db = get_admin_session()
-        admin_db.execute(
-            text("""
-                INSERT INTO public.organizations (id, legal_name, pan)
-                VALUES (:id, 'Auth Test Organization', 'AAAPL1234C')
-                ON CONFLICT (id) DO NOTHING;
-            """),
-            {"id": org_id}
-        )
-        admin_db.commit()
-        admin_db.close()
+        # Check if already present
+        exists = admin_db.execute(text("SELECT 1 FROM public.organizations WHERE id = :id;"), {"id": org_id}).fetchone()
+        if exists:
+            return
+
+        for _ in range(10):
+            pan = f"AAAPL{random.randint(1000, 9999)}Z"
+            sp = admin_db.begin_nested()
+            try:
+                admin_db.execute(
+                    text("""
+                        INSERT INTO public.organizations (id, legal_name, pan)
+                        VALUES (:id, 'Auth Test Organization', :pan)
+                        ON CONFLICT (id) DO NOTHING;
+                    """),
+                    {"id": org_id, "pan": pan}
+                )
+                sp.commit()
+                admin_db.commit()
+                return
+            except Exception as exc:
+                sp.rollback()
+                if "organizations_pan_key" in str(exc):
+                    continue
+                raise
     except Exception as exc:
-        print(f"Warning: could not ensure test org exists: {exc}")
+        admin_db.rollback()
+        raise RuntimeError(f"Fixture setup failure: could not ensure test org {org_id} exists: {exc}") from exc
+    finally:
+        admin_db.close()
 
 
 def _resolve_test_org_id():
     from tests.test_db_config import get_admin_session
     from sqlalchemy import text
     test_org_id = "7c157424-1b47-4f2d-8751-19fab9f7ae35"
+    db = get_admin_session()
     try:
-        db = get_admin_session()
         row = db.execute(text("SELECT id FROM public.organizations LIMIT 1;")).fetchone()
         if row:
-            db.close()
             return str(row[0])
         # If no organization exists yet (e.g. fresh CI run), seed one
         db.execute(text("""
@@ -56,11 +78,29 @@ def _resolve_test_org_id():
             ON CONFLICT (id) DO NOTHING;
         """), {"id": test_org_id})
         db.commit()
-        db.close()
         return test_org_id
-    except Exception:
-        pass
-    return test_org_id
+    except Exception as exc:
+        db.rollback()
+        raise RuntimeError(f"Fixture setup failure: could not resolve test org: {exc}") from exc
+    finally:
+        db.close()
+
+
+@pytest.fixture(autouse=True)
+def reset_nonce_test_state():
+    """Resets sliding window rate limits and prunes active test nonces between tests."""
+    from app.modules.auth.nonce_service import rate_limiter
+    from tests.test_db_config import get_admin_session
+    from sqlalchemy import text
+    rate_limiter.reset()
+    admin_db = get_admin_session()
+    try:
+        admin_db.execute(text("DELETE FROM public.idp_authentication_nonces WHERE status = 'ACTIVE';"))
+        admin_db.commit()
+    finally:
+        admin_db.close()
+    yield
+    rate_limiter.reset()
 
 
 USER_ID = str(uuid.uuid4())
@@ -418,7 +458,7 @@ def test_idp_token_exchange_with_authentic_asymmetric_rsa_in_production(monkeypa
     mock_db = MagicMock()
     mock_db.execute.return_value.fetchone.return_value = (USER_ID, "prod.auditor@firm.test", True)
     monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
-    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda db, nonce, org_id, idp_provider, email: True)
+    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
     monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: True)
 
     client = TestClient(app)
@@ -452,7 +492,7 @@ def test_idp_token_exchange_rejects_suspended_user(monkeypatch):
     # is_active = False
     mock_db.execute.return_value.fetchone.return_value = (USER_ID, "suspended@firm.test", False)
     monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
-    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda db, nonce, org_id, idp_provider, email: True)
+    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
 
     client = TestClient(app)
     response = client.post(
@@ -480,7 +520,7 @@ def test_idp_token_exchange_rejects_non_member_user(monkeypatch):
     mock_db = MagicMock()
     mock_db.execute.return_value.fetchone.return_value = (USER_ID, "nonmember@firm.test", True)
     monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
-    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda db, nonce, org_id, idp_provider, email: True)
+    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
     monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: False)
 
     client = TestClient(app)
@@ -612,7 +652,7 @@ def test_idp_token_exchange_normalizes_email(monkeypatch):
     mock_db.execute = mock_execute
 
     monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
-    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda db, nonce, org_id, idp_provider, email: True)
+    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
     monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: True)
 
     response = client.post(
@@ -693,13 +733,14 @@ def test_end_to_end_idp_nonce_issuance_and_atomic_replay_prevention():
 def test_idp_exchange_rejects_expired_nonce():
     """Proves exchange rejects nonces whose expiration timestamp has passed."""
     _ensure_org_exists(ORG_ID)
-    from app.database import SessionLocal
+    from app.database import SessionLocal, set_tenant_context
     from app.modules.auth.nonce_service import consume_idp_login_nonce
     from sqlalchemy import text
 
     expired_nonce = f"EXPIRED-TEST-NONCE-{uuid.uuid4().hex[:8]}"
     db = SessionLocal()
     try:
+        set_tenant_context(db, org_id=ORG_ID, user_id=None)
         db.execute(text("""
             INSERT INTO public.idp_authentication_nonces (
                 nonce, org_id, idp_provider, status, created_at, expires_at
@@ -740,16 +781,17 @@ def test_idp_exchange_rejects_nonce_context_mismatch():
     try:
         result = create_idp_login_nonce(db, ORG_ID, "google")
         nonce = result["nonce"]
+        session_token = result.get("session_token")
 
-        # 1. Reject org mismatch
+        # 1. Reject org mismatch (RLS isolates row or context mismatch detected)
         with pytest.raises(HTTPException) as excinfo1:
-            consume_idp_login_nonce(db, nonce, other_org, "google", "user@test.com")
+            consume_idp_login_nonce(db, nonce, other_org, "google", "user@test.com", session_token=session_token)
         assert excinfo1.value.status_code == 401
-        assert "NONCE_CONTEXT_MISMATCH" in excinfo1.value.detail
+        assert "NONCE_CONTEXT_MISMATCH" in excinfo1.value.detail or "UNKNOWN_IDP_NONCE" in excinfo1.value.detail
 
         # 2. Reject provider mismatch
         with pytest.raises(HTTPException) as excinfo2:
-            consume_idp_login_nonce(db, nonce, ORG_ID, "azuread", "user@test.com")
+            consume_idp_login_nonce(db, nonce, ORG_ID, "azuread", "user@test.com", session_token=session_token)
         assert excinfo2.value.status_code == 401
         assert "NONCE_CONTEXT_MISMATCH" in excinfo2.value.detail
     finally:
@@ -810,3 +852,347 @@ def test_settings_prohibits_allow_demo_tokens_in_staging(monkeypatch):
             _env_file=None,
         )
     assert "ALLOW_DEMO_TOKENS cannot be enabled in production or staging" in str(excinfo.value)
+
+
+# =========================================================================
+# 7. v1.0.14 Enhanced Authentication, Tenant Isolation & Abuse Tests
+# =========================================================================
+
+def test_multithreaded_concurrent_race_against_same_nonce():
+    """
+    CONCURRENCY STRESS TEST (Requirement 6):
+    Proves that when multiple independent threads race to consume the exact same nonce,
+    PostgreSQL atomic conditional update guarantees exactly ONE thread consumes it,
+    and all other concurrent attempts fail closed with HTTP 401 IDP_NONCE_REPLAY.
+    """
+    _ensure_org_exists(ORG_ID)
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import create_idp_login_nonce, consume_idp_login_nonce
+
+    init_db = SessionLocal()
+    try:
+        result = create_idp_login_nonce(init_db, ORG_ID, "google")
+        nonce = result["nonce"]
+        session_token = result["session_token"]
+    finally:
+        init_db.close()
+
+    successes = []
+    replays = []
+    errors = []
+
+    def race_worker(worker_id: int):
+        db = SessionLocal()
+        try:
+            consumed = consume_idp_login_nonce(
+                db,
+                nonce=nonce,
+                org_id=ORG_ID,
+                idp_provider="google",
+                email=f"worker_{worker_id}@myca.test",
+                session_token=session_token,
+            )
+            successes.append(worker_id)
+        except HTTPException as exc:
+            if exc.status_code == 401 and "IDP_NONCE_REPLAY" in exc.detail:
+                replays.append(worker_id)
+            else:
+                errors.append((worker_id, str(exc.detail)))
+        except Exception as exc:
+            errors.append((worker_id, str(exc)))
+        finally:
+            db.close()
+
+    # Race 5 independent threads concurrently
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(race_worker, i) for i in range(5)]
+        for f in futures:
+            f.result()
+
+    assert len(errors) == 0, f"Unexpected errors during concurrent race: {errors}"
+    assert len(successes) == 1, f"Expected exactly 1 thread to consume nonce, got {len(successes)}"
+    assert len(replays) == 4, f"Expected exactly 4 threads to be rejected for replay, got {len(replays)}"
+
+
+def test_browser_session_binding_and_anti_csrf():
+    """
+    BROWSER SESSION BINDING & ANTI-CSRF TEST (Requirement 2):
+    Proves authentication transactions are securely bound to the initiating client/browser session.
+    Rejects missing or mismatched session tokens to prevent login CSRF and session fixation.
+    """
+    _ensure_org_exists(ORG_ID)
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import create_idp_login_nonce, consume_idp_login_nonce
+
+    # 1. Direct service layer binding tests
+    db = SessionLocal()
+    try:
+        result = create_idp_login_nonce(db, ORG_ID, "google")
+        nonce = result["nonce"]
+        valid_session_token = result["session_token"]
+
+        # Missing session token -> 401 MISSING_SESSION_BINDING
+        with pytest.raises(HTTPException) as exc1:
+            consume_idp_login_nonce(
+                db, nonce=nonce, org_id=ORG_ID, idp_provider="google",
+                email="user@test.com", session_token=None
+            )
+        assert exc1.value.status_code == 401
+        assert "MISSING_SESSION_BINDING" in exc1.value.detail
+
+        # Tampered / mismatched session token -> 401 SESSION_BINDING_MISMATCH
+        with pytest.raises(HTTPException) as exc2:
+            consume_idp_login_nonce(
+                db, nonce=nonce, org_id=ORG_ID, idp_provider="google",
+                email="user@test.com", session_token="forged_attacker_session_token"
+            )
+        assert exc2.value.status_code == 401
+        assert "SESSION_BINDING_MISMATCH" in exc2.value.detail
+
+        # Authentic session token -> 200 OK consumed
+        consumed = consume_idp_login_nonce(
+            db, nonce=nonce, org_id=ORG_ID, idp_provider="google",
+            email="user@test.com", session_token=valid_session_token
+        )
+        assert consumed is True
+    finally:
+        db.close()
+
+
+def test_pkce_s256_verification():
+    """
+    PKCE S256 TEST (Requirement 2):
+    Proves transaction enforces PKCE S256 code challenge and verifier match.
+    """
+    _ensure_org_exists(ORG_ID)
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import create_idp_login_nonce, consume_idp_login_nonce
+
+    verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+    db = SessionLocal()
+    try:
+        result = create_idp_login_nonce(
+            db, ORG_ID, "google", code_challenge=code_challenge
+        )
+        nonce = result["nonce"]
+        session_token = result["session_token"]
+
+        # 1. Missing code_verifier -> 401 MISSING_PKCE_VERIFIER
+        with pytest.raises(HTTPException) as exc1:
+            consume_idp_login_nonce(
+                db, nonce=nonce, org_id=ORG_ID, idp_provider="google",
+                email="pkce@test.com", session_token=session_token, code_verifier=None
+            )
+        assert exc1.value.status_code == 401
+        assert "MISSING_PKCE_VERIFIER" in exc1.value.detail
+
+        # 2. Invalid code_verifier -> 401 INVALID_PKCE_VERIFIER
+        with pytest.raises(HTTPException) as exc2:
+            consume_idp_login_nonce(
+                db, nonce=nonce, org_id=ORG_ID, idp_provider="google",
+                email="pkce@test.com", session_token=session_token, code_verifier="wrong_verifier_string"
+            )
+        assert exc2.value.status_code == 401
+        assert "INVALID_PKCE_VERIFIER" in exc2.value.detail
+
+        # 3. Matching code_verifier -> 200 OK
+        consumed = consume_idp_login_nonce(
+            db, nonce=nonce, org_id=ORG_ID, idp_provider="google",
+            email="pkce@test.com", session_token=session_token, code_verifier=verifier
+        )
+        assert consumed is True
+    finally:
+        db.close()
+
+
+def test_nonce_issuance_rate_limiting_abuse_controls():
+    """
+    ABUSE PROTECTION RATE LIMIT TEST (Requirement 3):
+    Proves sliding window limits requests to 20/min per IP and returns HTTP 429.
+    """
+    _ensure_org_exists(ORG_ID)
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import create_idp_login_nonce, consume_idp_login_nonce
+
+    test_ip = "192.168.100.50"
+    db = SessionLocal()
+    try:
+        # First 20 requests succeed (consume each nonce so active cap is not exceeded)
+        for i in range(20):
+            res = create_idp_login_nonce(db, ORG_ID, "google", client_ip=test_ip)
+            assert "nonce" in res
+            consume_idp_login_nonce(
+                db, nonce=res["nonce"], org_id=ORG_ID, idp_provider="google",
+                email=f"user_{i}@test.com", session_token=res["session_token"]
+            )
+
+        # 21st request from same IP within the minute is rate limited
+        with pytest.raises(HTTPException) as exc:
+            create_idp_login_nonce(db, ORG_ID, "google", client_ip=test_ip)
+        assert exc.value.status_code == 429
+        assert "RATE_LIMIT_EXCEEDED" in exc.value.detail
+    finally:
+        db.close()
+
+
+def test_active_nonce_cap_per_org():
+    """
+    ACTIVE NONCE CAP TEST (Requirement 3):
+    Proves per-organization active nonce cap (max 5) rejects unbounded generation with HTTP 429.
+    """
+    unique_org = str(uuid.uuid4())
+    _ensure_org_exists(unique_org)
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import create_idp_login_nonce
+
+    db = SessionLocal()
+    try:
+        # Issue 5 active nonces (using different IPs to avoid triggering IP rate limit)
+        for i in range(5):
+            res = create_idp_login_nonce(db, unique_org, "google", client_ip=f"10.0.1.{i+1}")
+            assert "nonce" in res
+
+        # 6th active nonce exceeds per-org cap
+        with pytest.raises(HTTPException) as exc:
+            create_idp_login_nonce(db, unique_org, "google", client_ip="10.0.1.99")
+        assert exc.value.status_code == 429
+        assert "ACTIVE_NONCE_LIMIT_EXCEEDED" in exc.value.detail
+    finally:
+        db.close()
+
+
+def test_expired_nonce_safe_cleanup():
+    """
+    EXPIRED NONCE CLEANUP TEST (Requirement 3):
+    Proves expired active nonces are pruned automatically, while consumed nonces are preserved.
+    """
+    clean_org = str(uuid.uuid4())
+    _ensure_org_exists(clean_org)
+    from app.database import SessionLocal, set_tenant_context
+    from app.modules.auth.nonce_service import create_idp_login_nonce
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        set_tenant_context(db, org_id=clean_org, user_id=None)
+
+        expired_nonce = f"EXPIRED-CLEANUP-{uuid.uuid4().hex[:8]}"
+        consumed_nonce = f"CONSUMED-PRESERVE-{uuid.uuid4().hex[:8]}"
+
+        # Seed 1 expired active nonce and 1 consumed nonce
+        db.execute(text("""
+            INSERT INTO public.idp_authentication_nonces (
+                nonce, org_id, idp_provider, status, created_at, expires_at
+            ) VALUES (
+                :exp, :org_id, 'google', 'ACTIVE', NOW() - INTERVAL '10 minutes', NOW() - INTERVAL '5 minutes'
+            );
+        """), {"exp": expired_nonce, "org_id": clean_org})
+
+        db.execute(text("""
+            INSERT INTO public.idp_authentication_nonces (
+                nonce, org_id, idp_provider, status, created_at, expires_at, consumed_at, consumed_by_email
+            ) VALUES (
+                :cons, :org_id, 'google', 'CONSUMED', NOW() - INTERVAL '10 minutes', NOW() + INTERVAL '5 minutes', NOW(), 'user@test.com'
+            );
+        """), {"cons": consumed_nonce, "org_id": clean_org})
+        db.commit()
+
+        # Call create_idp_login_nonce which automatically runs the safe prune
+        create_idp_login_nonce(db, clean_org, "google", client_ip="10.20.30.40")
+
+        # Re-apply tenant context for verification query (create_idp_login_nonce commits, clearing transaction-local context)
+        set_tenant_context(db, org_id=clean_org, user_id=None)
+
+        # Verify expired active nonce was pruned
+        exp_row = db.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": expired_nonce}).fetchone()
+        assert exp_row is None, "Expired active nonce was NOT pruned!"
+
+        # Verify consumed nonce was preserved for permanent replay defense
+        cons_row = db.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": consumed_nonce}).fetchone()
+        assert cons_row is not None, "Consumed nonce was erroneously deleted during cleanup!"
+    finally:
+        db.close()
+
+
+def test_database_enforced_tenant_isolation_for_nonces():
+    """
+    DATABASE-ENFORCED TENANT ISOLATION TEST (Requirement 1):
+    Proves PostgreSQL RLS policy on public.idp_authentication_nonces isolates records:
+    Org B cannot SELECT, UPDATE, or DELETE Org A's nonces.
+    Null context returns 0 rows.
+    """
+    org_a = str(uuid.uuid4())
+    org_b = str(uuid.uuid4())
+    _ensure_org_exists(org_a)
+    _ensure_org_exists(org_b)
+
+    from app.database import SessionLocal, set_tenant_context
+    from app.modules.auth.nonce_service import create_idp_login_nonce
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        # Seed nonce under Org A
+        result_a = create_idp_login_nonce(db, org_a, "google", client_ip="10.10.10.1")
+        nonce_a = result_a["nonce"]
+
+        # Switch context to Org B
+        set_tenant_context(db, org_id=org_b, user_id=None)
+
+        # 1. Read isolation
+        row_b = db.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a}).fetchall()
+        assert len(row_b) == 0, "CRITICAL RLS BREACH: Org B can read Org A's nonce!"
+
+        # 2. Update isolation
+        res_up = db.execute(text("UPDATE public.idp_authentication_nonces SET status = 'CONSUMED' WHERE nonce = :nonce;"), {"nonce": nonce_a})
+        assert res_up.rowcount == 0, "CRITICAL RLS BREACH: Org B updated Org A's nonce!"
+
+        # 3. Delete isolation
+        res_del = db.execute(text("DELETE FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a})
+        assert res_del.rowcount == 0, "CRITICAL RLS BREACH: Org B deleted Org A's nonce!"
+
+        # 4. Null context isolation
+        db.execute(text("SELECT set_config('app.current_org', '', false);"))
+        row_null = db.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a}).fetchall()
+        assert len(row_null) == 0, "CRITICAL RLS BREACH: Null context can read nonce!"
+
+        # 5. Org A context succeeds
+        set_tenant_context(db, org_id=org_a, user_id=None)
+        row_a = db.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a}).fetchall()
+        assert len(row_a) == 1, "Org A cannot see its own nonce under valid tenant context!"
+    finally:
+        db.close()
+
+
+def test_exact_canonical_provider_issuer_matching(monkeypatch):
+    """
+    EXACT CANONICAL ISSUER MATCHING TEST (Requirement 4):
+    Proves strict rejection of loose substring matches in provider issuer claim.
+    """
+    # 1. Loose substring matching attack on Google: https://accounts.google.com.attacker.com
+    phishing_token = create_signed_test_jwt(
+        payload_overrides={"iss": "https://accounts.google.com.attacker.com"}
+    )
+    with pytest.raises(HTTPException) as exc1:
+        validate_idp_token("google", phishing_token, env="test")
+    assert exc1.value.status_code == 401
+    assert "PROVIDER_ISSUER_MISMATCH" in exc1.value.detail
+
+    # 2. Prefix substring attack: https://evil-accounts.google.com
+    phishing_token2 = create_signed_test_jwt(
+        payload_overrides={"iss": "https://evil-accounts.google.com"}
+    )
+    with pytest.raises(HTTPException) as exc2:
+        validate_idp_token("google", phishing_token2, env="test")
+    assert exc2.value.status_code == 401
+    assert "PROVIDER_ISSUER_MISMATCH" in exc2.value.detail
+
+    # 3. Valid exact canonical issuer: https://accounts.google.com
+    valid_token = create_signed_test_jwt(
+        payload_overrides={"iss": "https://accounts.google.com"}
+    )
+    res = validate_idp_token("google", valid_token, env="test")
+    assert res["iss"] == "https://accounts.google.com"

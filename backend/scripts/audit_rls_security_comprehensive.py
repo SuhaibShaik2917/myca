@@ -69,7 +69,7 @@ ALL_36_TENANT_TABLES = [
 ]
 
 def audit_database_roles_and_rls_enforcement():
-    print("=== [1] Auditing PostgreSQL Roles & Table RLS Configuration (All 36 Tables) ===")
+    print("=== [1] Auditing PostgreSQL Roles & Dynamic Table RLS Discovery (All Tenant Tables) ===")
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
             # 1. Role privileges for app_service_user
@@ -86,23 +86,44 @@ def audit_database_roles_and_rls_enforcement():
             assert rolbypassrls is False, "CRITICAL VIOLATION: app_service_user has BYPASSRLS privilege!"
             print("  --> Role Security PASS: app_service_user has NO superuser and NO bypassrls privileges.")
 
-            # 2. Check RLS and FORCE RLS on all 36 tenant-scoped tables
+            # 2. Dynamic Discovery of ALL tenant-scoped tables with org_id column in public schema
+            cur.execute("""
+                SELECT DISTINCT c.table_name
+                FROM information_schema.columns c
+                JOIN information_schema.tables t ON c.table_name = t.table_name AND c.table_schema = t.table_schema
+                WHERE c.table_schema = 'public'
+                  AND t.table_type = 'BASE TABLE'
+                  AND c.column_name = 'org_id'
+                ORDER BY c.table_name;
+            """)
+            discovered_org_tables = set(r[0] for r in cur.fetchall())
+            # Root tenant tables that define organizations and users
+            root_tenant_tables = {"organizations", "global_users"}
+            all_tenant_tables = sorted(list(discovered_org_tables | root_tenant_tables))
+
+            # Mandatory requirement: newly introduced idp_authentication_nonces MUST be discovered
+            assert "idp_authentication_nonces" in discovered_org_tables, (
+                "CRITICAL AUDIT FAILURE: idp_authentication_nonces missing from dynamically discovered org_id tables!"
+            )
+
             cur.execute("""
                 SELECT relname, relrowsecurity, relforcerowsecurity
                 FROM pg_class
                 WHERE relname = ANY(%s) AND relnamespace = 'public'::regnamespace;
-            """, (ALL_36_TENANT_TABLES,))
+            """, (all_tenant_tables,))
             rows = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
-            assert len(rows) == 36, f"Expected 36 tenant tables, found {len(rows)}"
-            for tbl in ALL_36_TENANT_TABLES:
+            assert len(rows) == len(all_tenant_tables), (
+                f"Expected {len(all_tenant_tables)} tenant tables, found {len(rows)}"
+            )
+            for tbl in all_tenant_tables:
                 assert tbl in rows, f"CRITICAL: Table {tbl} missing from database!"
                 r_sec, r_force = rows[tbl]
                 assert r_sec is True, f"CRITICAL: RLS not enabled on {tbl}!"
                 assert r_force is True, f"CRITICAL: FORCE RLS not enabled on {tbl}!"
                 print(f"  Table '{tbl:32}': RLS={r_sec}, FORCE_RLS={r_force} [PASS]")
 
-            print("  --> RLS Reconciliation: Exactly 36 of 36 tenant tables enforce RLS=True AND FORCE_RLS=True (100%).")
-            print("  --> Reference & system catalogues (9 tables) enforce table-level least-privilege role permissions.")
+            print(f"  --> Dynamic RLS Discovery: Exactly {len(all_tenant_tables)} of {len(all_tenant_tables)} tenant tables enforce RLS=True AND FORCE_RLS=True (100%).")
+            print("  --> Reference & system catalogues enforce table-level least-privilege role permissions.")
 
             # 3. Check reference catalogue least-privilege grants
             cur.execute("""
@@ -346,8 +367,14 @@ def audit_m1_m5_cross_tenant_isolation():
             VALUES (:id, :org_id, :scheme_id, 85.50, 'recommended');
         """), {"id": match_id_a, "org_id": org_a, "scheme_id": scheme_id})
 
+        nonce_id_a = f"nonce-alpha-{uuid.uuid4().hex[:12]}"
+        db.execute(text("""
+            INSERT INTO public.idp_authentication_nonces (nonce, org_id, idp_provider, status, expires_at, state)
+            VALUES (:nonce, :org_id, 'google', 'ACTIVE', NOW() + INTERVAL '5 minutes', 'state-alpha');
+        """), {"nonce": nonce_id_a, "org_id": org_a})
+
         db.commit()
-        print("  --> Seeded Org A records across all core tenant domains (M1-M5).")
+        print("  --> Seeded Org A records across all core tenant domains (M1-M5 & IdP Nonces).")
 
         # Step B: Switch to Org B context and test read isolation across ALL domain tables
         set_tenant_context(db, org_id=org_b, user_id=user_b)
@@ -364,6 +391,7 @@ def audit_m1_m5_cross_tenant_isolation():
             ("financial_summaries", "SELECT id FROM public.financial_summaries WHERE id = :id", summary_id_a),
             ("business_profiles", "SELECT id FROM public.business_profiles WHERE id = :id", prof_id_a),
             ("scheme_matches", "SELECT id FROM public.scheme_matches WHERE id = :id", match_id_a),
+            ("idp_authentication_nonces", "SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :id", nonce_id_a),
         ]
 
         for tbl, query, target_id in domain_checks:
@@ -371,9 +399,9 @@ def audit_m1_m5_cross_tenant_isolation():
             assert len(res) == 0, f"CRITICAL RLS BREACH: Org B can read Org A's {tbl}!"
             print(f"  [Read Isolation] PASS: Org B cannot see Org A's record in {tbl}.")
 
-        # Step C: Cross-tenant Write/Tamper Attempts from Org B into Org A (Across ALL 11 Domains)
+        # Step C: Cross-tenant Write/Tamper Attempts from Org B into Org A
         # C1: Cross-Tenant UPDATE Attempts
-        all_11_targets = [
+        all_targets = [
             ("invoices", "UPDATE public.invoices SET invoice_number = 'TAMPER' WHERE id = :id", inv_id_a),
             ("documents", "UPDATE public.documents SET file_name = 'tamper.pdf' WHERE id = :id", doc_id_a),
             ("gst_registrations", "UPDATE public.gst_registrations SET legal_name = 'TAMPER' WHERE id = :id", reg_id_a),
@@ -385,9 +413,10 @@ def audit_m1_m5_cross_tenant_isolation():
             ("financial_summaries", "UPDATE public.financial_summaries SET summary_period = '999999' WHERE id = :id", summary_id_a),
             ("business_profiles", "UPDATE public.business_profiles SET business_type = 'TAMPER' WHERE id = :id", prof_id_a),
             ("scheme_matches", "UPDATE public.scheme_matches SET status = 'approved' WHERE id = :id", match_id_a),
+            ("idp_authentication_nonces", "UPDATE public.idp_authentication_nonces SET status = 'CONSUMED' WHERE nonce = :id", nonce_id_a),
         ]
 
-        for tbl, update_stmt, target_id in all_11_targets:
+        for tbl, update_stmt, target_id in all_targets:
             savepoint = db.begin_nested()
             try:
                 res = db.execute(text(update_stmt), {"id": target_id})
@@ -403,8 +432,8 @@ def audit_m1_m5_cross_tenant_isolation():
                 else:
                     raise
 
-        # C2: Cross-Tenant DELETE Attempts (Across ALL 11 Domains)
-        all_11_deletes = [
+        # C2: Cross-Tenant DELETE Attempts (Across ALL 12 Domains)
+        all_12_deletes = [
             ("scheme_matches", "DELETE FROM public.scheme_matches WHERE id = :id", match_id_a),
             ("itc_ledger_entries", "DELETE FROM public.itc_ledger_entries WHERE id = :id", ledger_id_a),
             ("invoices", "DELETE FROM public.invoices WHERE id = :id", inv_id_a),
@@ -416,9 +445,10 @@ def audit_m1_m5_cross_tenant_isolation():
             ("financial_summaries", "DELETE FROM public.financial_summaries WHERE id = :id", summary_id_a),
             ("business_profiles", "DELETE FROM public.business_profiles WHERE id = :id", prof_id_a),
             ("gst_registrations", "DELETE FROM public.gst_registrations WHERE id = :id", reg_id_a),
+            ("idp_authentication_nonces", "DELETE FROM public.idp_authentication_nonces WHERE nonce = :id", nonce_id_a),
         ]
 
-        for tbl, delete_stmt, target_id in all_11_deletes:
+        for tbl, delete_stmt, target_id in all_12_deletes:
             savepoint = db.begin_nested()
             try:
                 res = db.execute(text(delete_stmt), {"id": target_id})
@@ -435,7 +465,7 @@ def audit_m1_m5_cross_tenant_isolation():
                     raise
 
         # Step D: Cross-tenant Insert Verification (Positive Alpha Proof + Beta Spoofing Rejection)
-        print("  --> Starting Step D: Cross-Tenant INSERT Verification across all 11 Tenant Domains...")
+        print("  --> Starting Step D: Cross-Tenant INSERT Verification across all 12 Tenant Domains...")
         insert_tamper_targets = [
             ("business_profiles",
              "INSERT INTO public.business_profiles (id, org_id, business_type, industry_sector, turnover_bracket, annual_turnover) VALUES (:id, :org_id, 'Private Limited', 'Manufacturing', 'under_5cr', 50000);",
@@ -480,6 +510,10 @@ def audit_m1_m5_cross_tenant_isolation():
             ("scheme_matches",
              "INSERT INTO public.scheme_matches (id, org_id, scheme_id, match_score, status) VALUES (:id, :org_id, :scheme_id, 90.0, 'recommended');",
              lambda u: {"id": str(uuid.uuid4()), "org_id": u, "scheme_id": scheme_id_d}),
+
+            ("idp_authentication_nonces",
+             "INSERT INTO public.idp_authentication_nonces (nonce, org_id, idp_provider, status, expires_at, state) VALUES (:nonce, :org_id, 'google', 'ACTIVE', NOW() + INTERVAL '5 minutes', 'state-test');",
+             lambda u: {"nonce": f"nonce-test-{uuid.uuid4().hex[:12]}", "org_id": u}),
         ]
 
         for tbl, sql, param_gen in insert_tamper_targets:
@@ -490,7 +524,9 @@ def audit_m1_m5_cross_tenant_isolation():
             db.execute(text(sql), alpha_params)
             sp_a.commit()
             # Verify row actually exists in table
-            row_chk = db.execute(text(f"SELECT id FROM public.{tbl} WHERE id = :id"), {"id": alpha_params["id"]}).fetchone()
+            pk_col = "nonce" if tbl == "idp_authentication_nonces" else "id"
+            pk_val = alpha_params.get(pk_col)
+            row_chk = db.execute(text(f"SELECT {pk_col} FROM public.{tbl} WHERE {pk_col} = :val"), {"val": pk_val}).fetchone()
             assert row_chk is not None, f"Failed positive baseline: row not found in {tbl} after Alpha insert!"
 
             # Phase 2: Switch to Tenant Beta and attempt spoofed INSERT with org_a
@@ -531,7 +567,8 @@ def audit_m1_m5_cross_tenant_isolation():
         db.execute(text("SELECT set_config('app.current_org', '', false), set_config('app.current_user', '', false);"))
         for tbl in ["invoices", "documents", "gst_registrations", "purchase_documents", "itc_ledger_entries", "gst_records", "financial_transactions", "gstr3b_filings", "financial_summaries", "business_profiles", "scheme_matches"]:
             assert len(db.execute(text(f"SELECT id FROM public.{tbl};")).fetchall()) == 0, f"Leak in {tbl} under null context!"
-        print("  [Null Context Isolation] PASS: Under null context, all 11 tenant tables return 0 rows.")
+        assert len(db.execute(text("SELECT nonce FROM public.idp_authentication_nonces;")).fetchall()) == 0, "Leak in idp_authentication_nonces under null context!"
+        print("  [Null Context Isolation] PASS: Under null context, all 12 tested tenant tables return 0 rows.")
 
     finally:
         db.close()

@@ -9,8 +9,14 @@ from typing import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
+def _to_psycopg_dsn(url: str) -> str:
+    """Normalize SQLAlchemy DSN to standard psycopg connection URI."""
+    if url and url.startswith("postgresql+psycopg://"):
+        return "postgresql://" + url[len("postgresql+psycopg://"):]
+    return url
+
 # Admin connection string (superuser / DDL / test setup)
-DB_ADMIN = (
+DB_ADMIN = _to_psycopg_dsn(
     os.environ.get("DB_ADMIN_URL")
     or os.environ.get("DATABASE_ADMIN_URL")
     or os.environ.get("TEST_DATABASE_URL")
@@ -18,28 +24,28 @@ DB_ADMIN = (
 )
 
 # App service role connection string
-DB_APP = (
+DB_APP = _to_psycopg_dsn(
     os.environ.get("DATABASE_URL")
     or os.environ.get("DB_APP_URL")
     or "postgresql://app_service_user:secret@localhost:5432/myca"
 )
 
 # Shared worker service role connection string
-DB_WORKER = (
+DB_WORKER = _to_psycopg_dsn(
     os.environ.get("DATABASE_WORKER_URL")
     or os.environ.get("DB_WORKER_URL")
     or "postgresql://worker_service_user:secret@localhost:5432/myca"
 )
 
 # Distinct worker 1 service role connection string
-DB_WORKER_1 = (
+DB_WORKER_1 = _to_psycopg_dsn(
     os.environ.get("DATABASE_WORKER_1_URL")
     or os.environ.get("DB_WORKER_1_URL")
     or "postgresql://worker_service_user_1:secret@localhost:5432/myca"
 )
 
 # Distinct worker 2 service role connection string
-DB_WORKER_2 = (
+DB_WORKER_2 = _to_psycopg_dsn(
     os.environ.get("DATABASE_WORKER_2_URL")
     or os.environ.get("DB_WORKER_2_URL")
     or "postgresql://worker_service_user_2:secret@localhost:5432/myca"

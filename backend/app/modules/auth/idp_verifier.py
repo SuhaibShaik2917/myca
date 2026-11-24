@@ -1,19 +1,34 @@
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from fastapi import HTTPException, status
 from jose import jwt
 from jose.exceptions import JWTError, ExpiredSignatureError, JWTClaimsError
 from app.config import settings
 
-ASYMMETRIC_ALGORITHMS = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
-DEFAULT_ALLOWED_PROVIDERS = {"google", "azuread", "okta", "auth0"}
+ASYMMETRIC_ALGORITHMS: Set[str] = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+DEFAULT_ALLOWED_PROVIDERS: Set[str] = {"google", "azuread", "okta", "auth0"}
 
-PROVIDER_ISSUER_PATTERNS = {
-    "google": ["https://accounts.google.com", "accounts.google.com"],
-    "azuread": ["login.microsoftonline.com", "sts.windows.net"],
-    "okta": ["okta.com"],
-    "auth0": ["auth0.com"],
+# Canonical exact trusted issuers per provider (strictly prohibiting loose substring matching)
+PROVIDER_CANONICAL_ISSUERS: Dict[str, Set[str]] = {
+    "google": {"https://accounts.google.com", "accounts.google.com"},
+    "azuread": {
+        "https://login.microsoftonline.com/common/v2.0",
+        "https://sts.windows.net/common/",
+    },
+    "test-idp": {
+        "https://idp.test.myca.internal",
+        "myca-test-idp",
+    },
+}
+
+# Strict approved signing algorithms per provider
+PROVIDER_ALLOWED_ALGORITHMS: Dict[str, Set[str]] = {
+    "google": {"RS256"},
+    "azuread": {"RS256"},
+    "okta": {"RS256"},
+    "auth0": {"RS256"},
+    "test-idp": {"RS256", "HS256"},
 }
 
 
@@ -33,7 +48,7 @@ def validate_idp_token(
     4. Header inspection, algorithm verification, and algorithm confusion defense.
     5. Cryptographic signature verification using trusted public key.
     6. Token expiration, not-before freshness, issuer, audience claims.
-    7. Provider-to-issuer binding check.
+    7. Exact provider-to-issuer binding check (strictly no loose substring matching).
     8. Strict email claim (non-empty string with '@'; no sub fallback).
     9. Strict email_verified claim (must be present, boolean type, and True).
     10. Nonce matching when an expected transaction nonce is supplied.
@@ -116,6 +131,16 @@ def validate_idp_token(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"ALGORITHM_CONFUSION_REJECTED: Token specifies symmetric algorithm '{alg_upper}' but asymmetric public key is configured as trust anchor.",
             )
+
+    # Enforce strict provider-approved signing algorithms
+    allowed_provider_algs = set(PROVIDER_ALLOWED_ALGORITHMS.get(provider_clean, {"RS256"}))
+    if env in ("development", "test") and not (idp_pubkey and "PUBLIC KEY" in str(idp_pubkey)):
+        allowed_provider_algs.add("HS256")
+    if alg_upper not in allowed_provider_algs:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"ALGORITHM_NOT_PERMITTED: Algorithm '{alg_upper}' is not permitted for provider '{idp_provider}'. Allowed: {sorted(list(allowed_provider_algs))}",
+        )
 
     # In production/staging, only permitted asymmetric algorithms are allowed
     allowed_algs = set(getattr(settings, "MYCA_IDP_ALLOWED_ALGORITHMS", list(ASYMMETRIC_ALGORITHMS)))
@@ -203,14 +228,23 @@ def validate_idp_token(
             detail=f"INVALID_IDP_SIGNATURE: Cryptographic signature verification failed: {str(exc)}",
         )
 
-    # 7. Provider-to-Issuer binding check
+    # 7. Exact Provider-to-Issuer binding check (strictly no loose substring matching)
     token_iss = str(claims.get("iss", "")).strip().lower()
-    if provider_clean in PROVIDER_ISSUER_PATTERNS:
-        expected_patterns = PROVIDER_ISSUER_PATTERNS[provider_clean]
-        if not any(pattern in token_iss for pattern in expected_patterns):
+    if provider_clean in PROVIDER_CANONICAL_ISSUERS:
+        canonical_issuers = {iss.lower() for iss in PROVIDER_CANONICAL_ISSUERS[provider_clean]}
+        # Also allow explicitly configured issuer if set
+        if idp_issuer:
+            canonical_issuers.add(idp_issuer.strip().lower())
+        if token_iss not in canonical_issuers:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"PROVIDER_ISSUER_MISMATCH: Token issuer '{claims.get('iss')}' is not a valid issuer for provider '{idp_provider}'.",
+                detail=f"PROVIDER_ISSUER_MISMATCH: Token issuer '{claims.get('iss')}' is not a valid canonical issuer for provider '{idp_provider}'.",
+            )
+    elif idp_issuer:
+        if token_iss != idp_issuer.strip().lower():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"PROVIDER_ISSUER_MISMATCH: Token issuer '{claims.get('iss')}' does not match configured issuer '{idp_issuer}'.",
             )
 
     # 8. Strict Email Claim Check (Require actual email claim; do not use sub as email)

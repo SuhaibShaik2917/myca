@@ -78,6 +78,7 @@ jobs:
       - name: Create Disposable Database for Migration Rollback
         run: |
           PGPASSWORD=postgrespassword psql -h localhost -U postgres -d postgres -c "DROP DATABASE IF EXISTS myca_test;" -c "CREATE DATABASE myca_test WITH TEMPLATE myca;"
+          PGPASSWORD=postgrespassword psql -h localhost -U postgres -d myca_test -c "CREATE TABLE IF NOT EXISTS public.disposable_database_marker (marker_token text PRIMARY KEY, purpose text NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO public.disposable_database_marker (marker_token, purpose) VALUES ('MYCA_VERIFIED_DISPOSABLE_TEST_DATABASE_TOKEN_V1_0_14', 'DISPOSABLE_MIGRATION_ROLLBACK_VERIFICATION') ON CONFLICT DO NOTHING;"
       - name: Verify Migration Rollback & Baseline Provenance
         run: python scripts/verify_migration_rollback_state.py
         env:

@@ -2,7 +2,7 @@ import os
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import text
 
@@ -31,6 +31,8 @@ class DemoTokenResponse(BaseModel):
 class IdpNonceRequest(BaseModel):
     org_id: str
     idp_provider: str
+    state: Optional[str] = None
+    code_challenge: Optional[str] = None
 
 
 class IdpNonceResponse(BaseModel):
@@ -38,6 +40,9 @@ class IdpNonceResponse(BaseModel):
     expires_in: int
     org_id: str
     idp_provider: str
+    state: str
+    session_token: str
+    code_challenge: Optional[str] = None
 
 
 class IdpTokenExchangeRequest(BaseModel):
@@ -45,6 +50,9 @@ class IdpTokenExchangeRequest(BaseModel):
     idp_token: str
     org_id: str
     nonce: Optional[str] = None
+    state: Optional[str] = None
+    code_verifier: Optional[str] = None
+    session_token: Optional[str] = None
     user_email: Optional[str] = None
 
 
@@ -119,31 +127,67 @@ def issue_demo_token(payload: DemoTokenRequest) -> DemoTokenResponse:
 
 
 @router.post("/idp-nonce", response_model=IdpNonceResponse)
-def request_idp_login_nonce(payload: IdpNonceRequest) -> IdpNonceResponse:
+def request_idp_login_nonce(
+    payload: IdpNonceRequest,
+    request: Request,
+    response: Response,
+) -> IdpNonceResponse:
     """
-    Issues a server-tracked single-use OIDC login nonce bound to an organization
-    and Identity Provider. Must be embedded in the IdP authorization flow and
-    validated upon token exchange to eliminate replay vulnerabilities.
+    Issues a server-tracked single-use OIDC login nonce bound to an organization,
+    Identity Provider, and initiating browser session. Enforces database tenant isolation,
+    rate limits, and active-nonce caps. Sets a secure HttpOnly session cookie to bind
+    the subsequent callback to the initiating user agent.
     """
+    raw_env = os.getenv("ENVIRONMENT") or getattr(settings, "ENVIRONMENT", "")
+    env = str(raw_env).strip().lower() if raw_env else "development"
+
+    existing_cookie_token = request.cookies.get("myca_auth_session")
+    header_session_token = request.headers.get("X-Auth-Session-Id")
+    inbound_session_token = existing_cookie_token or header_session_token
+
+    client_ip = request.client.host if request.client else "127.0.0.1"
+
     db = SessionLocal()
     try:
-        result = create_idp_login_nonce(db, payload.org_id, payload.idp_provider)
+        result = create_idp_login_nonce(
+            db=db,
+            org_id=payload.org_id,
+            idp_provider=payload.idp_provider,
+            state=payload.state,
+            code_challenge=payload.code_challenge,
+            session_token=inbound_session_token,
+            client_ip=client_ip,
+        )
+
+        # Set secure HttpOnly session cookie on initiating user-agent
+        response.set_cookie(
+            key="myca_auth_session",
+            value=result["session_token"],
+            max_age=300,
+            httponly=True,
+            secure=True if env in ("production", "staging") else False,
+            samesite="lax",
+        )
+
         return IdpNonceResponse(**result)
     finally:
         db.close()
 
 
 @router.post("/idp-exchange", response_model=DemoTokenResponse)
-def exchange_idp_token(payload: IdpTokenExchangeRequest) -> DemoTokenResponse:
+def exchange_idp_token(
+    payload: IdpTokenExchangeRequest,
+    request: Request,
+    response: Response,
+) -> DemoTokenResponse:
     """
     Production authenticated login flow via federated Identity Provider (IdP).
     Rigorously validates IdP token signature, algorithm confusion defenses, issuer,
     audience, expiration, and claims.
     
     Validates and atomically consumes single-use authentication transaction nonces
-    to prevent token replay attacks. Matches verified identity claim to an active
-    registered user in public.global_users, verifies active tenant membership in
-    public.organization_memberships, and issues a cryptographically signed MyCA access token.
+    under PostgreSQL RLS, validating PKCE S256 and browser session binding to prevent
+    token replay, login CSRF, and cross-session transaction substitution.
     """
     try:
         uuid.UUID(payload.org_id)
@@ -172,16 +216,29 @@ def exchange_idp_token(payload: IdpTokenExchangeRequest) -> DemoTokenResponse:
             detail="MISSING_IDP_NONCE: IdP token must contain an authentication transaction nonce claim.",
         )
 
+    # Resolve browser session token for binding validation
+    session_token = (
+        request.cookies.get("myca_auth_session")
+        or request.headers.get("X-Auth-Session-Id")
+        or payload.session_token
+    )
+
     db = SessionLocal()
     try:
-        # Atomically consume the single-use nonce to guarantee replay prevention
+        # Atomically consume the single-use nonce enforcing RLS, browser session binding, and PKCE S256
         consume_idp_login_nonce(
             db=db,
-            nonce=str(token_nonce),
+            nonce=str(token_nonce).strip(),
             org_id=payload.org_id,
             idp_provider=payload.idp_provider,
             email=verified_email,
+            session_token=session_token,
+            state=payload.state,
+            code_verifier=payload.code_verifier,
         )
+
+        # Clear session cookie on successful transaction consumption
+        response.delete_cookie("myca_auth_session")
 
         # Set tenant org context so security_barrier view v_org_users allows reading org users
         set_tenant_context(db, org_id=payload.org_id, user_id=None)

@@ -98,24 +98,86 @@ def run_cmd(cmd_list):
         raise RuntimeError(f"Command failed with code {res.returncode}")
     return res.stdout
 
+DISPOSABLE_MARKER_TABLE = "disposable_database_marker"
+DISPOSABLE_MARKER_TOKEN = "MYCA_VERIFIED_DISPOSABLE_TEST_DATABASE_TOKEN_V1_0_14"
+
+def assert_database_disposable_marker(conn):
+    """
+    Rigorously verifies the presence of the database-level disposable marker table
+    and the exact expected marker token.
+    Refuses to execute destructive rollback operations if the marker is absent.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name = %s
+            );
+        """, (DISPOSABLE_MARKER_TABLE,))
+        table_exists = cur.fetchone()[0]
+        if not table_exists:
+            raise RuntimeError(
+                f"CRITICAL SAFETY ABORT: Database marker table 'public.{DISPOSABLE_MARKER_TABLE}' does not exist! "
+                "A persistent database (even if named 'test') is not proved disposable without an explicit marker token."
+            )
+
+        cur.execute(f"SELECT marker_token FROM public.{DISPOSABLE_MARKER_TABLE} WHERE marker_token = %s;", (DISPOSABLE_MARKER_TOKEN,))
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(
+                f"CRITICAL SAFETY ABORT: Mandatory disposable marker token '{DISPOSABLE_MARKER_TOKEN}' missing "
+                f"from 'public.{DISPOSABLE_MARKER_TABLE}'! Database is not authorized for destructive rollback operations."
+            )
+        print(f"Safety check verified: Database-level disposable marker confirmed ('{DISPOSABLE_MARKER_TOKEN}').")
+
+
+def assert_alembic_targets_same_database(db_url: str, active_db: str):
+    """
+    Verifies that Alembic configuration resolves to the exact same database target
+    as the active psycopg connection.
+    """
+    from urllib.parse import urlparse
+    parsed_psycopg = urlparse(db_url)
+    psycopg_dbname = (parsed_psycopg.path or "").lstrip("/").lower()
+    if psycopg_dbname != active_db:
+        raise RuntimeError(
+            f"CRITICAL SAFETY ABORT: DB_ADMIN_URL path specifies database '{psycopg_dbname}', "
+            f"but active connected PostgreSQL database is '{active_db}'!"
+        )
+
+    # Check environment URL used by alembic/env.py
+    alembic_env_url = os.environ.get("DB_ADMIN_URL") or os.environ.get("DATABASE_URL")
+    if alembic_env_url:
+        parsed_alembic = urlparse(alembic_env_url)
+        alembic_dbname = (parsed_alembic.path or "").lstrip("/").lower()
+        if alembic_dbname != active_db:
+            raise RuntimeError(
+                f"CRITICAL SAFETY ABORT: Alembic environment target resolves to '{alembic_dbname}', "
+                f"which does not match active connected database '{active_db}'!"
+            )
+    print(f"Safety check verified: Alembic and psycopg target the exact same database ('{active_db}').")
+
+
 def capture_database_state(conn):
     with conn.cursor() as cur:
-        # 1. Full grants for app_service_user
+        # 1. Full grants for app_service_user (excluding disposable marker metadata)
         cur.execute("""
             SELECT table_schema, table_name, privilege_type, is_grantable 
             FROM information_schema.role_table_grants 
-            WHERE grantee = 'app_service_user' 
+            WHERE grantee = 'app_service_user'
+              AND table_name != 'disposable_database_marker'
             ORDER BY table_name, privilege_type;
         """)
         grants = {
             (r[0], r[1], r[2], r[3]) for r in cur.fetchall()
         }
 
-        # 2. Complete Policies with cmd, roles, qual, with_check
+        # 2. Complete Policies with cmd, roles, qual, with_check (excluding disposable marker metadata)
         cur.execute("""
             SELECT schemaname, tablename, policyname, permissive, roles, cmd, qual, with_check 
             FROM pg_policies 
             WHERE schemaname = 'public' 
+              AND tablename != 'disposable_database_marker'
             ORDER BY tablename, policyname;
         """)
         policies = {
@@ -123,11 +185,12 @@ def capture_database_state(conn):
             for r in cur.fetchall()
         }
 
-        # 3. Table RLS flags
+        # 3. Table RLS flags (excluding disposable marker metadata)
         cur.execute("""
             SELECT relname, relrowsecurity, relforcerowsecurity
             FROM pg_class
             WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'
+              AND relname != 'disposable_database_marker'
             ORDER BY relname;
         """)
         rls_flags = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
@@ -224,7 +287,17 @@ def assert_disposable_database_environment(db_url: str):
 
     # Database host check: must be local/test instance
     allowed_hosts = {"localhost", "127.0.0.1", "postgres", "db", "test-db", ""}
-    if hostname not in allowed_hosts:
+    import ipaddress
+    is_allowed_host = hostname in allowed_hosts
+    if not is_allowed_host:
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_loopback or ip.is_private:
+                is_allowed_host = True
+        except ValueError:
+            pass
+
+    if not is_allowed_host:
         raise RuntimeError(
             f"CRITICAL SAFETY ABORT: Database host '{hostname}' is not an authorized local/test disposable host. "
             "Destructive rollback verification is strictly prohibited against external or cloud targets."
@@ -276,6 +349,12 @@ def main():
             )
         print(f"Safety check verified: Connected to designated disposable database '{active_db}'.")
 
+    # Assert database-level disposable marker table and token
+    assert_database_disposable_marker(conn)
+
+    # Assert Alembic targets the exact same database as psycopg
+    assert_alembic_targets_same_database(DB_ADMIN_URL, active_db)
+
     trusted_ref = load_trusted_0019_reference()
     print("=== Loaded Independent Trusted Baseline Reference from baseline_0019_reference.json ===")
     print(f"  Provenance Origin: {trusted_ref['provenance'].get('generated_from')}")
@@ -300,15 +379,15 @@ def main():
     run_cmd(["alembic", "upgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 1b: Fresh Historical Upgrade 0022", "LEGACY_SEEDS_PRESENT_IN_HISTORICAL_0022")
 
-    print("\n=== Step 2: Upgrade to Head (0027_idp_auth_nonces) ===")
+    print("\n=== Step 2: Upgrade to Head (0028_idp_nonces_rls) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2: Head 0027", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2: Head 0028", "AUDITORS_VERIFIED_CLEAN")
     state_head = capture_database_state(conn)
-    print(f"  Head State (0027): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
-    assert len(state_head["grants"]) == 115, f"Expected 115 grants at 0027, got {len(state_head['grants'])}"
-    assert len(state_head["policies"]) == 95, f"Expected 95 policies at 0027, got {len(state_head['policies'])}"
+    print(f"  Head State (0028): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
+    assert len(state_head["grants"]) == 116, f"Expected 116 grants at 0028, got {len(state_head['grants'])}"
+    assert len(state_head["policies"]) == 96, f"Expected 96 policies at 0028, got {len(state_head['policies'])}"
 
-    # Verify nonce index, nonce registry table, and idp_authentication_nonces table exist at 0027
+    # Verify nonce index, nonce registry table, and idp_authentication_nonces table exist at 0028
     with conn.cursor() as cur:
         cur.execute("""
             SELECT 1 FROM pg_indexes 
@@ -316,38 +395,63 @@ def main():
               AND tablename = 'statutory_auditors' 
               AND indexname = 'uq_statutory_auditors_gateway_nonce';
         """)
-        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0027"
+        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0028"
 
         cur.execute("""
             SELECT 1 FROM information_schema.tables 
             WHERE table_schema = 'public' 
               AND table_name = 'statutory_gateway_nonce_registry';
         """)
-        assert cur.fetchone() is not None, "statutory_gateway_nonce_registry table missing at 0027"
+        assert cur.fetchone() is not None, "statutory_gateway_nonce_registry table missing at 0028"
 
         cur.execute("""
             SELECT 1 FROM information_schema.tables 
             WHERE table_schema = 'public' 
               AND table_name = 'idp_authentication_nonces';
         """)
-        assert cur.fetchone() is not None, "idp_authentication_nonces table missing at 0027"
+        assert cur.fetchone() is not None, "idp_authentication_nonces table missing at 0028"
 
-        # Verify grants for app_service_user on idp_authentication_nonces
+        # Verify grants for app_service_user on idp_authentication_nonces (SELECT, INSERT, UPDATE, DELETE)
         cur.execute("""
             SELECT privilege_type FROM information_schema.role_table_grants
             WHERE grantee = 'app_service_user' AND table_name = 'idp_authentication_nonces';
         """)
         idp_privs = {r[0] for r in cur.fetchall()}
-        assert idp_privs == {"SELECT", "INSERT", "UPDATE"}, f"Expected SELECT, INSERT, UPDATE on idp_authentication_nonces, got {idp_privs}"
+        assert idp_privs == {"SELECT", "INSERT", "UPDATE", "DELETE"}, f"Expected SELECT, INSERT, UPDATE, DELETE on idp_authentication_nonces, got {idp_privs}"
+
+        # Verify columns added in 0028
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'idp_authentication_nonces'
+              AND column_name IN ('state', 'code_challenge', 'session_binding_hash', 'client_ip');
+        """)
+        cols_0028 = {r[0] for r in cur.fetchall()}
+        assert cols_0028 == {"state", "code_challenge", "session_binding_hash", "client_ip"}, f"Missing 0028 columns: {cols_0028}"
+
+        # Verify RLS and FORCE RLS on idp_authentication_nonces
+        cur.execute("""
+            SELECT relrowsecurity, relforcerowsecurity FROM pg_class
+            WHERE relname = 'idp_authentication_nonces' AND relnamespace = 'public'::regnamespace;
+        """)
+        idp_rls = cur.fetchone()
+        assert idp_rls == (True, True), f"Expected (True, True) for idp_authentication_nonces RLS, got {idp_rls}"
+
+        # Verify idp_auth_nonces_service_policy
+        cur.execute("""
+            SELECT policyname FROM pg_policies
+            WHERE schemaname = 'public' AND tablename = 'idp_authentication_nonces'
+              AND policyname = 'idp_auth_nonces_service_policy';
+        """)
+        assert cur.fetchone() is not None, "Policy idp_auth_nonces_service_policy missing on idp_authentication_nonces"
 
     # Verify all 21 tables have relforcerowsecurity=True
     for tbl in TENANT_TABLES_21:
-        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0027"
+        assert state_head["rls_flags"][tbl][1] is True, f"{tbl} must have relforcerowsecurity=True at 0028"
     # Verify all 8 0020 policies present
     for p_name in POLICIES_0020_8:
         matching = [p for p in state_head["policies"] if p[2] == p_name]
-        assert len(matching) == 1, f"Policy {p_name} missing at 0027"
-    print("PASS: Head state (0027) completely verified.")
+        assert len(matching) == 1, f"Policy {p_name} missing at 0028"
+    print("PASS: Head state (0028) completely verified.")
 
     print("\n=== Step 2-POPULATED: Populated-Record Migration Downgrade & Nonce Preservation Test ===")
     test_pop_aid = "CA-POPULATED-ROLLBACK-TEST"
@@ -406,13 +510,15 @@ def main():
             );
         """, (test_pop_nonce, test_pop_mem))
 
-        # Seed consumed IdP login nonce
+        # Seed consumed IdP login nonce with 0028 columns
         cur.execute("""
             INSERT INTO public.idp_authentication_nonces (
-                nonce, org_id, idp_provider, status, created_at, expires_at, consumed_at, consumed_by_email
+                nonce, org_id, idp_provider, status, created_at, expires_at, consumed_at, consumed_by_email,
+                state, code_challenge, session_binding_hash, client_ip
             ) VALUES (
                 %s, %s, 'google', 'CONSUMED',
-                clock_timestamp(), clock_timestamp() + interval '5 minutes', clock_timestamp(), 'auditor_pop@example.com'
+                clock_timestamp(), clock_timestamp() + interval '5 minutes', clock_timestamp(), 'auditor_pop@example.com',
+                'state-pop-test', 'chal-pop-test', 'hash-pop-test', '127.0.0.1'
             );
         """, (test_idp_nonce, test_org_id))
 
@@ -531,6 +637,29 @@ def main():
         cur.execute("DELETE FROM public.statutory_auditors WHERE auditor_id = %s;", (test_pop_aid,))
     print("PASS: Populated-state downgrade, evidence preservation, nonce replay defense (gateway & IdP), and re-upgrade completely verified.")
 
+    print("\n=== Step 2a-PRE: Downgrade to 0027_idp_auth_nonces & Verify ===")
+    run_cmd(["alembic", "downgrade", "0027_idp_auth_nonces"])
+    classify_and_verify_auditor_state(conn, "Step 2a-PRE: Downgrade 0027", "AUDITORS_VERIFIED_CLEAN")
+    state_0027 = capture_database_state(conn)
+    assert len(state_0027["grants"]) == 115, f"Expected 115 grants at 0027, got {len(state_0027['grants'])}"
+    assert len(state_0027["policies"]) == 95, f"Expected 95 policies at 0027, got {len(state_0027['policies'])}"
+    assert state_0027["rls_flags"]["idp_authentication_nonces"] == (False, False), "RLS should be disabled at 0027"
+    with conn.cursor() as cur:
+        # Check DELETE revoked
+        cur.execute("""
+            SELECT privilege_type FROM information_schema.role_table_grants
+            WHERE grantee = 'app_service_user' AND table_name = 'idp_authentication_nonces';
+        """)
+        privs_0027 = {r[0] for r in cur.fetchall()}
+        assert privs_0027 == {"SELECT", "INSERT", "UPDATE"}, f"Expected SELECT, INSERT, UPDATE at 0027, got {privs_0027}"
+        # Check 0028 columns dropped
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'idp_authentication_nonces'
+              AND column_name IN ('state', 'code_challenge', 'session_binding_hash', 'client_ip');
+        """)
+        assert len(cur.fetchall()) == 0, "0028 columns were not cleanly dropped on downgrade to 0027"
+
     print("\n=== Step 2a-0: Downgrade to 0026_gateway_nonce_and_audit & Verify ===")
     run_cmd(["alembic", "downgrade", "0026_gateway_nonce_and_audit"])
     classify_and_verify_auditor_state(conn, "Step 2a-0: Downgrade 0026", "AUDITORS_VERIFIED_CLEAN")
@@ -579,11 +708,12 @@ def main():
     run_cmd(["alembic", "downgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 2c: Clean Downgrade 0022", "AUDITORS_VERIFIED_CLEAN")
 
-    print("\n=== Step 2d: Re-upgrade to Head (0027_idp_auth_nonces) ===")
+    print("\n=== Step 2d: Re-upgrade to Head (0028_idp_nonces_rls) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0027", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0028", "AUDITORS_VERIFIED_CLEAN")
     state_re_head = capture_database_state(conn)
-    assert len(state_re_head["grants"]) == 115, f"Expected 115 grants at 0027, got {len(state_re_head['grants'])}"
+    assert len(state_re_head["grants"]) == 116, f"Expected 116 grants at 0028, got {len(state_re_head['grants'])}"
+    assert len(state_re_head["policies"]) == 96, f"Expected 96 policies at 0028, got {len(state_re_head['policies'])}"
     print("PASS: Downgrade rollback and re-upgrade cycles verified with zero fake auditor identities.")
 
     print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
@@ -635,15 +765,16 @@ def main():
     assert rolled_back_state["rls_flags"] == trusted_ref["rls_flags"], "Rollback RLS flags mismatch with independent reference snapshot!"
     print("  PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.")
 
-    print("\n=== Step 5: Re-Upgrade to Head (0027_idp_auth_nonces) ===")
+    print("\n=== Step 5: Re-Upgrade to Head (0028_idp_nonces_rls) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0027", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0028", "AUDITORS_VERIFIED_CLEAN")
     final_head_state = capture_database_state(conn)
     assert final_head_state["grants"] == state_head["grants"]
     assert final_head_state["policies"] == state_head["policies"]
     assert final_head_state["rls_flags"] == state_head["rls_flags"]
-    assert len(final_head_state["grants"]) == 115
-    print("  PASS: Re-upgrade to head completely restored production security state (115 grants, 95 policies).")
+    assert len(final_head_state["grants"]) == 116
+    assert len(final_head_state["policies"]) == 96
+    print("  PASS: Re-upgrade to head completely restored production security state (116 grants, 96 policies).")
 
     conn.close()
     print("\nALL MIGRATION ROLLBACK & INDEPENDENT BASELINE REFERENCE INVARIANTS 100% VERIFIED!")
