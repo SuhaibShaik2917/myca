@@ -44,6 +44,22 @@ def _sign_gstr3b_review_attestation(
     message = f"{org_id}:{filing_id}:{checker_id}:{new_status}:{nonce}".encode("utf-8")
     return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
 
+def _sign_gstr3b_filing_attestation(
+    org_id: str,
+    filing_id: str,
+    actor_id: str,
+    arn: str,
+    cin: Optional[str],
+    payload_hash: str,
+    nonce: str,
+) -> str:
+    """Computes server-side HMAC-SHA256 attestation for APPROVED_BY_CHECKER -> FILED transition."""
+    raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
+    derived_secret = hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
+    message = f"{org_id}:{filing_id}:{actor_id}:FILED:{arn}:{cin or ''}:{payload_hash}:{nonce}".encode("utf-8")
+    return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
+
+
 def prepare_gstr3b_return(
     session: Session,
     org_id: str,
@@ -331,7 +347,7 @@ def prepare_gstr3b_return(
             table_4_data = EXCLUDED.table_4_data,
             offset_data = EXCLUDED.offset_data,
             filing_status = 'DRAFT',
-            maker_id = EXCLUDED.maker_id,
+            maker_id = COALESCE(public.gstr3b_filings.maker_id, EXCLUDED.maker_id),
             maker_remarks = EXCLUDED.maker_remarks,
             revision_number = EXCLUDED.revision_number,
             previous_snapshot = EXCLUDED.previous_snapshot,
@@ -417,7 +433,7 @@ def submit_gstr3b_for_review(
         text("""
         UPDATE public.gstr3b_filings
         SET filing_status = 'SUBMITTED_FOR_REVIEW',
-            maker_id = :uid,
+            maker_id = COALESCE(maker_id, :uid),
             maker_remarks = :rem,
             updated_at = clock_timestamp()
         WHERE id = :id AND org_id = :org;
@@ -570,25 +586,41 @@ def file_gstr3b_to_gsp_sandbox(
     except GSPSandboxFilingError as e:
         raise GSTR3BServiceError(str(e))
 
-    # Update filing record
+    # Update filing record through restricted SECURITY DEFINER filing transition
+    nonce = secrets.token_hex(24)
+    signature = _sign_gstr3b_filing_attestation(
+        org_id=str(org_id),
+        filing_id=str(filing_id),
+        actor_id=str(user_id),
+        arn=arn,
+        cin=cin,
+        payload_hash=payload_hash,
+        nonce=nonce,
+    )
     session.execute(
         text("""
-        UPDATE public.gstr3b_filings
-        SET filing_status = 'FILED',
-            arn = :arn,
-            cin = :cin,
-            filing_date = :fdate,
-            payload_hash = :phash,
-            updated_at = clock_timestamp()
-        WHERE id = :id AND org_id = :org_id;
+        SELECT public.execute_gstr3b_filing_transition(
+            CAST(:org_id AS uuid),
+            CAST(:id AS uuid),
+            CAST(:actor_id AS uuid),
+            :arn,
+            :cin,
+            CAST(:fdate AS timestamptz),
+            :phash,
+            :nonce,
+            :sig
+        );
         """),
         {
-            "id": filing_id,
-            "org_id": org_id,
+            "org_id": str(org_id),
+            "id": str(filing_id),
+            "actor_id": str(user_id),
             "arn": arn,
             "cin": cin,
             "fdate": filing_date_iso,
-            "phash": payload_hash
+            "phash": payload_hash,
+            "nonce": nonce,
+            "sig": signature,
         }
     )
 
