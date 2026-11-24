@@ -1,10 +1,15 @@
+import hashlib
+import hmac
 import json
+import secrets
 import uuid
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+from app.config import settings
 
 from app.modules.gstr3b.schemas import (
     TaxBreakdown, Table31OutwardSupplies, Table4ITC,
@@ -24,6 +29,21 @@ GSTR3B_STATUTORY_DISCLAIMER = (
 
 class GSTR3BServiceError(Exception):
     pass
+
+
+def _sign_gstr3b_review_attestation(
+    org_id: str,
+    filing_id: str,
+    checker_id: str,
+    new_status: str,
+    nonce: str,
+) -> str:
+    """Computes server-side HMAC-SHA256 attestation bound to deployment SECRET_KEY."""
+    derived_secret = hashlib.sha256(
+        f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}".encode("utf-8")
+    ).hexdigest().encode("utf-8")
+    message = f"{org_id}:{filing_id}:{checker_id}:{new_status}:{nonce}".encode("utf-8")
+    return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
 
 def prepare_gstr3b_return(
     session: Session,
@@ -469,16 +489,35 @@ def review_gstr3b_decision(
         )
 
     new_status = "APPROVED_BY_CHECKER" if decision == "APPROVED" else "REJECTED_BY_CHECKER"
+    nonce = secrets.token_hex(24)
+    signature = _sign_gstr3b_review_attestation(
+        org_id=str(org_id),
+        filing_id=str(filing_id),
+        checker_id=str(checker_id),
+        new_status=new_status,
+        nonce=nonce,
+    )
     session.execute(
         text("""
-        UPDATE public.gstr3b_filings
-        SET filing_status = :st,
-            checker_id = :cid,
-            checker_remarks = :rem,
-            updated_at = clock_timestamp()
-        WHERE id = :id AND org_id = :org;
+        SELECT public.execute_gstr3b_review_transition(
+            CAST(:org AS uuid),
+            CAST(:id AS uuid),
+            CAST(:cid AS uuid),
+            :st,
+            :rem,
+            :nonce,
+            :sig
+        );
         """),
-        {"id": filing_id, "org": org_id, "st": new_status, "cid": checker_id, "rem": remarks}
+        {
+            "org": str(org_id),
+            "id": str(filing_id),
+            "cid": str(checker_id),
+            "st": new_status,
+            "rem": remarks,
+            "nonce": nonce,
+            "sig": signature,
+        }
     )
     session.commit()
     return {"id": filing_id, "status": new_status, "decision": decision, "remarks": remarks}
