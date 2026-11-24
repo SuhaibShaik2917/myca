@@ -19,18 +19,48 @@ import app.modules.auth.api as auth_api
 from app.modules.auth.idp_verifier import validate_idp_token
 
 
-def _resolve_test_org_id():
+def _ensure_org_exists(org_id: str):
+    """Guarantees the specified organization exists in public.organizations for FK integrity."""
     from tests.test_db_config import get_admin_session
     from sqlalchemy import text
     try:
+        admin_db = get_admin_session()
+        admin_db.execute(
+            text("""
+                INSERT INTO public.organizations (id, legal_name, pan)
+                VALUES (:id, 'Auth Test Organization', 'AAAPL1234C')
+                ON CONFLICT (id) DO NOTHING;
+            """),
+            {"id": org_id}
+        )
+        admin_db.commit()
+        admin_db.close()
+    except Exception as exc:
+        print(f"Warning: could not ensure test org exists: {exc}")
+
+
+def _resolve_test_org_id():
+    from tests.test_db_config import get_admin_session
+    from sqlalchemy import text
+    test_org_id = "7c157424-1b47-4f2d-8751-19fab9f7ae35"
+    try:
         db = get_admin_session()
         row = db.execute(text("SELECT id FROM public.organizations LIMIT 1;")).fetchone()
-        db.close()
         if row:
+            db.close()
             return str(row[0])
+        # If no organization exists yet (e.g. fresh CI run), seed one
+        db.execute(text("""
+            INSERT INTO public.organizations (id, legal_name, pan)
+            VALUES (:id, 'Auth Test Organization', 'AAAPL1234C')
+            ON CONFLICT (id) DO NOTHING;
+        """), {"id": test_org_id})
+        db.commit()
+        db.close()
+        return test_org_id
     except Exception:
         pass
-    return "7c157424-1b47-4f2d-8751-19fab9f7ae35"
+    return test_org_id
 
 
 USER_ID = str(uuid.uuid4())
@@ -472,6 +502,7 @@ def test_idp_token_exchange_rejects_non_member_user(monkeypatch):
 
 def test_idp_nonce_endpoint_issues_tracked_nonce():
     """Proves POST /api/v1/auth/idp-nonce issues an unpredictable active nonce with 5 min TTL."""
+    _ensure_org_exists(ORG_ID)
     from app.main import app
     client = TestClient(app)
     response = client.post(
@@ -554,6 +585,7 @@ def test_idp_token_exchange_rejects_provider_issuer_mismatch():
 
 def test_idp_token_exchange_normalizes_email(monkeypatch):
     """Proves that email claim is normalized (lowercased and whitespace trimmed) before user lookup."""
+    _ensure_org_exists(ORG_ID)
     from app.main import app
     client = TestClient(app)
     
@@ -602,6 +634,7 @@ def test_end_to_end_idp_nonce_issuance_and_atomic_replay_prevention():
     Proves that a real database-tracked nonce can be consumed exactly once,
     and subsequent replay attempts with the same token/nonce are rejected (HTTP 401 IDP_NONCE_REPLAY).
     """
+    _ensure_org_exists(ORG_ID)
     from app.main import app
     client = TestClient(app)
 
@@ -659,6 +692,7 @@ def test_end_to_end_idp_nonce_issuance_and_atomic_replay_prevention():
 
 def test_idp_exchange_rejects_expired_nonce():
     """Proves exchange rejects nonces whose expiration timestamp has passed."""
+    _ensure_org_exists(ORG_ID)
     from app.database import SessionLocal
     from app.modules.auth.nonce_service import consume_idp_login_nonce
     from sqlalchemy import text
@@ -685,6 +719,7 @@ def test_idp_exchange_rejects_expired_nonce():
 
 def test_idp_exchange_rejects_nonce_context_mismatch():
     """Proves exchange rejects nonces bound to a different organization or provider."""
+    _ensure_org_exists(ORG_ID)
     from tests.test_db_config import get_admin_session
     from app.database import SessionLocal
     from app.modules.auth.nonce_service import consume_idp_login_nonce, create_idp_login_nonce
