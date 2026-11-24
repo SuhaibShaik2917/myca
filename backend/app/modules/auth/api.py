@@ -1,9 +1,11 @@
+import ipaddress
+import logging
 import os
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.config import settings
@@ -11,6 +13,8 @@ from app.core.security import create_access_token
 from app.database import SessionLocal, verify_and_resolve_tenant_membership, set_tenant_context
 from app.modules.auth.idp_verifier import validate_idp_token
 from app.modules.auth.nonce_service import create_idp_login_nonce, consume_idp_login_nonce
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -31,8 +35,8 @@ class DemoTokenResponse(BaseModel):
 class IdpNonceRequest(BaseModel):
     org_id: str
     idp_provider: str
-    state: str
-    code_challenge: str
+    state: str = Field(..., min_length=16, max_length=128, description="OIDC transaction state")
+    code_challenge: str = Field(..., min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_-]{43,128}$", description="Base64url-encoded SHA-256 PKCE code challenge")
 
 
 class IdpNonceResponse(BaseModel):
@@ -49,8 +53,8 @@ class IdpTokenExchangeRequest(BaseModel):
     idp_token: str
     org_id: str
     nonce: Optional[str] = None
-    state: str
-    code_verifier: str
+    state: str = Field(..., min_length=16, max_length=128, description="OIDC transaction state")
+    code_verifier: str = Field(..., min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_.~-]{43,128}$", description="RFC 7636 PKCE code verifier (43-128 unreserved chars)")
     user_email: Optional[str] = None
 
 
@@ -124,6 +128,38 @@ def issue_demo_token(payload: DemoTokenRequest) -> DemoTokenResponse:
     )
 
 
+def extract_client_ip(request: Request) -> str:
+    """
+    Safely resolves client IP address while defending against header spoofing.
+    X-Forwarded-For is only trusted if the direct connection originates from a configured TRUSTED_PROXIES peer.
+    Direct connections from untrusted peers strictly use request.client.host.
+    Validates that extracted IP addresses conform to RFC IPv4/IPv6 address syntax.
+    """
+    peer_ip = request.client.host if request.client and request.client.host else "127.0.0.1"
+
+    trusted_proxies = getattr(settings, "TRUSTED_PROXIES", ["127.0.0.1", "::1"])
+    if isinstance(trusted_proxies, str):
+        trusted_proxies = [p.strip() for p in trusted_proxies.split(",") if p.strip()]
+    trusted_set = set(trusted_proxies)
+
+    if peer_ip in trusted_set:
+        xff = request.headers.get("X-Forwarded-For")
+        if xff:
+            for hop in xff.split(","):
+                candidate = hop.strip()
+                try:
+                    ip_obj = ipaddress.ip_address(candidate)
+                    return str(ip_obj)
+                except ValueError:
+                    continue
+
+    try:
+        ip_obj = ipaddress.ip_address(peer_ip)
+        return str(ip_obj)
+    except ValueError:
+        return "127.0.0.1"
+
+
 @router.post("/idp-nonce", response_model=IdpNonceResponse)
 def request_idp_login_nonce(
     payload: IdpNonceRequest,
@@ -140,7 +176,7 @@ def request_idp_login_nonce(
     env = str(raw_env).strip().lower() if raw_env else "development"
 
     inbound_session_token = request.cookies.get("myca_auth_session")
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    client_ip = extract_client_ip(request)
 
     db = SessionLocal()
     try:
@@ -254,8 +290,8 @@ def exchange_idp_token(
                 text("SELECT id, email, membership_status FROM public.v_org_users WHERE LOWER(email) = :email;"),
                 {"email": verified_email},
             ).fetchone()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("User lookup via v_org_users encountered exception: %s", exc)
 
         if not user_row:
             # Fallback for platform/global lookup if permitted
@@ -266,8 +302,8 @@ def exchange_idp_token(
                 ).fetchone()
                 if g_row:
                     user_row = g_row
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("User lookup via global_users encountered exception: %s", exc)
 
         if not user_row:
             raise HTTPException(

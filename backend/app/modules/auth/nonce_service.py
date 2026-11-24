@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import re
 import secrets
@@ -16,6 +17,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.config import settings
 from app.database import set_tenant_context
 
+logger = logging.getLogger(__name__)
+
 NONCE_TTL_SECONDS = 300  # 5 minutes
 MAX_ACTIVE_NONCES_PER_ORG = 5
 MAX_ISSUANCES_PER_IP_PER_MIN = 20
@@ -29,68 +32,136 @@ def check_distributed_rate_limit(
     org_id: str,
     max_ip: int = MAX_ISSUANCES_PER_IP_PER_MIN,
     max_org: int = MAX_ISSUANCES_PER_ORG_PER_MIN,
+    current_time: Optional[datetime] = None,
 ) -> None:
     """
-    Atomically enforces distributed rate limits using PostgreSQL row locking on public.auth_rate_limits.
+    Atomically enforces distributed rolling 60-second rate limits using PostgreSQL row locking on public.auth_rate_limits.
+    Unlike calendar-minute fixed windows, this sliding window tracks exact request timestamps over a 60-second rolling window,
+    completely preventing boundary bursts across minute transitions.
     Shared across all worker processes, threads, and instances without memory synchronization gaps.
     """
-    now = datetime.now(timezone.utc)
-    window_start = now.replace(second=0, microsecond=0)
+    now = current_time or datetime.now(timezone.utc)
 
-    # 1. IP rate limit check
+    # 1. IP rolling 60-second rate limit check
     ip_key = f"ip:{client_ip.strip()}"
-    ip_count = db.execute(
+    db.execute(
         text("""
-            INSERT INTO public.auth_rate_limits (rate_key, window_start, request_count)
-            VALUES (:key, :window_start, 1)
-            ON CONFLICT (rate_key) DO UPDATE
-            SET request_count = CASE
-                    WHEN public.auth_rate_limits.window_start < :window_start THEN 1
-                    ELSE public.auth_rate_limits.request_count + 1
-                END,
-                window_start = CASE
-                    WHEN public.auth_rate_limits.window_start < :window_start THEN :window_start
-                    ELSE public.auth_rate_limits.window_start
-                END
-            RETURNING request_count;
+            INSERT INTO public.auth_rate_limits (rate_key, timestamps, updated_at)
+            VALUES (:key, '{}'::timestamptz[], :now)
+            ON CONFLICT (rate_key) DO NOTHING;
         """),
-        {"key": ip_key, "window_start": window_start},
-    ).scalar() or 1
+        {"key": ip_key, "now": now},
+    )
+    ip_result = db.execute(
+        text("""
+            UPDATE public.auth_rate_limits
+            SET timestamps = CASE
+                    WHEN (
+                        SELECT count(*)
+                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
+                        WHERE t_item > :now - INTERVAL '60 seconds'
+                    ) < :max_ip
+                    THEN (
+                        SELECT coalesce(array_agg(t_item ORDER BY t_item), '{}'::timestamptz[]) || :now
+                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
+                        WHERE t_item > :now - INTERVAL '60 seconds'
+                    )
+                    ELSE (
+                        SELECT coalesce(array_agg(t_item ORDER BY t_item), '{}'::timestamptz[])
+                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
+                        WHERE t_item > :now - INTERVAL '60 seconds'
+                    )
+                END,
+                updated_at = :now
+            WHERE rate_key = :key
+            RETURNING 
+                (public.auth_rate_limits.timestamps @> ARRAY[:now]) AS is_allowed,
+                (
+                    SELECT count(*)
+                    FROM unnest(public.auth_rate_limits.timestamps) AS t_item
+                    WHERE t_item > :now - INTERVAL '60 seconds'
+                ) AS active_count;
+        """),
+        {"key": ip_key, "now": now, "max_ip": max_ip},
+    ).fetchone()
 
-    if ip_count > max_ip:
+    ip_allowed = ip_result[0] if ip_result else False
+    if not ip_allowed:
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"RATE_LIMIT_EXCEEDED: Maximum nonce issuance rate ({max_ip}/min) exceeded for IP.",
         )
 
-    # 2. Org rate limit check
+    # 2. Org rolling 60-second rate limit check
     org_key = f"org:{str(org_id).strip()}"
-    org_count = db.execute(
+    db.execute(
         text("""
-            INSERT INTO public.auth_rate_limits (rate_key, window_start, request_count)
-            VALUES (:key, :window_start, 1)
-            ON CONFLICT (rate_key) DO UPDATE
-            SET request_count = CASE
-                    WHEN public.auth_rate_limits.window_start < :window_start THEN 1
-                    ELSE public.auth_rate_limits.request_count + 1
-                END,
-                window_start = CASE
-                    WHEN public.auth_rate_limits.window_start < :window_start THEN :window_start
-                    ELSE public.auth_rate_limits.window_start
-                END
-            RETURNING request_count;
+            INSERT INTO public.auth_rate_limits (rate_key, timestamps, updated_at)
+            VALUES (:key, '{}'::timestamptz[], :now)
+            ON CONFLICT (rate_key) DO NOTHING;
         """),
-        {"key": org_key, "window_start": window_start},
-    ).scalar() or 1
+        {"key": org_key, "now": now},
+    )
+    org_result = db.execute(
+        text("""
+            UPDATE public.auth_rate_limits
+            SET timestamps = CASE
+                    WHEN (
+                        SELECT count(*)
+                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
+                        WHERE t_item > :now - INTERVAL '60 seconds'
+                    ) < :max_org
+                    THEN (
+                        SELECT coalesce(array_agg(t_item ORDER BY t_item), '{}'::timestamptz[]) || :now
+                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
+                        WHERE t_item > :now - INTERVAL '60 seconds'
+                    )
+                    ELSE (
+                        SELECT coalesce(array_agg(t_item ORDER BY t_item), '{}'::timestamptz[])
+                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
+                        WHERE t_item > :now - INTERVAL '60 seconds'
+                    )
+                END,
+                updated_at = :now
+            WHERE rate_key = :key
+            RETURNING 
+                (public.auth_rate_limits.timestamps @> ARRAY[:now]) AS is_allowed,
+                (
+                    SELECT count(*)
+                    FROM unnest(public.auth_rate_limits.timestamps) AS t_item
+                    WHERE t_item > :now - INTERVAL '60 seconds'
+                ) AS active_count;
+        """),
+        {"key": org_key, "now": now, "max_org": max_org},
+    ).fetchone()
 
-    if org_count > max_org:
+    org_allowed = org_result[0] if org_result else False
+    if not org_allowed:
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"RATE_LIMIT_EXCEEDED: Maximum nonce issuance rate ({max_org}/min) exceeded for organization.",
         )
     db.commit()
+
+
+def cleanup_expired_auth_rate_limits(db: Session, retention_hours: int = 1) -> int:
+    """
+    Safely prunes inactive rate-limit records where no requests have occurred
+    within the retention window (default 1 hour).
+    Because active rate limiting operates strictly on a rolling 60-second window,
+    pruning records older than 1 hour cannot interfere with active enforcement.
+    """
+    res = db.execute(
+        text("""
+            DELETE FROM public.auth_rate_limits
+            WHERE updated_at < NOW() - make_interval(hours => :hours);
+        """),
+        {"hours": retention_hours},
+    )
+    db.commit()
+    return res.rowcount or 0
 
 
 def reset_auth_rate_limits(db: Session) -> None:
@@ -263,9 +334,10 @@ def create_idp_login_nonce(
         raise
     except SQLAlchemyError as exc:
         db.rollback()
+        logger.error(f"Database error during nonce persistence: {exc}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"IDP_AUTH_SERVICE_UNAVAILABLE: Failed to persist authentication nonce: {str(exc)}",
+            detail="IDP_AUTH_SERVICE_UNAVAILABLE: Database operation failed during nonce persistence.",
         )
 
     return {
@@ -308,13 +380,23 @@ def consume_idp_login_nonce(
         )
     clean_state = str(state).strip()
 
-    # 2. Validate mandatory PKCE code_verifier
+    # 2. Validate mandatory PKCE code_verifier (RFC 7636 unreserved: 43-128 chars)
     if not code_verifier or not str(code_verifier).strip():
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="MISSING_PKCE_VERIFIER: Authentication transaction requires a PKCE code_verifier.",
         )
     clean_code_verifier = str(code_verifier).strip()
+    if len(clean_code_verifier) < 43 or len(clean_code_verifier) > 128:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="INVALID_PKCE_VERIFIER: PKCE code_verifier length must be between 43 and 128 characters.",
+        )
+    if not re.match(r"^[A-Za-z0-9_.~-]{43,128}$", clean_code_verifier):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="INVALID_PKCE_VERIFIER: PKCE code_verifier contains invalid characters. Must contain only RFC 7636 unreserved characters.",
+        )
 
     # 3. Validate mandatory HttpOnly Session Token
     if not session_token or not str(session_token).strip():

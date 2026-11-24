@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str = "dev-insecure-secret-key-replace-in-production-with-min-32-chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
+    TRUSTED_PROXIES: List[str] = ["127.0.0.1", "::1"]
     
     # Gemini AI (Currently operational models for late 2026: Gemini 3.8 Flash & Gemini 3.5 Flash-Lite)
     GEMINI_API_KEY: Optional[str] = None

@@ -99,7 +99,7 @@ def run_cmd(cmd_list):
     return res.stdout
 
 DISPOSABLE_MARKER_TABLE = "disposable_database_marker"
-DISPOSABLE_MARKER_TOKEN = "MYCA_VERIFIED_DISPOSABLE_TEST_DATABASE_TOKEN_V1_0_15"
+DISPOSABLE_MARKER_TOKEN = "MYCA_VERIFIED_DISPOSABLE_TEST_DATABASE_TOKEN_V1_0_16"
 
 def assert_database_disposable_marker(conn):
     """
@@ -379,15 +379,15 @@ def main():
     run_cmd(["alembic", "upgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 1b: Fresh Historical Upgrade 0022", "LEGACY_SEEDS_PRESENT_IN_HISTORICAL_0022")
 
-    print("\n=== Step 2: Upgrade to Head (0029_auth_rate_limits) ===")
+    print("\n=== Step 2: Upgrade to Head (0030_auth_rate_limits_rolling) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2: Head 0029", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2: Head 0030", "AUDITORS_VERIFIED_CLEAN")
     state_head = capture_database_state(conn)
-    print(f"  Head State (0029): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
-    assert len(state_head["grants"]) == 120, f"Expected 120 grants at 0029, got {len(state_head['grants'])}"
-    assert len(state_head["policies"]) == 96, f"Expected 96 policies at 0029, got {len(state_head['policies'])}"
+    print(f"  Head State (0030): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
+    assert len(state_head["grants"]) == 120, f"Expected 120 grants at 0030, got {len(state_head['grants'])}"
+    assert len(state_head["policies"]) == 96, f"Expected 96 policies at 0030, got {len(state_head['policies'])}"
 
-    # Verify nonce index, nonce registry table, idp_authentication_nonces table, and auth_rate_limits table exist at 0029
+    # Verify nonce index, nonce registry table, idp_authentication_nonces table, and auth_rate_limits table exist at 0030
     with conn.cursor() as cur:
         cur.execute("""
             SELECT 1 FROM pg_indexes 
@@ -395,28 +395,45 @@ def main():
               AND tablename = 'statutory_auditors' 
               AND indexname = 'uq_statutory_auditors_gateway_nonce';
         """)
-        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0029"
+        assert cur.fetchone() is not None, "uq_statutory_auditors_gateway_nonce index missing at 0030"
 
         cur.execute("""
             SELECT 1 FROM information_schema.tables 
             WHERE table_schema = 'public' 
               AND table_name = 'statutory_gateway_nonce_registry';
         """)
-        assert cur.fetchone() is not None, "statutory_gateway_nonce_registry table missing at 0029"
+        assert cur.fetchone() is not None, "statutory_gateway_nonce_registry table missing at 0030"
 
         cur.execute("""
             SELECT 1 FROM information_schema.tables 
             WHERE table_schema = 'public' 
               AND table_name = 'idp_authentication_nonces';
         """)
-        assert cur.fetchone() is not None, "idp_authentication_nonces table missing at 0029"
+        assert cur.fetchone() is not None, "idp_authentication_nonces table missing at 0030"
 
         cur.execute("""
             SELECT 1 FROM information_schema.tables 
             WHERE table_schema = 'public' 
               AND table_name = 'auth_rate_limits';
         """)
-        assert cur.fetchone() is not None, "auth_rate_limits table missing at 0029"
+        assert cur.fetchone() is not None, "auth_rate_limits table missing at 0030"
+
+        # Verify rolling sliding window columns on auth_rate_limits at 0030
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'auth_rate_limits'
+              AND column_name IN ('timestamps', 'updated_at');
+        """)
+        rate_cols = {r[0] for r in cur.fetchall()}
+        assert rate_cols == {"timestamps", "updated_at"}, f"Expected timestamps, updated_at on auth_rate_limits at 0030, got {rate_cols}"
+
+        # Verify index on updated_at exists
+        cur.execute("""
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = 'auth_rate_limits'
+              AND indexname = 'ix_auth_rate_limits_updated_at';
+        """)
+        assert cur.fetchone() is not None, "ix_auth_rate_limits_updated_at index missing at 0030"
 
         # Verify grants for app_service_user on auth_rate_limits (SELECT, INSERT, UPDATE, DELETE)
         cur.execute("""
@@ -652,6 +669,29 @@ def main():
         cur.execute("DELETE FROM public.statutory_auditors WHERE auditor_id = %s;", (test_pop_aid,))
     print("PASS: Populated-state downgrade, evidence preservation, nonce replay defense (gateway & IdP), and re-upgrade completely verified.")
 
+    print("\n=== Step 2a-PRE-30: Downgrade to 0029_auth_rate_limits & Verify ===")
+    run_cmd(["alembic", "downgrade", "0029_auth_rate_limits"])
+    classify_and_verify_auditor_state(conn, "Step 2a-PRE-30: Downgrade 0029", "AUDITORS_VERIFIED_CLEAN")
+    state_0029 = capture_database_state(conn)
+    assert len(state_0029["grants"]) == 120, f"Expected 120 grants at 0029, got {len(state_0029['grants'])}"
+    assert len(state_0029["policies"]) == 96, f"Expected 96 policies at 0029, got {len(state_0029['policies'])}"
+    with conn.cursor() as cur:
+        # Check window_start, request_count exist
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'auth_rate_limits'
+              AND column_name IN ('window_start', 'request_count');
+        """)
+        cols_0029 = {r[0] for r in cur.fetchall()}
+        assert cols_0029 == {"window_start", "request_count"}, f"Missing 0029 columns on downgrade: {cols_0029}"
+        # Check index dropped
+        cur.execute("""
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = 'auth_rate_limits'
+              AND indexname = 'ix_auth_rate_limits_updated_at';
+        """)
+        assert cur.fetchone() is None, "ix_auth_rate_limits_updated_at should be dropped at 0029"
+
     print("\n=== Step 2a-PRE-29: Downgrade to 0028_idp_nonces_rls & Verify ===")
     run_cmd(["alembic", "downgrade", "0028_idp_nonces_rls"])
     classify_and_verify_auditor_state(conn, "Step 2a-PRE-29: Downgrade 0028", "AUDITORS_VERIFIED_CLEAN")
@@ -736,12 +776,12 @@ def main():
     run_cmd(["alembic", "downgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 2c: Clean Downgrade 0022", "AUDITORS_VERIFIED_CLEAN")
 
-    print("\n=== Step 2d: Re-upgrade to Head (0029_auth_rate_limits) ===")
+    print("\n=== Step 2d: Re-upgrade to Head (0030_auth_rate_limits_rolling) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0029", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0030", "AUDITORS_VERIFIED_CLEAN")
     state_re_head = capture_database_state(conn)
-    assert len(state_re_head["grants"]) == 120, f"Expected 120 grants at 0029, got {len(state_re_head['grants'])}"
-    assert len(state_re_head["policies"]) == 96, f"Expected 96 policies at 0029, got {len(state_re_head['policies'])}"
+    assert len(state_re_head["grants"]) == 120, f"Expected 120 grants at 0030, got {len(state_re_head['grants'])}"
+    assert len(state_re_head["policies"]) == 96, f"Expected 96 policies at 0030, got {len(state_re_head['policies'])}"
     print("PASS: Downgrade rollback and re-upgrade cycles verified with zero fake auditor identities.")
 
     print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
@@ -793,9 +833,9 @@ def main():
     assert rolled_back_state["rls_flags"] == trusted_ref["rls_flags"], "Rollback RLS flags mismatch with independent reference snapshot!"
     print("  PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.")
 
-    print("\n=== Step 5: Re-Upgrade to Head (0029_auth_rate_limits) ===")
+    print("\n=== Step 5: Re-Upgrade to Head (0030_auth_rate_limits_rolling) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0029", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0030", "AUDITORS_VERIFIED_CLEAN")
     final_head_state = capture_database_state(conn)
     assert final_head_state["grants"] == state_head["grants"]
     assert final_head_state["policies"] == state_head["policies"]
