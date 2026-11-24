@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, Header, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_tenant_db
+from app.core.dependencies import get_tenant_db, validate_tenant_identity
 from app.modules.credit_builder.schemas import (
     StatementUploadResponse, FinancialSummaryOut,
     FinancialReadinessScore, LoanDossierOut
@@ -26,8 +26,7 @@ async def upload_bank_statement_endpoint(
     Ingests and auto-categorizes bank or UPI statement CSV.
     Supports file upload or direct text paste.
     """
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
 
     content = ""
     if file:
@@ -56,8 +55,7 @@ def get_summary_endpoint(
     db: Session = Depends(get_tenant_db)
 ):
     """Retrieves monthly cash flow trends, revenue, and categorized expenditure."""
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         return get_financial_summary(db, effective_org, effective_user)
     except Exception as e:
@@ -73,8 +71,7 @@ def get_readiness_score_endpoint(
     Calculates deterministic MSME Financial Readiness Index (scale 300-900)
     with factor-by-factor breakdown.
     """
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         return compute_financial_readiness_score(db, effective_org, effective_user)
     except Exception as e:
@@ -87,8 +84,7 @@ def get_loan_dossier_endpoint(
     db: Session = Depends(get_tenant_db)
 ):
     """Generates structured loan readiness dossier for bank and NBFC submissions."""
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         return generate_loan_dossier(db, effective_org, effective_user)
     except Exception as e:

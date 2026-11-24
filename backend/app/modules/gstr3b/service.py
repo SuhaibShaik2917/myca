@@ -51,6 +51,22 @@ def prepare_gstr3b_return(
 
     gstin = reg_row.gstin
 
+    # Check if target return for tax period is already FILED (strict immutability)
+    existing_filing = session.execute(
+        text("""
+            SELECT id, filing_status 
+            FROM public.gstr3b_filings 
+            WHERE org_id = :org AND registration_id = :reg AND tax_period = :period;
+        """),
+        {"org": org_id, "reg": registration_id, "period": tax_period}
+    ).fetchone()
+
+    if existing_filing and existing_filing.filing_status == "FILED":
+        raise GSTR3BServiceError(
+            f"Statutory return for tax period '{tax_period}' has already been FILED and is strictly immutable. "
+            "Corrections must be handled through separate statutory amendment workflows."
+        )
+
     # 2. Compute Table 3.1 Outward Taxable Supplies from approved invoices
     # Matches tax_period e.g. '2026-11'
     inv_rows = session.execute(
@@ -241,6 +257,7 @@ def prepare_gstr3b_return(
                 ELSE 'DRAFT' 
             END,
             updated_at = EXCLUDED.updated_at
+        WHERE public.gstr3b_filings.filing_status != 'FILED'
         RETURNING id, filing_status;
     """)
 
@@ -255,6 +272,11 @@ def prepare_gstr3b_return(
         "maker_id": user_id,
         "now": now_ts
     }).fetchone()
+
+    if res is None:
+        raise GSTR3BServiceError(
+            f"Statutory return for tax period '{tax_period}' has already been FILED and is strictly immutable."
+        )
 
     session.commit()
 
@@ -322,10 +344,13 @@ def review_gstr3b_decision(
     if filing.filing_status != "SUBMITTED_FOR_REVIEW":
         raise GSTR3BServiceError(f"Cannot review return in status '{filing.filing_status}'. Must be SUBMITTED_FOR_REVIEW.")
 
-    # Separation of duties: Checker cannot be the same user as Maker if multiple users exist
-    if filing.maker_id and str(filing.maker_id) == checker_id:
-        # In single-user demo organizations, log advisory notice
-        pass
+    # Strict separation of duties: Maker cannot act as Checker across all environments
+    if not checker_id:
+        raise GSTR3BServiceError("Checker user identity required for review.")
+    if filing.maker_id and str(filing.maker_id) == str(checker_id):
+        raise GSTR3BServiceError(
+            "Segregation of duties violation: Maker cannot act as Checker to approve or reject their own GSTR-3B submission."
+        )
 
     new_status = "APPROVED_BY_CHECKER" if decision == "APPROVED" else "REJECTED_BY_CHECKER"
     session.execute(

@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, H
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
-from app.core.dependencies import get_tenant_db
+from app.core.dependencies import get_tenant_db, validate_tenant_identity
 from app.database import set_tenant_context
 from app.modules.reconciliation.schemas import (
     GSTR2BParsedStatement, GSTR2BUploadResponse, IMSActionRequest, IMSActionResponse,
@@ -49,8 +49,8 @@ router = APIRouter(prefix="/reconciliation", tags=["GSTR-2B & Purchase Reconcili
 @router.post("/gst-registrations/create", response_model=GSTRegistrationOut)
 def create_gst_registration(
     payload: GSTRegistrationCreate,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -58,9 +58,10 @@ def create_gst_registration(
     Validates PAN consistency (chars 3-12 match organization PAN)
     and enforces partial unique index for primary registration.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     org_row = db.execute(
         text("SELECT pan FROM public.organizations WHERE id = :org;"),
-        {"org": x_org_id}
+        {"org": effective_org}
     ).fetchone()
     if not org_row or not org_row.pan:
         raise HTTPException(status_code=400, detail="Organization PAN is not configured")
@@ -76,7 +77,7 @@ def create_gst_registration(
     if payload.is_primary:
         existing_primary = db.execute(
             text("SELECT id FROM public.gst_registrations WHERE org_id = :org AND is_primary = true;"),
-            {"org": x_org_id}
+            {"org": effective_org}
         ).fetchone()
         if existing_primary:
             raise HTTPException(
@@ -86,7 +87,7 @@ def create_gst_registration(
 
     dup_gstin = db.execute(
         text("SELECT id FROM public.gst_registrations WHERE org_id = :org AND gstin = :gstin;"),
-        {"org": x_org_id, "gstin": gstin_clean}
+        {"org": effective_org, "gstin": gstin_clean}
     ).fetchone()
     if dup_gstin:
         raise HTTPException(status_code=409, detail=f"GSTIN {gstin_clean} is already registered for this organization.")
@@ -106,7 +107,7 @@ def create_gst_registration(
         """),
         {
             "id": reg_id,
-            "org_id": x_org_id,
+            "org_id": effective_org,
             "gstin": gstin_clean,
             "state_code": payload.state_code,
             "trade_name": payload.trade_name,
@@ -120,7 +121,7 @@ def create_gst_registration(
 
     return GSTRegistrationOut(
         id=reg_id,
-        org_id=x_org_id,
+        org_id=effective_org,
         gstin=gstin_clean,
         state_code=payload.state_code,
         trade_name=payload.trade_name,
@@ -137,7 +138,8 @@ def list_gst_registrations(
     db: Session = Depends(get_tenant_db)
 ):
     """Lists all GST registrations belonging to this organization."""
-    effective_org = x_org_id or db.info.get("current_org")
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
+    # effective_org already validated from session context
     rows = db.execute(
         text("""
         SELECT id, org_id, gstin, state_code, trade_name, legal_name,
@@ -174,8 +176,8 @@ def upload_gstr2b(
     registration_id: str = Form(...),
     return_period: str = Form(...),  # YYYY-MM
     file: UploadFile = File(...),
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -183,11 +185,12 @@ def upload_gstr2b(
     verifies GST registration ownership under PAN, creates an immutable statement snapshot,
     and initializes IMS (Invoice Management System) actions for each inward document.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         # 1. Verify registration
         reg_row = db.execute(
             text("SELECT id, gstin FROM public.gst_registrations WHERE id = :id AND org_id = :org;"),
-            {"id": registration_id, "org": x_org_id}
+            {"id": registration_id, "org": effective_org}
         ).fetchone()
         if not reg_row:
             raise HTTPException(status_code=404, detail="GST Registration not found for this organization")
@@ -200,7 +203,7 @@ def upload_gstr2b(
         # 2. Check duplicate hash
         dup_import = db.execute(
             text("SELECT id FROM public.gstr2b_imports WHERE org_id = :org AND file_hash = :hash;"),
-            {"org": x_org_id, "hash": file_hash}
+            {"org": effective_org, "hash": file_hash}
         ).fetchone()
         if dup_import:
             raise HTTPException(
@@ -234,7 +237,7 @@ def upload_gstr2b(
             """),
             {
                 "id": import_id,
-                "org_id": x_org_id,
+                "org_id": effective_org,
                 "reg_id": registration_id,
                 "gstin": reg_row.gstin,
                 "rp": rp,
@@ -254,7 +257,7 @@ def upload_gstr2b(
             WHERE org_id = :org AND registration_id = :reg_id AND return_period = :rp AND is_active = true
             ORDER BY version_number DESC LIMIT 1;
             """),
-            {"org": x_org_id, "reg_id": registration_id, "rp": rp}
+            {"org": effective_org, "reg_id": registration_id, "rp": rp}
         ).fetchone()
 
         version_num = 1
@@ -264,7 +267,7 @@ def upload_gstr2b(
             prev_id = prev_snapshot.id
             db.execute(
                 text("UPDATE public.gstr2b_snapshots SET is_active = false WHERE id = :id AND org_id = :org;"),
-                {"id": prev_snapshot.id, "org": x_org_id}
+                {"id": prev_snapshot.id, "org": effective_org}
             )
 
         snapshot_id = str(uuid.uuid4())
@@ -281,7 +284,7 @@ def upload_gstr2b(
             """),
             {
                 "id": snapshot_id,
-                "org_id": x_org_id,
+                "org_id": effective_org,
                 "import_id": import_id,
                 "reg_id": registration_id,
                 "gstin": reg_row.gstin,
@@ -316,7 +319,7 @@ def upload_gstr2b(
                 """),
                 {
                     "id": doc_id,
-                    "org_id": x_org_id,
+                    "org_id": effective_org,
                     "snapshot_id": snapshot_id,
                     "section_name": doc.section_name,
                     "itc_availability": doc.itc_availability,
@@ -361,7 +364,7 @@ def upload_gstr2b(
                 """),
                 {
                     "id": str(uuid.uuid4()),
-                    "org_id": x_org_id,
+                    "org_id": effective_org,
                     "g_doc_id": doc_id,
                     "ref": f"{doc.supplier_gstin or 'UNKNOWN'}:{doc.document_number}",
                     "action": initial_ims,
@@ -397,17 +400,18 @@ def upload_gstr2b(
 def list_snapshots(
     registration_id: str,
     return_period: Optional[str] = None,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """Lists snapshots for a GST registration."""
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     query = """
     SELECT id, import_id, recipient_gstin, return_period, version_number,
            total_itc_available, total_itc_not_available, is_active, created_at
     FROM public.gstr2b_snapshots
     WHERE org_id = :org AND registration_id = :reg_id
     """
-    params = {"org": x_org_id, "reg_id": registration_id}
+    params = {"org": effective_org, "reg_id": registration_id}
     if return_period:
         query += " AND return_period = :rp"
         params["rp"] = return_period
@@ -433,10 +437,11 @@ def list_snapshots(
 @router.get("/gstr2b/documents")
 def list_gstr2b_documents(
     snapshot_id: str,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """Lists source documents for a snapshot along with current IMS action."""
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     rows = db.execute(
         text("""
         SELECT d.id, d.section_name, d.itc_availability, d.source_form,
@@ -451,7 +456,7 @@ def list_gstr2b_documents(
         WHERE d.snapshot_id = :sid AND d.org_id = :org
         ORDER BY d.document_date DESC, d.document_number ASC;
         """),
-        {"sid": snapshot_id, "org": x_org_id}
+        {"sid": snapshot_id, "org": effective_org}
     ).fetchall()
 
     return [
@@ -488,21 +493,22 @@ def list_gstr2b_documents(
 @router.post("/ims/action", response_model=IMSActionResponse)
 def set_ims_action(
     payload: IMSActionRequest,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Updates the IMS (Invoice Management System) action (ACCEPTED, REJECTED, PENDING, NO_ACTION).
     Blocks changes if the statement period has already been filed in GSTR-3B.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     ims_row = db.execute(
         text("""
         SELECT id, current_action, is_frozen_by_gstr3b, gstr2b_return_period
         FROM public.ims_document_actions
         WHERE gstr2b_doc_id = :doc_id AND org_id = :org;
         """),
-        {"doc_id": payload.gstr2b_doc_id, "org": x_org_id}
+        {"doc_id": payload.gstr2b_doc_id, "org": effective_org}
     ).fetchone()
 
     if not ims_row:
@@ -518,7 +524,7 @@ def set_ims_action(
     if payload.action.value == "PENDING":
         doc_type_row = db.execute(
             text("SELECT document_type, section_name FROM public.gstr2b_source_documents WHERE id = :id AND org_id = :org;"),
-            {"id": payload.gstr2b_doc_id, "org": x_org_id}
+            {"id": payload.gstr2b_doc_id, "org": effective_org}
         ).fetchone()
         if doc_type_row:
             dt = (doc_type_row.document_type or "").lower()
@@ -544,11 +550,11 @@ def set_ims_action(
         """),
         {
             "id": ims_row.id,
-            "org": x_org_id,
+            "org": effective_org,
             "act": payload.action.value,
             "prev": prev_action,
             "ts": now_ts,
-            "user_id": x_user_id
+            "user_id": effective_user
         }
     )
 
@@ -564,12 +570,12 @@ def set_ims_action(
         """),
         {
             "id": str(uuid.uuid4()),
-            "org": x_org_id,
+            "org": effective_org,
             "ims_id": ims_row.id,
             "prev": prev_action,
             "new": payload.action.value,
             "reason": payload.reason or "Taxpayer action change in IMS",
-            "actor": x_user_id,
+            "actor": effective_user,
             "ts": now_ts
         }
     )
@@ -587,8 +593,8 @@ def set_ims_action(
 @router.post("/gstr2b/recompute", response_model=GSTR2BRecomputeResponse)
 def recompute_gstr2b(
     payload: GSTR2BRecomputeRequest,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -601,6 +607,7 @@ def recompute_gstr2b(
     - Deactivates previous snapshot and creates Snapshot Version N+1.
     - Preserves action history in ims_document_actions.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     # 1. Check if frozen by GSTR-3B
     frozen_check = db.execute(
         text("""
@@ -608,7 +615,7 @@ def recompute_gstr2b(
         WHERE org_id = :org AND gstr2b_return_period = :rp AND is_frozen_by_gstr3b = true
         LIMIT 1;
         """),
-        {"org": x_org_id, "rp": payload.return_period}
+        {"org": effective_org, "rp": payload.return_period}
     ).fetchone()
     if frozen_check:
         raise HTTPException(
@@ -623,7 +630,7 @@ def recompute_gstr2b(
         FROM public.gstr2b_snapshots
         WHERE id = :sid AND org_id = :org;
         """),
-        {"sid": payload.snapshot_id, "org": x_org_id}
+        {"sid": payload.snapshot_id, "org": effective_org}
     ).fetchone()
     if not curr_snapshot:
         raise HTTPException(status_code=404, detail="GSTR-2B snapshot not found")
@@ -638,7 +645,7 @@ def recompute_gstr2b(
         LEFT JOIN public.ims_document_actions a ON d.id = a.gstr2b_doc_id AND d.org_id = a.org_id
         WHERE d.snapshot_id = :sid AND d.org_id = :org;
         """),
-        {"sid": payload.snapshot_id, "org": x_org_id}
+        {"sid": payload.snapshot_id, "org": effective_org}
     ).fetchall()
 
     new_avail = Decimal("0.00")
@@ -670,7 +677,7 @@ def recompute_gstr2b(
     # 4. Deactivate old snapshot
     db.execute(
         text("UPDATE public.gstr2b_snapshots SET is_active = false WHERE id = :id AND org_id = :org;"),
-        {"id": curr_snapshot.id, "org": x_org_id}
+        {"id": curr_snapshot.id, "org": effective_org}
     )
 
     # 5. Insert new Snapshot Version N+1
@@ -691,7 +698,7 @@ def recompute_gstr2b(
         """),
         {
             "id": new_snap_id,
-            "org_id": x_org_id,
+            "org_id": effective_org,
             "import_id": curr_snapshot.import_id,
             "reg_id": curr_snapshot.registration_id,
             "gstin": curr_snapshot.recipient_gstin,
@@ -710,7 +717,7 @@ def recompute_gstr2b(
         SET recomputed_at = :ts
         WHERE org_id = :org AND gstr2b_return_period = :rp;
         """),
-        {"org": x_org_id, "rp": curr_snapshot.return_period, "ts": now_ts}
+        {"org": effective_org, "rp": curr_snapshot.return_period, "ts": now_ts}
     )
 
     db.commit()
@@ -736,8 +743,8 @@ def freeze_ims_on_gstr3b_filing(
     return_period: str = Query(...),
     filing_status: str = Query("FILED", description="Must be confirmed FILED; drafts or submitted attempts do not freeze IMS"),
     filing_arn: Optional[str] = Query(None, description="GSTN Application Reference Number / Acknowledgement"),
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -745,6 +752,7 @@ def freeze_ims_on_gstr3b_filing(
     Prevents any further action modification or GSTR-2B recomputation.
     Rejects freeze if filing_status is not 'FILED'.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     if filing_status.upper() != "FILED":
         raise HTTPException(
             status_code=400,
@@ -760,7 +768,7 @@ def freeze_ims_on_gstr3b_filing(
             updated_at = :ts
         WHERE org_id = :org AND gstr2b_return_period = :rp;
         """),
-        {"org": x_org_id, "rp": return_period, "ts": now_ts}
+        {"org": effective_org, "rp": return_period, "ts": now_ts}
     )
 
     db.execute(
@@ -771,7 +779,7 @@ def freeze_ims_on_gstr3b_filing(
             filed_at = :ts
         WHERE org_id = :org AND return_period = :rp AND is_active = true;
         """),
-        {"org": x_org_id, "rp": return_period, "arn": filing_arn, "ts": now_ts}
+        {"org": effective_org, "rp": return_period, "arn": filing_arn, "ts": now_ts}
     )
     db.commit()
     return {
@@ -791,13 +799,14 @@ def freeze_ims_on_gstr3b_filing(
 @router.post("/purchase/create")
 def create_purchase(
     payload: PurchaseDocumentCreate,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """Creates a new inward purchase document in the purchase register."""
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
-        res = create_purchase_document(session=db, org_id=x_org_id, payload=payload, user_id=x_user_id)
+        res = create_purchase_document(session=db, org_id=effective_org, payload=payload, user_id=effective_user)
         db.commit()
         return res
     except DuplicatePurchaseDocumentError as e:
@@ -820,12 +829,13 @@ def list_purchase_documents(
     db: Session = Depends(get_tenant_db)
 ):
     """Lists purchase register documents."""
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     try:
         uuid.UUID(str(registration_id))
     except (ValueError, AttributeError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid registration_id format: must be a valid UUID")
 
-    effective_org = x_org_id or db.info.get("current_org")
+    # effective_org already validated from session context
     query = """
     SELECT id, registration_id, document_type, document_number, document_date,
            financial_period, supplier_gstin, supplier_legal_name, recipient_gstin,
@@ -877,8 +887,8 @@ def list_purchase_documents(
 def update_receipt_evidence(
     id: str,
     payload: Dict[str, Any],
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -890,10 +900,11 @@ def update_receipt_evidence(
     - Deemed Receipt: Statutory legal basis under Section 16(2)(b) Explanation.
     Rejects unauthorized or bare client status updates.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     # 1. Authorization check: Verify user is an active member with role
     membership = db.execute(
         text("SELECT role FROM public.organization_memberships WHERE org_id = :org AND user_id = :uid AND status = 'active';"),
-        {"org": x_org_id, "uid": x_user_id}
+        {"org": effective_org, "uid": effective_user}
     ).fetchone()
     if not membership:
         raise HTTPException(
@@ -910,7 +921,7 @@ def update_receipt_evidence(
         FROM public.purchase_documents
         WHERE id = :id AND org_id = :org;
         """),
-        {"id": id, "org": x_org_id}
+        {"id": id, "org": effective_org}
     ).fetchone()
     if not doc:
         raise HTTPException(status_code=404, detail="Purchase document not found")
@@ -1036,11 +1047,11 @@ def update_receipt_evidence(
             "qty_rec": payload.get("quantity_received"),
             "rem_qty": payload.get("remaining_quantity"),
             "is_last": is_last_flag,
-            "uid": x_user_id,
+            "uid": effective_user,
             "ts": now_ts,
             "new_st": new_itc_state,
             "id": id,
-            "org": x_org_id
+            "org": effective_org
         }
     ).fetchone()
     db.commit()
@@ -1051,8 +1062,8 @@ def update_receipt_evidence(
 def record_purchase_lot_delivery(
     id: str,
     payload: Dict[str, Any],
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -1060,6 +1071,7 @@ def record_purchase_lot_delivery(
     Delegates to record_lot_to_ledger which calculates final-lot status strictly from
     persisted database records and verified quantities. No client boolean is trusted.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     lot_req = LotLedgerEntryCreate(
         lot_number=int(payload.get("lot_number", 1)),
         expected_lots_count=payload.get("expected_lots_count") or payload.get("total_lots_expected"),
@@ -1075,10 +1087,10 @@ def record_purchase_lot_delivery(
     )
     res = record_lot_to_ledger(
         session=db,
-        org_id=x_org_id,
+        org_id=effective_org,
         purchase_doc_id=id,
         payload=lot_req,
-        user_id=x_user_id
+        user_id=effective_user
     )
     db.commit()
     return res
@@ -1087,25 +1099,27 @@ def record_purchase_lot_delivery(
 @router.get("/purchase/{id}/lots", response_model=List[LotLedgerEntryOut])
 def get_purchase_document_lots(
     id: str,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Returns all immutable verified goods receipt lots for a purchase document.
     """
-    return list_document_lots(session=db, org_id=x_org_id, purchase_doc_id=id)
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
+    return list_document_lots(session=db, org_id=effective_org, purchase_doc_id=id)
 
 
 @router.post("/purchase/{id}/approve")
 def approve_purchase(
     id: str,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """Approves a purchase document after human review."""
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
-        res = approve_purchase_document(session=db, org_id=x_org_id, purchase_doc_id=id, user_id=x_user_id)
+        res = approve_purchase_document(session=db, org_id=effective_org, purchase_doc_id=id, user_id=effective_user)
         db.commit()
         return res
     except PurchaseServiceError as e:
@@ -1116,16 +1130,17 @@ def approve_purchase(
 @router.post("/purchase/payment")
 def add_purchase_payment(
     payload: PurchasePaymentRequest,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """Records payment and allocates to purchase documents."""
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         alloc_list = [a.model_dump() for a in payload.allocations]
         res = record_purchase_payment(
             session=db,
-            org_id=x_org_id,
+            org_id=effective_org,
             payment_reference=payload.payment_reference,
             payment_date=payload.payment_date,
             payment_mode=payload.payment_mode,
@@ -1147,14 +1162,15 @@ def add_purchase_payment(
 @router.post("/run", response_model=ReconciliationSummaryOut)
 def run_reconciliation(
     config: ReconciliationRunConfig,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Executes the deterministic 4-pass reconciliation between Books (Purchase Register)
     and GST Portal (GSTR-2B Statement).
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     # 1. Fetch GSTR-2B documents for snapshot
     gstr2b_rows = db.execute(
         text("""
@@ -1166,7 +1182,7 @@ def run_reconciliation(
         FROM public.gstr2b_source_documents
         WHERE snapshot_id = :sid AND org_id = :org;
         """),
-        {"sid": config.snapshot_id, "org": x_org_id}
+        {"sid": config.snapshot_id, "org": effective_org}
     ).fetchall()
 
     gstr2b_docs = [dict(r._mapping) for r in gstr2b_rows]
@@ -1182,7 +1198,7 @@ def run_reconciliation(
         FROM public.purchase_documents
         WHERE registration_id = :reg_id AND financial_period = :rp AND org_id = :org;
         """),
-        {"reg_id": config.registration_id, "rp": config.return_period, "org": x_org_id}
+        {"reg_id": config.registration_id, "rp": config.return_period, "org": effective_org}
     ).fetchall()
 
     purchase_docs = [dict(r._mapping) for r in purchase_rows]
@@ -1217,7 +1233,7 @@ def run_reconciliation(
         """),
         {
             "id": run_id,
-            "org_id": x_org_id,
+            "org_id": effective_org,
             "reg_id": config.registration_id,
             "rp": config.return_period,
             "sid": config.snapshot_id,
@@ -1247,7 +1263,7 @@ def run_reconciliation(
             """),
             {
                 "id": str(uuid.uuid4()),
-                "org_id": x_org_id,
+                "org_id": effective_org,
                 "run_id": run_id,
                 "pid": m.purchase_doc_id,
                 "gid": m.gstr2b_doc_id,
@@ -1274,7 +1290,7 @@ def run_reconciliation(
             """),
             {
                 "id": str(uuid.uuid4()),
-                "org_id": x_org_id,
+                "org_id": effective_org,
                 "run_id": run_id,
                 "cat": v.variance_category.value,
                 "pid": v.purchase_doc_id,
@@ -1304,16 +1320,17 @@ def run_reconciliation(
 @router.post("/itc-risk/evaluate", response_model=List[ITCAssessmentOut])
 def evaluate_itc_risk(
     payload: ITCRiskEvaluateRequest,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Evaluates statutory ITC risk for a purchase document (Section 16, 17, Rule 37 180 days, Rule 37A).
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     p_row = db.execute(
         text("SELECT * FROM public.purchase_documents WHERE id = :id AND org_id = :org FOR UPDATE;"),
-        {"id": payload.purchase_doc_id, "org": x_org_id}
+        {"id": payload.purchase_doc_id, "org": effective_org}
     ).fetchone()
     if not p_row:
         raise HTTPException(status_code=404, detail="Purchase document not found")
@@ -1324,7 +1341,7 @@ def evaluate_itc_risk(
     if payload.gstr2b_doc_id:
         g_row = db.execute(
             text("SELECT * FROM public.gstr2b_source_documents WHERE id = :id AND org_id = :org;"),
-            {"id": payload.gstr2b_doc_id, "org": x_org_id}
+            {"id": payload.gstr2b_doc_id, "org": effective_org}
         ).fetchone()
         if g_row:
             gstr2b_doc = dict(g_row._mapping)
@@ -1338,7 +1355,7 @@ def evaluate_itc_risk(
         JOIN public.purchase_payments p ON a.payment_id = p.id AND a.org_id = p.org_id
         WHERE a.purchase_doc_id = :id AND a.org_id = :org;
         """),
-        {"id": payload.purchase_doc_id, "org": x_org_id}
+        {"id": payload.purchase_doc_id, "org": effective_org}
     ).fetchall()
     payments = [dict(r._mapping) for r in pay_rows]
 
@@ -1369,7 +1386,7 @@ def evaluate_itc_risk(
             """),
             {
                 "id": str(uuid.uuid4()),
-                "org_id": x_org_id,
+                "org_id": effective_org,
                 "pid": a.purchase_doc_id,
                 "gid": a.gstr2b_doc_id,
                 "rc": a.rule_code,
@@ -1397,13 +1414,14 @@ def evaluate_itc_risk(
 @router.post("/resolve", response_model=HumanResolutionResponse)
 def resolve_variance(
     payload: HumanResolutionRequest,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Records an auditor/CA human resolution event for reconciliation variances or blocked credit states.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     res_id = str(uuid.uuid4())
     now_ts = datetime.now(timezone.utc)
 
@@ -1419,14 +1437,14 @@ def resolve_variance(
         """),
         {
             "id": res_id,
-            "org_id": x_org_id,
+            "org_id": effective_org,
             "vid": payload.variance_id,
             "pid": payload.purchase_doc_id,
             "gid": payload.gstr2b_doc_id,
             "act": payload.resolution_action,
             "notes": payload.resolution_notes,
             "doc_id": payload.supporting_document_id,
-            "user_id": x_user_id,
+            "user_id": effective_user,
             "created_at": now_ts
         }
     )
@@ -1435,7 +1453,7 @@ def resolve_variance(
     return HumanResolutionResponse(
         id=res_id,
         resolution_action=payload.resolution_action,
-        resolved_by=x_user_id,
+        resolved_by=effective_user,
         created_at=now_ts.isoformat()
     )
 
@@ -1450,7 +1468,7 @@ def get_gstr3b_table4_summary(
     return_period: str,
     snapshot_id: str,
     auto_reverse_unreceived: bool = Query(True, description="Automatically reverse unreceived GSTR-2B documents under Table 4(B)(2) per Circular 170"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -1461,10 +1479,11 @@ def get_gstr3b_table4_summary(
     3. Legally Eligible Total
     4. Human Approved Total
     """
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     # 1. Registration
     reg_row = db.execute(
         text("SELECT gstin FROM public.gst_registrations WHERE id = :id AND org_id = :org;"),
-        {"id": registration_id, "org": x_org_id}
+        {"id": registration_id, "org": effective_org}
     ).fetchone()
     if not reg_row:
         raise HTTPException(status_code=404, detail="GST Registration not found")
@@ -1472,7 +1491,7 @@ def get_gstr3b_table4_summary(
     # 2. GSTR-2B docs
     g_rows = db.execute(
         text("SELECT * FROM public.gstr2b_source_documents WHERE snapshot_id = :sid AND org_id = :org;"),
-        {"sid": snapshot_id, "org": x_org_id}
+        {"sid": snapshot_id, "org": effective_org}
     ).fetchall()
     gstr2b_docs = [dict(r._mapping) for r in g_rows]
 
@@ -1482,7 +1501,7 @@ def get_gstr3b_table4_summary(
         SELECT * FROM public.purchase_documents
         WHERE registration_id = :reg_id AND financial_period = :rp AND org_id = :org;
         """),
-        {"reg_id": registration_id, "rp": return_period, "org": x_org_id}
+        {"reg_id": registration_id, "rp": return_period, "org": effective_org}
     ).fetchall()
     purchase_docs = [dict(r._mapping) for r in p_rows]
 
@@ -1494,7 +1513,7 @@ def get_gstr3b_table4_summary(
         JOIN public.reconciliation_runs r ON m.run_id = r.id AND m.org_id = r.org_id
         WHERE r.registration_id = :reg_id AND r.return_period = :rp AND r.snapshot_id = :sid AND m.org_id = :org;
         """),
-        {"reg_id": registration_id, "rp": return_period, "sid": snapshot_id, "org": x_org_id}
+        {"reg_id": registration_id, "rp": return_period, "sid": snapshot_id, "org": effective_org}
     ).fetchall()
     matches = [dict(r._mapping) for r in m_rows]
 
@@ -1506,14 +1525,14 @@ def get_gstr3b_table4_summary(
         JOIN public.purchase_documents p ON a.purchase_doc_id = p.id AND a.org_id = p.org_id
         WHERE p.registration_id = :reg_id AND p.financial_period = :rp AND a.org_id = :org;
         """),
-        {"reg_id": registration_id, "rp": return_period, "org": x_org_id}
+        {"reg_id": registration_id, "rp": return_period, "org": effective_org}
     ).fetchall()
     assessments = [dict(r._mapping) for r in a_rows]
 
     # 6. Approved IDs
     approved_rows = db.execute(
         text("SELECT id FROM public.purchase_documents WHERE registration_id = :reg_id AND status = 'approved' AND org_id = :org;"),
-        {"reg_id": registration_id, "org": x_org_id}
+        {"reg_id": registration_id, "org": effective_org}
     ).fetchall()
     approved_set = {str(r.id) for r in approved_rows}
 
@@ -1525,7 +1544,7 @@ def get_gstr3b_table4_summary(
         JOIN public.purchase_documents p ON r.purchase_doc_id = p.id AND r.org_id = p.org_id
         WHERE p.registration_id = :reg_id AND r.reavailment_period = :rp AND r.org_id = :org;
         """),
-        {"reg_id": registration_id, "rp": return_period, "org": x_org_id}
+        {"reg_id": registration_id, "rp": return_period, "org": effective_org}
     ).fetchall()
     reclaims = [dict(r._mapping) for r in rec_rows]
 
@@ -1537,7 +1556,7 @@ def get_gstr3b_table4_summary(
         JOIN public.purchase_documents p ON r.purchase_doc_id = p.id AND r.org_id = p.org_id
         WHERE p.registration_id = :reg_id AND r.reversal_period = :rp AND r.org_id = :org;
         """),
-        {"reg_id": registration_id, "rp": return_period, "org": x_org_id}
+        {"reg_id": registration_id, "rp": return_period, "org": effective_org}
     ).fetchall()
     reversals_ledger = [dict(r._mapping) for r in rev_rows]
 
@@ -1563,17 +1582,18 @@ def get_gstr3b_table4_summary(
 def avail_purchase_document_in_3b(
     purchase_doc_id: str = Query(..., description="Purchase document UUID"),
     return_period: str = Query(..., description="GSTR-3B tax period YYYY-MM"),
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Marks an inward purchase document as availed in GSTR-3B for a specific return period.
     Statutory prerequisite for assessing Rule 37A supplier non-filing reversal risk.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     res = mark_purchase_doc_availed_in_3b(
         session=db,
-        org_id=x_org_id,
+        org_id=effective_org,
         doc_id=purchase_doc_id,
         return_period=return_period
     )
@@ -1584,17 +1604,18 @@ def avail_purchase_document_in_3b(
 @router.post("/rule37/calculate-interest", response_model=Rule37InterestCalculationResponse)
 def calculate_rule37_interest_endpoint(
     payload: Rule37InterestCalculationRequest,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Computes statutory Rule 37 interest liability under Section 50(3) read with Rule 88B(3).
     Evaluates actual Electronic Credit Ledger (ECL) minimum balance and date of credit utilisation.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     p_row = db.execute(
         text("SELECT * FROM public.purchase_documents WHERE id = :id AND org_id = :org;"),
-        {"id": payload.purchase_doc_id, "org": x_org_id}
+        {"id": payload.purchase_doc_id, "org": effective_org}
     ).fetchone()
     if not p_row:
         raise HTTPException(status_code=404, detail="Purchase document not found")
@@ -1645,8 +1666,8 @@ def calculate_rule37_interest_endpoint(
 @router.post("/itc-ledger/record-event", response_model=ITCLedgerEntryOut)
 def record_itc_ledger_event(
     payload: ITCLedgerEventCreate,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -1659,9 +1680,10 @@ def record_itc_ledger_event(
     - Permanent Section 17(5) and Rule 38 credit cannot be reavailed.
     - Reclaim must reference an existing reversal event.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     p_row = db.execute(
         text("SELECT * FROM public.purchase_documents WHERE id = :id AND org_id = :org FOR UPDATE;"),
-        {"id": payload.purchase_doc_id, "org": x_org_id}
+        {"id": payload.purchase_doc_id, "org": effective_org}
     ).fetchone()
     if not p_row:
         raise HTTPException(status_code=404, detail="Purchase document not found")
@@ -1683,7 +1705,7 @@ def record_itc_ledger_event(
                 updated_at = :ts
             WHERE id = :id AND org_id = :org;
             """),
-            {"id": p_doc["id"], "org": x_org_id, "rp": payload.tax_period, "ts": now_ts}
+            {"id": p_doc["id"], "org": effective_org, "rp": payload.tax_period, "ts": now_ts}
         )
 
     elif payload.event_type.startswith("REVERSAL_"):
@@ -1704,7 +1726,7 @@ def record_itc_ledger_event(
             SELECT id FROM public.itc_ledger_entries
             WHERE purchase_doc_id = :pid AND event_type = :etype AND tax_period = :rp AND org_id = :org;
             """),
-            {"pid": p_doc["id"], "etype": payload.event_type, "rp": payload.tax_period, "org": x_org_id}
+            {"pid": p_doc["id"], "etype": payload.event_type, "rp": payload.tax_period, "org": effective_org}
         ).fetchone()
         if dup_rev:
             raise HTTPException(
@@ -1738,7 +1760,7 @@ def record_itc_ledger_event(
             """),
             {
                 "id": rev_id,
-                "org": x_org_id,
+                "org": effective_org,
                 "pid": p_doc["id"],
                 "rule": r_code,
                 "reason": payload.reversal_reason or f"Reversal under {payload.event_type}",
@@ -1762,7 +1784,7 @@ def record_itc_ledger_event(
                 updated_at = :ts
             WHERE id = :id AND org_id = :org;
             """),
-            {"id": p_doc["id"], "org": x_org_id, "st": itc_state, "ts": now_ts}
+            {"id": p_doc["id"], "org": effective_org, "st": itc_state, "ts": now_ts}
         )
 
     elif payload.event_type == "RECLAIM":
@@ -1774,7 +1796,7 @@ def record_itc_ledger_event(
 
         orig_rev = db.execute(
             text("SELECT * FROM public.itc_reversal_events WHERE id = :id AND org_id = :org FOR UPDATE;"),
-            {"id": payload.reversal_event_id, "org": x_org_id}
+            {"id": payload.reversal_event_id, "org": effective_org}
         ).fetchone()
         if not orig_rev:
             raise HTTPException(status_code=404, detail="Referenced reversal event not found.")
@@ -1796,7 +1818,7 @@ def record_itc_ledger_event(
             FROM public.itc_reavailment_events
             WHERE reversal_event_id = :rev_id AND org_id = :org;
             """),
-            {"rev_id": payload.reversal_event_id, "org": x_org_id}
+            {"rev_id": payload.reversal_event_id, "org": effective_org}
         ).scalar() or Decimal("0.00")
 
         if Decimal(str(already_reavailed)) + total_event_tax > tot_rev:
@@ -1820,7 +1842,7 @@ def record_itc_ledger_event(
             """),
             {
                 "id": reclaim_id,
-                "org": x_org_id,
+                "org": effective_org,
                 "pid": p_doc["id"],
                 "rev_id": payload.reversal_event_id,
                 "rp": payload.tax_period,
@@ -1840,7 +1862,7 @@ def record_itc_ledger_event(
                 updated_at = :ts
             WHERE id = :id AND org_id = :org;
             """),
-            {"id": p_doc["id"], "org": x_org_id, "ts": now_ts}
+            {"id": p_doc["id"], "org": effective_org, "ts": now_ts}
         )
 
     entry_id = str(uuid.uuid4())
@@ -1848,7 +1870,7 @@ def record_itc_ledger_event(
         "supplier_gstin": p_doc.get("supplier_gstin"),
         "document_number": p_doc.get("document_number"),
         "document_date": str(p_doc.get("document_date")),
-        "actor_id": x_user_id
+        "actor_id": effective_user
     }
 
     db.execute(
@@ -1867,7 +1889,7 @@ def record_itc_ledger_event(
         """),
         {
             "id": entry_id,
-            "org": x_org_id,
+            "org": effective_org,
             "pid": p_doc["id"],
             "gid": payload.gstr2b_doc_id,
             "etype": payload.event_type,
@@ -1917,7 +1939,8 @@ def get_itc_ledger_summary(
     """
     Returns component-level ledger summary: total availed, reversed permanent, reversed temporary, reavailed, and net balance.
     """
-    effective_org = x_org_id or db.info.get("current_org")
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
+    # effective_org already validated from session context
     query = """
     SELECT e.event_type,
            SUM(e.cgst_amount) as cgst,
@@ -2011,19 +2034,20 @@ def get_itc_ledger_summary(
 @router.get("/itc-ledger/{purchase_doc_id}", response_model=List[ITCLedgerEntryOut])
 def get_purchase_doc_itc_history(
     purchase_doc_id: str,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Returns full chronological ITC lifecycle audit events for a purchase document.
     """
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     rows = db.execute(
         text("""
         SELECT * FROM public.itc_ledger_entries
         WHERE purchase_doc_id = :pid AND org_id = :org
         ORDER BY created_at ASC;
         """),
-        {"pid": purchase_doc_id, "org": x_org_id}
+        {"pid": purchase_doc_id, "org": effective_org}
     ).fetchall()
     return [
         ITCLedgerEntryOut(
@@ -2050,19 +2074,20 @@ def get_purchase_doc_itc_history(
 @router.get("/ims/history/{ims_action_id}", response_model=List[IMSActionHistoryOut])
 def get_ims_action_history(
     ims_action_id: str,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Returns audit action history for an IMS document record.
     """
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     rows = db.execute(
         text("""
         SELECT * FROM public.ims_action_history
         WHERE ims_action_id = :id AND org_id = :org
         ORDER BY created_at ASC;
         """),
-        {"id": ims_action_id, "org": x_org_id}
+        {"id": ims_action_id, "org": effective_org}
     ).fetchall()
     return [
         IMSActionHistoryOut(
@@ -2083,17 +2108,18 @@ def export_reconciliation_audit_report(
     registration_id: str,
     return_period: str,
     snapshot_id: str,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Exports a comprehensive reconciliation and ITC ledger audit report with full document provenance.
     """
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     t4 = get_gstr3b_table4_summary(
         registration_id=registration_id,
         return_period=return_period,
         snapshot_id=snapshot_id,
-        x_org_id=x_org_id,
+        effective_org=effective_org,
         db=db
     )
     return {
@@ -2116,20 +2142,21 @@ def export_reconciliation_audit_report(
 @router.get("/unbooked-candidates", response_model=List[UnbookedCandidateOut])
 def list_unbooked_candidates(
     snapshot_id: str,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Returns unbooked GSTR-2B candidate documents for receipt verification and booking workflow.
     Automatically populates candidate records from GSTR-2B source documents if not yet seeded.
     """
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     candidates = db.execute(
         text("""
         SELECT * FROM public.gstr2b_unbooked_candidates
         WHERE snapshot_id = :sid AND org_id = :org
         ORDER BY document_date DESC;
         """),
-        {"sid": snapshot_id, "org": x_org_id}
+        {"sid": snapshot_id, "org": effective_org}
     ).fetchall()
 
     if not candidates:
@@ -2157,7 +2184,7 @@ def list_unbooked_candidates(
               )
             ON CONFLICT (org_id, gstr2b_doc_id) DO NOTHING;
             """),
-            {"sid": snapshot_id, "org": x_org_id}
+            {"sid": snapshot_id, "org": effective_org}
         )
 
         candidates = db.execute(
@@ -2166,10 +2193,10 @@ def list_unbooked_candidates(
             WHERE snapshot_id = :sid AND org_id = :org
             ORDER BY document_date DESC;
             """),
-            {"sid": snapshot_id, "org": x_org_id}
+            {"sid": snapshot_id, "org": effective_org}
         ).fetchall()
         db.commit()
-        set_tenant_context(db, org_id=x_org_id, user_id=None)
+        set_tenant_context(db, org_id=effective_org, user_id=None)
 
     return [
         UnbookedCandidateOut(
@@ -2208,16 +2235,17 @@ def list_unbooked_candidates(
 def verify_unbooked_candidate_receipt(
     id: str,
     payload: Dict[str, Any],
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Attaches GRN / delivery proof or service completion evidence to an unbooked candidate.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     cand = db.execute(
         text("SELECT id, document_date FROM public.gstr2b_unbooked_candidates WHERE id = :id AND org_id = :org;"),
-        {"id": id, "org": x_org_id}
+        {"id": id, "org": effective_org}
     ).fetchone()
     if not cand:
         raise HTTPException(status_code=404, detail="Unbooked candidate not found")
@@ -2280,10 +2308,10 @@ def verify_unbooked_candidate_receipt(
             "sc_dt": payload.get("service_completion_date"),
             "sc_cert": payload.get("service_acceptance_cert_ref"),
             "d_reason": payload.get("deemed_receipt_reason"),
-            "uid": x_user_id,
+            "uid": effective_user,
             "ts": now_ts,
             "id": id,
-            "org": x_org_id
+            "org": effective_org
         }
     ).fetchone()
     if not row:
@@ -2296,8 +2324,8 @@ def verify_unbooked_candidate_receipt(
 def book_unbooked_candidate_entry(
     id: str,
     payload: BookUnbookedCandidateRequest,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -2306,9 +2334,10 @@ def book_unbooked_candidate_entry(
     Acquires row lock to prevent race conditions and rejects duplicate booking with HTTP 409 Conflict.
     Enforces that approval remains an explicit, separate authenticated human action.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     cand = db.execute(
         text("SELECT * FROM public.gstr2b_unbooked_candidates WHERE id = :id AND org_id = :org FOR UPDATE;"),
-        {"id": id, "org": x_org_id}
+        {"id": id, "org": effective_org}
     ).fetchone()
     if not cand:
         raise HTTPException(status_code=404, detail="Unbooked candidate not found")
@@ -2321,7 +2350,7 @@ def book_unbooked_candidate_entry(
 
     reg = db.execute(
         text("SELECT gstin FROM public.gst_registrations WHERE id = :rid AND org_id = :org;"),
-        {"rid": payload.registration_id, "org": x_org_id}
+        {"rid": payload.registration_id, "org": effective_org}
     ).fetchone()
     if not reg:
         raise HTTPException(status_code=404, detail="GST Registration not found")
@@ -2353,7 +2382,7 @@ def book_unbooked_candidate_entry(
         """),
         {
             "id": p_id,
-            "org": x_org_id,
+            "org": effective_org,
             "reg_id": payload.registration_id,
             "doc_num": cand.document_number,
             "doc_dt": cand.document_date,
@@ -2388,7 +2417,7 @@ def book_unbooked_candidate_entry(
             updated_at = :ts
         WHERE id = :id AND org_id = :org;
         """),
-        {"pid": p_id, "ts": now_ts, "id": id, "org": x_org_id}
+        {"pid": p_id, "ts": now_ts, "id": id, "org": effective_org}
     )
     db.commit()
 
@@ -2407,8 +2436,8 @@ def book_unbooked_candidate_entry(
 @router.post("/rcm/validate", response_model=RCMValidationResponse)
 def validate_rcm_service_endpoint(
     payload: RCMValidationRequest,
-    x_user_id: str = Header(..., alias="X-User-Id"),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -2416,6 +2445,7 @@ def validate_rcm_service_endpoint(
     Verifies supplier forward charge declarations (Annexure V), consignment note requirements,
     recipient category conditions, place of supply (Section 12(8) IGST Act), and cash discharge status.
     """
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     res = validate_rcm_and_gta_eligibility(
         service_type=payload.service_type,
         taxable_value=payload.taxable_value,
@@ -2454,7 +2484,7 @@ def list_reconciliation_exceptions(
     registration_id: Optional[str] = None,
     return_period: Optional[str] = None,
     category: Optional[str] = None,
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -2465,9 +2495,10 @@ def list_reconciliation_exceptions(
     DUPLICATE_DOCUMENTS, TAX_HEAD_MISMATCH, CREDIT_NOTE_DISCREPANCY,
     MISSING_SUPPORTING_EVIDENCE.
     """
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     items = get_consolidated_exceptions(
         session=db,
-        org_id=x_org_id,
+        org_id=effective_org,
         registration_id=registration_id,
         return_period=return_period,
         category_filter=category
@@ -2502,7 +2533,7 @@ def list_reconciliation_exceptions(
 def get_unified_financial_report(
     registration_id: str = Query(...),
     return_period: str = Query(...),
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
@@ -2510,9 +2541,10 @@ def get_unified_financial_report(
     reversal/reclaim ledger, supplier breakdown, and exception queues.
     Zero invented numbers; every total derives from atomic database records.
     """
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     res = generate_unified_financial_report(
         session=db,
-        org_id=x_org_id,
+        org_id=effective_org,
         registration_id=registration_id,
         return_period=return_period
     )
@@ -2521,20 +2553,21 @@ def get_unified_financial_report(
 
 @router.get("/remediation-audit", response_model=List[ReceiptRemediationAuditOut])
 def get_receipt_remediation_audit(
-    x_org_id: str = Header(..., alias="X-Org-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     db: Session = Depends(get_tenant_db)
 ):
     """
     Returns audit records for all purchase documents remediated or downgraded
     due to incomplete statutory receipt evidence.
     """
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     rows = db.execute(
         text("""
         SELECT * FROM public.receipt_remediation_audit
         WHERE org_id = :org
         ORDER BY remediated_at DESC;
         """),
-        {"org": x_org_id}
+        {"org": effective_org}
     ).fetchall()
 
     return [

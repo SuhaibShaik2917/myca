@@ -178,7 +178,7 @@ def test_invalid_tokens_are_rejected(token):
         decode_access_token(token)
 
 
-def test_bearer_token_identity_overrides_spoofed_headers(monkeypatch):
+def test_bearer_token_identity_rejects_spoofed_headers(monkeypatch):
     captured = {}
     def mock_verify(db, user_id, org_id):
         captured["user_id"] = user_id
@@ -196,11 +196,20 @@ def test_bearer_token_identity_overrides_spoofed_headers(monkeypatch):
         x_user_id=spoofed_user,
         x_org_id=spoofed_org,
     )
-    next(generator)
+    with pytest.raises(HTTPException) as excinfo:
+        next(generator)
+    assert excinfo.value.status_code == 403
+    assert "Cross-tenant header tampering detected" in excinfo.value.detail
+
+    # Matching headers are accepted
+    generator_valid = dependencies.get_tenant_db(
+        authorization=f"Bearer {token}",
+        x_user_id=USER_ID,
+        x_org_id=ORG_ID,
+    )
+    next(generator_valid)
     assert captured["user_id"] == USER_ID
     assert captured["org_id"] == ORG_ID
-    assert captured["user_id"] != spoofed_user
-    assert captured["org_id"] != spoofed_org
 
 
 def test_invalid_bearer_token_returns_401():

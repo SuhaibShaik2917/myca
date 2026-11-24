@@ -21,7 +21,7 @@ def verify_and_resolve_tenant_membership(db: Session, user_id: str, org_id: str)
     """
     set_tenant_context(db, org_id=org_id, user_id=user_id)
     stmt = text("""
-        SELECT 1 
+        SELECT role 
         FROM public.organization_memberships
         WHERE org_id = :org_id 
           AND user_id = :user_id 
@@ -29,15 +29,29 @@ def verify_and_resolve_tenant_membership(db: Session, user_id: str, org_id: str)
     """)
     result = db.execute(stmt, {"org_id": org_id, "user_id": user_id}).scalar()
     if not result:
-        set_tenant_context(db, org_id=None, user_id=None)
+        db.info.pop("current_org", None)
+        db.info.pop("current_user", None)
+        db.info.pop("current_role", None)
+        session_clear_sql = "SELECT set_config('app.current_org', '', true), set_config('app.current_user', '', true);"
+        db.execute(text(session_clear_sql))
         return False
+    db.info["current_role"] = str(result)
     return True
 
 def set_tenant_context(session: Session, org_id: Optional[str], user_id: Optional[str]) -> None:
     """
     Explicitly applies tenant context to the current database transaction.
+    Enforces that once a session is bound to an authenticated tenant,
+    cross-tenant switching within that same session is strictly prohibited.
     """
     if org_id:
+        if isinstance(getattr(session, "info", None), dict):
+            bound_org = session.info.get("current_org")
+            if bound_org and str(bound_org) != str(org_id):
+                raise PermissionError(
+                    f"CRITICAL SECURITY VIOLATION: Attempted cross-tenant context switch "
+                    f"from {bound_org} to {org_id} within the same session."
+                )
         session.execute(text("SELECT set_config('app.current_org', :org, true);"), {"org": str(org_id)})
     if user_id:
         session.execute(text("SELECT set_config('app.current_user', :user, true);"), {"user": str(user_id)})

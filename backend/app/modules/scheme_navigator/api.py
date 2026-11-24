@@ -2,7 +2,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_tenant_db
+from app.core.dependencies import get_tenant_db, validate_tenant_identity
 from app.modules.scheme_navigator.schemas import (
     GovernmentSchemeOut, BusinessProfileIn, BusinessProfileOut,
     SchemeMatchOut, SchemeChecklistOut
@@ -37,8 +37,7 @@ def evaluate_eligibility_endpoint(
     Evaluates enterprise profile against all government schemes deterministically.
     Updates or inserts match records in scheme_matches.
     """
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         return evaluate_and_persist_matches(
             session=db,
@@ -65,8 +64,7 @@ def get_profile_endpoint(
     db: Session = Depends(get_tenant_db)
 ):
     """Fetches the current MSME profile for scheme evaluation."""
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         return get_or_create_business_profile(db, effective_org, effective_user)
     except Exception as e:
@@ -80,8 +78,7 @@ def update_profile_endpoint(
     db: Session = Depends(get_tenant_db)
 ):
     """Updates business profile (turnover, sector, Udyam registration)."""
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         return upsert_business_profile(db, effective_org, effective_user, profile_in)
     except Exception as e:

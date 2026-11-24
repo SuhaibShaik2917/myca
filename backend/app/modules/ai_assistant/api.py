@@ -2,7 +2,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_tenant_db
+from app.core.dependencies import get_tenant_db, validate_tenant_identity
 from app.modules.ai_assistant.schemas import (
     ChatConversationIn, ChatResponseOut, QuickInsightOut
 )
@@ -24,8 +24,7 @@ def chat_endpoint(
     Multi-turn AI Assistant grounded in tenant's real-time GST and financial records.
     Provides statutory compliance guidance with full CGST Act / Rules grounding.
     """
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
 
     try:
         ctx = None
@@ -45,8 +44,7 @@ def quick_insights_endpoint(
     """
     Returns proactive statutory compliance alerts and financial advisory insights.
     """
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
 
     try:
         return generate_quick_insights(db, effective_org, effective_user)

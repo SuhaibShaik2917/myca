@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_tenant_db
+from app.core.dependencies import get_tenant_db, validate_tenant_identity
 from app.modules.gstr3b.schemas import (
     GSTR3BPrepareRequest, MakerCheckerSubmitRequest, MakerCheckerDecisionRequest,
     GSTR3BFilingResponse, GSTR3BStatusResponse
@@ -25,8 +25,7 @@ def prepare_return_endpoint(
     Stage 1: Prepares GSTR-3B Table 3.1 & Table 4 and executes Rule 88A tax offset.
     Persists DRAFT filing record in public.gstr3b_filings.
     """
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         res = prepare_gstr3b_return(
             session=db,
@@ -51,7 +50,7 @@ def get_return_status_endpoint(
     db: Session = Depends(get_tenant_db)
 ):
     """Retrieves current return state for a registration and tax period."""
-    effective_org = x_org_id or db.info.get("current_org")
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
     try:
         res = get_gstr3b_status(
             session=db,
@@ -79,8 +78,7 @@ def submit_for_review_endpoint(
     Maker-Checker Stage 2: Maker submits return for checker statutory review.
     Transitions DRAFT -> SUBMITTED_FOR_REVIEW.
     """
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         return submit_gstr3b_for_review(
             session=db,
@@ -107,8 +105,7 @@ def review_decision_endpoint(
     Maker-Checker Stage 3: Checker / CA approves or rejects the return.
     Transitions SUBMITTED_FOR_REVIEW -> APPROVED_BY_CHECKER or REJECTED_BY_CHECKER.
     """
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         return review_gstr3b_decision(
             session=db,
@@ -136,8 +133,7 @@ def file_to_gsp_sandbox_endpoint(
     Generates realistic ARN (Application Reference Number) and CIN (Challan ID Number).
     Locks return as FILED and creates compliance entry in public.gst_records.
     """
-    effective_org = x_org_id or db.info.get("current_org")
-    effective_user = x_user_id or db.info.get("current_user")
+    effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
     try:
         res = file_gstr3b_to_gsp_sandbox(
             session=db,
