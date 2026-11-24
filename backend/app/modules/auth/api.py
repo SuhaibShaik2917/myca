@@ -31,8 +31,8 @@ class DemoTokenResponse(BaseModel):
 class IdpNonceRequest(BaseModel):
     org_id: str
     idp_provider: str
-    state: Optional[str] = None
-    code_challenge: Optional[str] = None
+    state: str
+    code_challenge: str
 
 
 class IdpNonceResponse(BaseModel):
@@ -41,8 +41,7 @@ class IdpNonceResponse(BaseModel):
     org_id: str
     idp_provider: str
     state: str
-    session_token: str
-    code_challenge: Optional[str] = None
+    code_challenge: str
 
 
 class IdpTokenExchangeRequest(BaseModel):
@@ -50,9 +49,8 @@ class IdpTokenExchangeRequest(BaseModel):
     idp_token: str
     org_id: str
     nonce: Optional[str] = None
-    state: Optional[str] = None
-    code_verifier: Optional[str] = None
-    session_token: Optional[str] = None
+    state: str
+    code_verifier: str
     user_email: Optional[str] = None
 
 
@@ -141,10 +139,7 @@ def request_idp_login_nonce(
     raw_env = os.getenv("ENVIRONMENT") or getattr(settings, "ENVIRONMENT", "")
     env = str(raw_env).strip().lower() if raw_env else "development"
 
-    existing_cookie_token = request.cookies.get("myca_auth_session")
-    header_session_token = request.headers.get("X-Auth-Session-Id")
-    inbound_session_token = existing_cookie_token or header_session_token
-
+    inbound_session_token = request.cookies.get("myca_auth_session")
     client_ip = request.client.host if request.client else "127.0.0.1"
 
     db = SessionLocal()
@@ -167,9 +162,17 @@ def request_idp_login_nonce(
             httponly=True,
             secure=True if env in ("production", "staging") else False,
             samesite="lax",
+            path="/api/v1/auth",
         )
 
-        return IdpNonceResponse(**result)
+        return IdpNonceResponse(
+            nonce=result["nonce"],
+            expires_in=result["expires_in"],
+            org_id=result["org_id"],
+            idp_provider=result["idp_provider"],
+            state=result["state"],
+            code_challenge=result["code_challenge"],
+        )
     finally:
         db.close()
 
@@ -216,12 +219,13 @@ def exchange_idp_token(
             detail="MISSING_IDP_NONCE: IdP token must contain an authentication transaction nonce claim.",
         )
 
-    # Resolve browser session token for binding validation
-    session_token = (
-        request.cookies.get("myca_auth_session")
-        or request.headers.get("X-Auth-Session-Id")
-        or payload.session_token
-    )
+    # Resolve browser session token: strictly from HttpOnly cookie only (no headers or body fallback)
+    session_token = request.cookies.get("myca_auth_session")
+    if not session_token or not str(session_token).strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MISSING_SESSION_COOKIE: Browser authentication requires myca_auth_session HttpOnly cookie.",
+        )
 
     db = SessionLocal()
     try:
@@ -238,7 +242,7 @@ def exchange_idp_token(
         )
 
         # Clear session cookie on successful transaction consumption
-        response.delete_cookie("myca_auth_session")
+        response.delete_cookie("myca_auth_session", path="/api/v1/auth")
 
         # Set tenant org context so security_barrier view v_org_users allows reading org users
         set_tenant_context(db, org_id=payload.org_id, user_id=None)
