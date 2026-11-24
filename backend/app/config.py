@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: Optional[str] = None
     ALLOW_DEMO_TOKENS: bool = False
+    ALLOW_DEV_HEADER_AUTH: bool = False
     
     # Federated Identity Provider (IdP) Settings
     MYCA_IDP_PROVIDER: Optional[str] = None
@@ -74,6 +75,20 @@ class Settings(BaseSettings):
             raise ValueError(
                 "CRITICAL SECURITY ERROR: ALLOW_DEMO_TOKENS cannot be enabled in production or staging environments. "
                 "Demo token authentication is strictly prohibited outside designated local/test environments."
+            )
+        return v
+
+    @field_validator("ALLOW_DEV_HEADER_AUTH")
+    @classmethod
+    def validate_allow_dev_header_auth(cls, v, info):
+        raw_env = os.getenv("ENVIRONMENT")
+        if not raw_env and hasattr(info, "data"):
+            raw_env = info.data.get("ENVIRONMENT")
+        env_norm = str(raw_env).strip().lower() if raw_env else None
+        if v and env_norm not in LOCAL_TEST_ENVIRONMENTS:
+            raise ValueError(
+                "CRITICAL SECURITY ERROR: ALLOW_DEV_HEADER_AUTH cannot be enabled in production or staging environments. "
+                "Header-based development authentication fallback is strictly prohibited outside designated local/test environments."
             )
         return v
 

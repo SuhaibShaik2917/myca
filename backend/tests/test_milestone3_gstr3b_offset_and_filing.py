@@ -31,13 +31,16 @@ def m3_tenant():
 
             cur.execute("INSERT INTO public.organizations (id, legal_name, pan) VALUES (%s, 'M3 Test Org', %s);", (org_id, pan))
             cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'M3 Tester');", (user_id, f"m3_{uuid.uuid4().hex}@example.com"))
+            checker_id = str(uuid.uuid4())
+            cur.execute("INSERT INTO public.global_users (id, email, full_name) VALUES (%s, %s, 'M3 Checker');", (checker_id, f"m3_checker_{uuid.uuid4().hex}@example.com"))
             cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'owner', 'active');", (org_id, user_id))
+            cur.execute("INSERT INTO public.organization_memberships (org_id, user_id, role, status) VALUES (%s, %s, 'admin', 'active');", (org_id, checker_id))
             cur.execute("""
                 INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, legal_name, is_primary)
                 VALUES (%s, %s, %s, '27', 'M3 Legal Entity', true);
             """, (reg_id, org_id, gstin))
 
-    return {"org_id": org_id, "user_id": user_id, "reg_id": reg_id, "gstin": gstin}
+    return {"org_id": org_id, "user_id": user_id, "checker_id": checker_id, "reg_id": reg_id, "gstin": gstin}
 
 def test_rule_88a_igst_credit_priority_and_exhaustion():
     liab = TaxBreakdown(
@@ -145,7 +148,7 @@ def test_maker_checker_workflow_and_filing_gate(m3_tenant):
         assert sub["status"] == "SUBMITTED_FOR_REVIEW"
 
         # 4. Checker rejects with notes
-        rej = review_gstr3b_decision(db, t["org_id"], filing_id, str(uuid.uuid4()), "REJECTED", "Verify RCM challan numbers.")
+        rej = review_gstr3b_decision(db, t["org_id"], filing_id, t["checker_id"], "REJECTED", "Verify RCM challan numbers.")
         assert rej["status"] == "REJECTED_BY_CHECKER"
 
         # 5. Maker resubmits
@@ -153,7 +156,7 @@ def test_maker_checker_workflow_and_filing_gate(m3_tenant):
         assert sub2["status"] == "SUBMITTED_FOR_REVIEW"
 
         # 6. Checker approves
-        checker_user = str(uuid.uuid4())
+        checker_user = t["checker_id"]
         app = review_gstr3b_decision(db, t["org_id"], filing_id, checker_user, "APPROVED", "Statutory checks verified. Approved to file.")
         assert app["status"] == "APPROVED_BY_CHECKER"
 

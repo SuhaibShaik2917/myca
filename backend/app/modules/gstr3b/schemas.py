@@ -92,3 +92,5 @@ class GSTR3BStatusResponse(BaseModel):
     payload_hash: Optional[str]
     created_at: str
     updated_at: str
+    revision_number: int = 1
+    previous_snapshot: Optional[Dict[str, Any]] = None

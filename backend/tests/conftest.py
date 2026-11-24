@@ -6,6 +6,7 @@ Ensures reference data catalogs are seeded and manages isolated test statutory a
 import os
 os.environ.setdefault("ENVIRONMENT", "test")
 os.environ.setdefault("ALLOW_DEMO_TOKENS", "true")
+os.environ.setdefault("ALLOW_DEV_HEADER_AUTH", "true")
 os.environ.setdefault("ALLOW_DISPOSABLE_DATABASE_ROLLBACK", "true")
 os.environ.setdefault("STATUTORY_AUDIT_SIGNING_KEY", "MYCA_CI_TEST_STATUTORY_AUDITOR_HMAC_SECRET_v1.0.6_MIN32CHAR")
 import pytest

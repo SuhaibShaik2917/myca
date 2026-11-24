@@ -88,6 +88,11 @@ def get_tenant_db(
         x_org_id = token_org_id
     elif settings.ENVIRONMENT in ("production", "staging"):
         raise HTTPException(status_code=401, detail="Bearer access token required")
+    elif not getattr(settings, "ALLOW_DEV_HEADER_AUTH", False):
+        raise HTTPException(
+            status_code=401,
+            detail="Header-based development authentication is disabled. Bearer access token required."
+        )
 
     if not x_user_id:
         raise HTTPException(status_code=401, detail="Missing required X-User-Id authentication header")

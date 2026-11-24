@@ -51,21 +51,63 @@ def prepare_gstr3b_return(
 
     gstin = reg_row.gstin
 
-    # Check if target return for tax period is already FILED (strict immutability)
+    # Check if target return for tax period already exists (with row-level lock)
     existing_filing = session.execute(
         text("""
-            SELECT id, filing_status 
+            SELECT id, filing_status, revision_number, table_3_1_data, table_4_data, offset_data, checker_id, checker_remarks, updated_at
             FROM public.gstr3b_filings 
-            WHERE org_id = :org AND registration_id = :reg AND tax_period = :period;
+            WHERE org_id = :org AND registration_id = :reg AND tax_period = :period
+            FOR UPDATE;
         """),
         {"org": org_id, "reg": registration_id, "period": tax_period}
     ).fetchone()
 
-    if existing_filing and existing_filing.filing_status == "FILED":
-        raise GSTR3BServiceError(
-            f"Statutory return for tax period '{tax_period}' has already been FILED and is strictly immutable. "
-            "Corrections must be handled through separate statutory amendment workflows."
-        )
+    prev_snapshot_json = None
+    target_revision = 1
+
+    if existing_filing:
+        status = existing_filing.filing_status
+        if status == "FILED":
+            session.rollback()
+            raise GSTR3BServiceError(
+                f"Statutory return for tax period '{tax_period}' has already been FILED and is strictly immutable. "
+                "Corrections must be handled through separate statutory amendment workflows."
+            )
+        elif status == "SUBMITTED_FOR_REVIEW":
+            session.rollback()
+            raise GSTR3BServiceError(
+                f"Cannot re-prepare return in 'SUBMITTED_FOR_REVIEW' status. "
+                "It must be reviewed by the Checker or formally rejected before revisions can be made."
+            )
+        elif status == "APPROVED_BY_CHECKER":
+            session.rollback()
+            raise GSTR3BServiceError(
+                f"Cannot re-prepare return in 'APPROVED_BY_CHECKER' status. "
+                "Approved statutory snapshots are immutable. If changes are required, the return must be formally rejected or amended."
+            )
+        elif status == "REJECTED_BY_CHECKER":
+            curr_rev = existing_filing.revision_number or 1
+            target_revision = curr_rev + 1
+            prev_snapshot_dict = {
+                "revision": curr_rev,
+                "table_3_1": existing_filing.table_3_1_data,
+                "table_4": existing_filing.table_4_data,
+                "offset": existing_filing.offset_data,
+                "checker_id": str(existing_filing.checker_id) if existing_filing.checker_id else None,
+                "checker_remarks": existing_filing.checker_remarks,
+                "rejected_at": existing_filing.updated_at.isoformat() if existing_filing.updated_at else None
+            }
+            prev_snapshot_json = json.dumps(prev_snapshot_dict)
+        elif status == "DRAFT":
+            target_revision = existing_filing.revision_number or 1
+            if getattr(existing_filing, "previous_snapshot", None):
+                prev_snap = existing_filing.previous_snapshot
+                prev_snapshot_json = json.dumps(prev_snap) if not isinstance(prev_snap, str) else prev_snap
+        else:
+            session.rollback()
+            raise GSTR3BServiceError(
+                f"Cannot re-prepare return in unrecognized status '{status}'."
+            )
 
     # 2. Compute Table 3.1 Outward Taxable Supplies from approved invoices
     # Matches tax_period e.g. '2026-11'
@@ -241,24 +283,27 @@ def prepare_gstr3b_return(
         INSERT INTO public.gstr3b_filings (
             id, org_id, registration_id, tax_period, filing_status,
             table_3_1_data, table_4_data, offset_data, maker_id,
-            maker_remarks, updated_at
+            maker_remarks, revision_number, previous_snapshot, updated_at
         ) VALUES (
             :id, :org_id, :reg_id, :period, 'DRAFT',
             CAST(:t31 AS jsonb), CAST(:t4 AS jsonb), CAST(:offset AS jsonb), :maker_id,
-            'Prepared by MyCA rules engine from reconciled registers.', :now
+            'Prepared by MyCA rules engine from reconciled registers.', :rev, CAST(:prev_snap AS jsonb), :now
         )
         ON CONFLICT (org_id, registration_id, tax_period)
         DO UPDATE SET
             table_3_1_data = EXCLUDED.table_3_1_data,
             table_4_data = EXCLUDED.table_4_data,
             offset_data = EXCLUDED.offset_data,
-            filing_status = CASE 
-                WHEN public.gstr3b_filings.filing_status = 'FILED' THEN 'FILED' 
-                ELSE 'DRAFT' 
-            END,
+            filing_status = 'DRAFT',
+            maker_id = EXCLUDED.maker_id,
+            maker_remarks = EXCLUDED.maker_remarks,
+            revision_number = EXCLUDED.revision_number,
+            previous_snapshot = EXCLUDED.previous_snapshot,
+            checker_id = NULL,
+            checker_remarks = NULL,
             updated_at = EXCLUDED.updated_at
-        WHERE public.gstr3b_filings.filing_status != 'FILED'
-        RETURNING id, filing_status;
+        WHERE public.gstr3b_filings.filing_status IN ('DRAFT', 'REJECTED_BY_CHECKER')
+        RETURNING id, filing_status, revision_number;
     """)
 
     res = session.execute(upsert_stmt, {
@@ -270,12 +315,15 @@ def prepare_gstr3b_return(
         "t4": json.dumps(t4_dict),
         "offset": json.dumps(offset_dict),
         "maker_id": user_id,
+        "rev": target_revision,
+        "prev_snap": prev_snapshot_json,
         "now": now_ts
     }).fetchone()
 
     if res is None:
+        session.rollback()
         raise GSTR3BServiceError(
-            f"Statutory return for tax period '{tax_period}' has already been FILED and is strictly immutable."
+            f"Cannot re-prepare GSTR-3B return for tax period '{tax_period}': filing status prohibits re-preparation."
         )
 
     session.commit()
@@ -285,6 +333,7 @@ def prepare_gstr3b_return(
         "registration_id": registration_id,
         "tax_period": tax_period,
         "filing_status": res.filing_status,
+        "revision_number": res.revision_number,
         "table_3_1": t31_dict,
         "table_4": t4_dict,
         "offset": offset_dict,
@@ -301,13 +350,14 @@ def submit_gstr3b_for_review(
     """Maker submits prepared return for checker / CA review."""
     set_tenant_context(session, org_id=org_id, user_id=user_id)
     filing = session.execute(
-        text("SELECT id, filing_status FROM public.gstr3b_filings WHERE id = :id AND org_id = :org;"),
+        text("SELECT id, filing_status FROM public.gstr3b_filings WHERE id = :id AND org_id = :org FOR UPDATE;"),
         {"id": filing_id, "org": org_id}
     ).fetchone()
     if not filing:
         raise GSTR3BServiceError("GSTR-3B filing not found.")
 
     if filing.filing_status not in ("DRAFT", "REJECTED_BY_CHECKER"):
+        session.rollback()
         raise GSTR3BServiceError(f"Cannot submit return in status '{filing.filing_status}'. Must be DRAFT or REJECTED_BY_CHECKER.")
 
     session.execute(
@@ -335,21 +385,53 @@ def review_gstr3b_decision(
     """Checker / CA approves or rejects return."""
     set_tenant_context(session, org_id=org_id, user_id=checker_id)
     filing = session.execute(
-        text("SELECT id, filing_status, maker_id FROM public.gstr3b_filings WHERE id = :id AND org_id = :org;"),
+        text("SELECT id, filing_status, maker_id FROM public.gstr3b_filings WHERE id = :id AND org_id = :org FOR UPDATE;"),
         {"id": filing_id, "org": org_id}
     ).fetchone()
     if not filing:
         raise GSTR3BServiceError("GSTR-3B filing not found.")
 
     if filing.filing_status != "SUBMITTED_FOR_REVIEW":
+        session.rollback()
         raise GSTR3BServiceError(f"Cannot review return in status '{filing.filing_status}'. Must be SUBMITTED_FOR_REVIEW.")
 
     # Strict separation of duties: Maker cannot act as Checker across all environments
     if not checker_id:
+        session.rollback()
         raise GSTR3BServiceError("Checker user identity required for review.")
     if filing.maker_id and str(filing.maker_id) == str(checker_id):
+        session.rollback()
         raise GSTR3BServiceError(
             "Segregation of duties violation: Maker cannot act as Checker to approve or reject their own GSTR-3B submission."
+        )
+
+    # Authoritative reviewer membership & role validation in public.organization_memberships
+    membership_row = session.execute(
+        text("""
+        SELECT role::text as role, status::text as status
+        FROM public.organization_memberships
+        WHERE org_id = :org AND user_id = :uid;
+        """),
+        {"org": org_id, "uid": checker_id}
+    ).fetchone()
+
+    if not membership_row:
+        session.rollback()
+        raise GSTR3BServiceError(
+            "Unauthorized reviewer: Checker is not a member of the organization."
+        )
+
+    if membership_row.status != "active":
+        session.rollback()
+        raise GSTR3BServiceError(
+            f"Unauthorized reviewer: Checker membership status is '{membership_row.status}'. Must be 'active'."
+        )
+
+    if membership_row.role not in ("admin", "owner"):
+        session.rollback()
+        raise GSTR3BServiceError(
+            f"Unauthorized reviewer: Checker possesses role '{membership_row.role}'. "
+            "Statutory review of GSTR-3B returns requires an authoritative 'admin' or 'owner' role."
         )
 
     new_status = "APPROVED_BY_CHECKER" if decision == "APPROVED" else "REJECTED_BY_CHECKER"
@@ -380,7 +462,8 @@ def file_gstr3b_to_gsp_sandbox(
         SELECT f.*, r.gstin
         FROM public.gstr3b_filings f
         JOIN public.gst_registrations r ON f.registration_id = r.id AND f.org_id = r.org_id
-        WHERE f.id = :id AND f.org_id = :org;
+        WHERE f.id = :id AND f.org_id = :org
+        FOR UPDATE OF f;
         """),
         {"id": filing_id, "org": org_id}
     ).fetchone()
@@ -389,6 +472,7 @@ def file_gstr3b_to_gsp_sandbox(
 
     # Gate: must be approved by checker
     if filing.filing_status != "APPROVED_BY_CHECKER":
+        session.rollback()
         raise GSTR3BServiceError(
             f"Filing Gate Blocked: Cannot file return in status '{filing.filing_status}'. "
             "GSTR-3B must be APPROVED_BY_CHECKER prior to submission."
@@ -501,6 +585,8 @@ def get_gstr3b_status(
         "registration_id": str(row.registration_id),
         "tax_period": row.tax_period,
         "filing_status": row.filing_status,
+        "revision_number": getattr(row, "revision_number", 1) or 1,
+        "previous_snapshot": getattr(row, "previous_snapshot", None),
         "table_3_1": row.table_3_1_data,
         "table_4": row.table_4_data,
         "offset": row.offset_data,
