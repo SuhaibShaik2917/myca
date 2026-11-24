@@ -56,10 +56,9 @@ def upgrade() -> None:
     ALTER TABLE public.gstr3b_verified_review_tokens FORCE ROW LEVEL SECURITY;
     """)
 
-    # Seed derived HMAC trust anchor from application SECRET_KEY
-    derived_secret = hashlib.sha256(
-        f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}".encode("utf-8")
-    ).hexdigest()
+    # Seed derived HMAC trust anchor from dedicated GSTR3B_REVIEW_ATTESTATION_KEY (or SECRET_KEY fallback)
+    raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
+    derived_secret = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
     conn = op.get_bind()
     conn.execute(

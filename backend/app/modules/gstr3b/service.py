@@ -38,10 +38,9 @@ def _sign_gstr3b_review_attestation(
     new_status: str,
     nonce: str,
 ) -> str:
-    """Computes server-side HMAC-SHA256 attestation bound to deployment SECRET_KEY."""
-    derived_secret = hashlib.sha256(
-        f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}".encode("utf-8")
-    ).hexdigest().encode("utf-8")
+    """Computes server-side HMAC-SHA256 attestation using dedicated GSTR3B_REVIEW_ATTESTATION_KEY (or SECRET_KEY fallback)."""
+    raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
+    derived_secret = hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
     message = f"{org_id}:{filing_id}:{checker_id}:{new_status}:{nonce}".encode("utf-8")
     return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
 
