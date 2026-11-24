@@ -1,3 +1,4 @@
+import ipaddress
 import os
 from pydantic_settings import BaseSettings
 from pydantic import ConfigDict, field_validator
@@ -116,6 +117,52 @@ class Settings(BaseSettings):
             if not v or ":secret@" in v or "localhost" in v or "127.0.0.1" in v:
                 raise ValueError("CRITICAL SECURITY ERROR: Production and staging deployments require non-default database URLs (Insecure or default DATABASE_URL targeting localhost/secret is prohibited; must target a remote/dedicated host).")
         return v
+
+    @field_validator("TRUSTED_PROXIES", mode="before")
+    @classmethod
+    def validate_trusted_proxies(cls, v):
+        if v is None:
+            raise ValueError(
+                "CRITICAL CONFIGURATION ERROR: TRUSTED_PROXIES cannot be None. "
+                "Must configure at least one trusted proxy IP (e.g. ['127.0.0.1', '::1'])."
+            )
+        if isinstance(v, str):
+            raw_entries = [p.strip() for p in v.split(",") if p.strip()]
+        elif isinstance(v, (list, tuple, set)):
+            raw_entries = [str(p).strip() for p in v if str(p).strip()]
+        else:
+            raise ValueError(
+                "CRITICAL CONFIGURATION ERROR: TRUSTED_PROXIES must be a list of IP/CIDR strings or comma-separated string."
+            )
+
+        if not raw_entries:
+            raise ValueError(
+                "CRITICAL CONFIGURATION ERROR: TRUSTED_PROXIES cannot be empty. "
+                "Must configure at least one trusted proxy IP (e.g. ['127.0.0.1', '::1'])."
+            )
+
+        validated = []
+        for entry in raw_entries:
+            if entry in ("*", "0.0.0.0/0", "::/0"):
+                raise ValueError(
+                    f"CRITICAL CONFIGURATION ERROR: Overly permissive wildcard proxy '{entry}' is strictly prohibited."
+                )
+            try:
+                if "/" in entry:
+                    net = ipaddress.ip_network(entry, strict=False)
+                    if net.prefixlen == 0:
+                        raise ValueError(
+                            f"CRITICAL CONFIGURATION ERROR: Overly broad network '{entry}' (/0) is strictly prohibited."
+                        )
+                    validated.append(str(net))
+                else:
+                    addr = ipaddress.ip_address(entry)
+                    validated.append(str(addr))
+            except ValueError as err:
+                raise ValueError(
+                    f"CRITICAL CONFIGURATION ERROR: Invalid IP address or CIDR in TRUSTED_PROXIES '{entry}': {err}"
+                )
+        return validated
 
     model_config = ConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

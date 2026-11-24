@@ -98,7 +98,7 @@ def check_distributed_rate_limit(
 
     ip_allowed = bool(ip_result[0]) if ip_result else False
     if not ip_allowed:
-        db.commit()
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"RATE_LIMIT_EXCEEDED: Maximum nonce issuance rate ({max_ip}/min) exceeded for IP.",
@@ -154,7 +154,9 @@ def check_distributed_rate_limit(
 
     org_allowed = bool(org_result[0]) if org_result else False
     if not org_allowed:
-        db.commit()
+        # Atomic transaction rollback: if Organization quota is exceeded, roll back the IP timestamp
+        # update so the client IP is not penalized for an organization-wide rejection.
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"RATE_LIMIT_EXCEEDED: Maximum nonce issuance rate ({max_org}/min) exceeded for organization.",
@@ -180,24 +182,100 @@ def cleanup_expired_auth_rate_limits(db: Session, retention_hours: int = 1) -> i
     return res.rowcount or 0
 
 
-def run_rate_limit_cleanup_job(retention_hours: int = 1) -> int:
+class RateLimitCleanupMetrics:
+    """Thread-safe operational telemetry for rate-limit maintenance jobs."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.total_runs: int = 0
+        self.total_pruned: int = 0
+        self.total_failures: int = 0
+        self.last_run_timestamp: Optional[str] = None
+        self.last_run_pruned: int = 0
+        self.last_error: Optional[str] = None
+
+    def record_success(self, pruned: int) -> None:
+        with self._lock:
+            self.total_runs += 1
+            self.total_pruned += pruned
+            self.last_run_pruned = pruned
+            self.last_run_timestamp = datetime.now(timezone.utc).isoformat()
+            self.last_error = None
+
+    def record_failure(self, error: str) -> None:
+        with self._lock:
+            self.total_runs += 1
+            self.total_failures += 1
+            self.last_run_timestamp = datetime.now(timezone.utc).isoformat()
+            self.last_error = error
+
+    def get_metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "total_runs": self.total_runs,
+                "total_pruned": self.total_pruned,
+                "total_failures": self.total_failures,
+                "last_run_timestamp": self.last_run_timestamp,
+                "last_run_pruned": self.last_run_pruned,
+                "last_error": self.last_error,
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            self.total_runs = 0
+            self.total_pruned = 0
+            self.total_failures = 0
+            self.last_run_timestamp = None
+            self.last_run_pruned = 0
+            self.last_error = None
+
+
+cleanup_metrics = RateLimitCleanupMetrics()
+
+
+def get_rate_limit_cleanup_metrics() -> Dict[str, Any]:
+    """Returns observable telemetry metrics for auth rate-limit cleanup operations."""
+    return cleanup_metrics.get_metrics()
+
+
+def run_rate_limit_cleanup_job(
+    retention_hours: int = 1,
+    max_retries: int = 3,
+    retry_delay: float = 0.1,
+) -> int:
     """
     Standalone operational maintenance runner for expired rate limit records.
-    Opens an independent DB session, prunes records, and safely logs metrics.
+    Opens an independent DB session with retry resilience and metrics tracking.
     Suitable for invocation by background workers, cron jobs, or schedulers.
     """
     from app.database import SessionLocal
-    db = SessionLocal()
-    try:
-        pruned = cleanup_expired_auth_rate_limits(db, retention_hours=retention_hours)
-        if pruned > 0:
-            logger.info("Auth rate limit cleanup pruned %d expired record(s)", pruned)
-        return pruned
-    except Exception as exc:
-        logger.warning("Auth rate limit cleanup encountered exception: %s", exc)
-        return 0
-    finally:
-        db.close()
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        db = None
+        try:
+            db = SessionLocal()
+            pruned = cleanup_expired_auth_rate_limits(db, retention_hours=retention_hours)
+            cleanup_metrics.record_success(pruned)
+            if pruned > 0:
+                logger.info("Auth rate limit cleanup pruned %d expired record(s)", pruned)
+            return pruned
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Auth rate limit cleanup attempt %d/%d failed: %s", attempt, max_retries, exc
+            )
+            if attempt < max_retries:
+                time.sleep(retry_delay * attempt)
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    error_msg = str(last_exc) if last_exc else "Unknown failure"
+    cleanup_metrics.record_failure(error_msg)
+    logger.error("Auth rate limit cleanup exhausted all %d retries: %s", max_retries, error_msg)
+    return 0
 
 
 async def run_periodic_rate_limit_cleanup(

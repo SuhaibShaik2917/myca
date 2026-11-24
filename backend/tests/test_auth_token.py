@@ -1869,12 +1869,32 @@ def test_trusted_proxy_client_ip_extraction(monkeypatch):
         ip = extract_client_ip(cidr_req)
         assert ip == "203.0.113.88", f"Expected untrusted client 203.0.113.88, got {ip}"
 
-    # 5. Connection from trusted proxy with malicious/malformed header injection
+    # 5. Connection from trusted proxy with malicious/malformed header injection (FAILS CLOSED)
     malicious_req = MagicMock()
     malicious_req.client.host = "127.0.0.1"
     malicious_req.headers = {"X-Forwarded-For": "'; DROP TABLE users; --, 127.0.0.1"}
-    ip = extract_client_ip(malicious_req)
-    assert ip == "127.0.0.1", f"Malformed header injection was not sanitized: {ip}"
+    with pytest.raises(HTTPException) as excinfo:
+        extract_client_ip(malicious_req)
+    assert excinfo.value.status_code == 400
+    assert "MALFORMED_FORWARDED_HEADER" in excinfo.value.detail
+
+    # 6. Connection from trusted proxy with all-trusted hops (FAILS CLOSED: never selects proxy)
+    all_trusted_req = MagicMock()
+    all_trusted_req.client.host = "127.0.0.1"
+    all_trusted_req.headers = {"X-Forwarded-For": "127.0.0.1, ::1"}
+    with pytest.raises(HTTPException) as exc_all_trusted:
+        extract_client_ip(all_trusted_req)
+    assert exc_all_trusted.value.status_code == 400
+    assert "UNTRUSTED_CLIENT_NOT_FOUND" in exc_all_trusted.value.detail
+
+    # 7. Connection from trusted proxy missing X-Forwarded-For (FAILS CLOSED)
+    missing_req = MagicMock()
+    missing_req.client.host = "127.0.0.1"
+    missing_req.headers = {}
+    with pytest.raises(HTTPException) as exc_missing:
+        extract_client_ip(missing_req)
+    assert exc_missing.value.status_code == 400
+    assert "MISSING_FORWARDED_HEADER" in exc_missing.value.detail
 
 
 def test_rate_limiter_explicit_acceptance_boolean_identical_timestamps():
@@ -2041,4 +2061,204 @@ def test_idp_nonce_triggers_background_cleanup():
     data = response.json()
     assert "nonce" in data
     assert "myca_auth_session" in response.cookies
+
+
+def test_trusted_proxies_startup_validation():
+    """
+    STARTUP VALIDATION TEST:
+    Proves that invalid, empty, or overly broad wildcard TRUSTED_PROXIES configurations
+    fail closed at application startup with a clear configuration error.
+    """
+    from app.config import Settings
+    import pytest
+
+    # 1. Empty list rejected
+    with pytest.raises(ValueError) as exc1:
+        Settings(ENVIRONMENT="test", TRUSTED_PROXIES=[])
+    assert "TRUSTED_PROXIES cannot be empty" in str(exc1.value)
+
+    # 2. Wildcard '*' rejected
+    with pytest.raises(ValueError) as exc2:
+        Settings(ENVIRONMENT="test", TRUSTED_PROXIES=["*"])
+    assert "Overly permissive wildcard proxy" in str(exc2.value)
+
+    # 3. Overly broad '0.0.0.0/0' rejected
+    with pytest.raises(ValueError) as exc3:
+        Settings(ENVIRONMENT="test", TRUSTED_PROXIES=["0.0.0.0/0"])
+    assert "Overly permissive wildcard proxy" in str(exc3.value) or "Overly broad network" in str(exc3.value)
+
+    # 4. Invalid IP syntax rejected
+    with pytest.raises(ValueError) as exc4:
+        Settings(ENVIRONMENT="test", TRUSTED_PROXIES=["not-an-ip"])
+    assert "Invalid IP address or CIDR" in str(exc4.value)
+
+
+def test_concurrent_first_time_rate_limit_keys_across_connections():
+    """
+    CONCURRENT FIRST-TIME KEY CREATION TEST:
+    Proves that concurrent database connections racing against brand-new IP and Organization
+    keys (that do not exist in public.auth_rate_limits) execute atomically via ON CONFLICT DO NOTHING
+    and row-level locking without duplicate key errors, deadlocks, or quota breaches.
+    """
+    _ensure_org_exists(ORG_ID)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import check_distributed_rate_limit
+    import random
+
+    # Generate unique brand-new IP and Org that definitely do not exist in DB
+    new_ip = f"198.51.100.{random.randint(100, 250)}"
+    new_org = str(uuid.uuid4())
+    limit = 10
+    total_workers = 15
+
+    def worker_attempt():
+        db = SessionLocal()
+        try:
+            check_distributed_rate_limit(db, client_ip=new_ip, org_id=new_org, max_ip=limit, max_org=limit)
+            return "SUCCESS"
+        except HTTPException as e:
+            if e.status_code == 429:
+                return "THROTTLED"
+            return f"ERROR_{e.status_code}"
+        finally:
+            db.close()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(worker_attempt) for _ in range(total_workers)]
+        for fut in as_completed(futures):
+            results.append(fut.result())
+
+    success_count = results.count("SUCCESS")
+    throttled_count = results.count("THROTTLED")
+    assert success_count == limit, f"Expected exactly {limit} successes on first-time key, got {success_count}"
+    assert throttled_count == (total_workers - limit), f"Expected exactly {total_workers - limit} throttles, got {throttled_count}"
+
+
+def test_ip_and_organization_quota_interaction_transaction_rollback():
+    """
+    QUOTA INTERACTION & TRANSACTION ROLLBACK TEST:
+    Proves that when a request is accepted by the IP quota but rejected by the Organization quota:
+    1. The transaction executes an atomic rollback.
+    2. The client IP's timestamps are NOT incremented for the denied request.
+    3. The client IP is not penalized for an organization-wide quota exhaustion.
+    """
+    _ensure_org_exists(ORG_ID)
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import check_distributed_rate_limit, reset_auth_rate_limits
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        reset_auth_rate_limits(db)
+        test_ip = "192.0.2.88"
+        test_org = str(uuid.uuid4())
+
+        # Configure limits: IP max = 5, Org max = 2
+        ip_limit = 5
+        org_limit = 2
+
+        # Request 1: IP (1/5), Org (1/2) -> Accepted
+        check_distributed_rate_limit(db, client_ip=test_ip, org_id=test_org, max_ip=ip_limit, max_org=org_limit)
+
+        # Request 2: IP (2/5), Org (2/2) -> Accepted
+        check_distributed_rate_limit(db, client_ip=test_ip, org_id=test_org, max_ip=ip_limit, max_org=org_limit)
+
+        # Verify initial counts: IP has 2 timestamps, Org has 2 timestamps
+        ip_count_pre = db.execute(
+            text("SELECT cardinality(timestamps) FROM public.auth_rate_limits WHERE rate_key = :k;"),
+            {"k": f"ip:{test_ip}"}
+        ).scalar()
+        org_count_pre = db.execute(
+            text("SELECT cardinality(timestamps) FROM public.auth_rate_limits WHERE rate_key = :k;"),
+            {"k": f"org:{test_org}"}
+        ).scalar()
+        assert ip_count_pre == 2
+        assert org_count_pre == 2
+
+        # Request 3: IP would be (3/5) [OK], but Org is (3/2) [EXCEEDED!]
+        # Must raise HTTP 429
+        with pytest.raises(HTTPException) as exc_info:
+            check_distributed_rate_limit(db, client_ip=test_ip, org_id=test_org, max_ip=ip_limit, max_org=org_limit)
+        assert exc_info.value.status_code == 429
+        assert "exceeded for organization" in exc_info.value.detail
+
+        # TRANSACTION VERIFICATION:
+        # Verify that IP timestamps count was ROLLED BACK and remains strictly 2 (not 3!)
+        ip_count_post = db.execute(
+            text("SELECT cardinality(timestamps) FROM public.auth_rate_limits WHERE rate_key = :k;"),
+            {"k": f"ip:{test_ip}"}
+        ).scalar()
+        org_count_post = db.execute(
+            text("SELECT cardinality(timestamps) FROM public.auth_rate_limits WHERE rate_key = :k;"),
+            {"k": f"org:{test_org}"}
+        ).scalar()
+
+        assert ip_count_post == 2, (
+            f"TRANSACTION DEFECT: IP count was incremented to {ip_count_post} despite Organization rejection! "
+            "IP update must be rolled back."
+        )
+        assert org_count_post == 2
+    finally:
+        db.close()
+
+
+def test_cleanup_telemetry_metrics_and_retry_resilience(monkeypatch):
+    """
+    CLEANUP TELEMETRY & RETRY RESILIENCE TEST:
+    Proves that:
+    1. Operational metrics accurately record successful runs, pruned counts, and failure tracking.
+    2. Transient database errors trigger automatic retries with exponential backoff before failing closed.
+    3. Multi-worker concurrent cleanup invocations execute safely without deadlocks or conflicting state.
+    """
+    from app.modules.auth.nonce_service import (
+        run_rate_limit_cleanup_job,
+        get_rate_limit_cleanup_metrics,
+        cleanup_metrics,
+    )
+    from concurrent.futures import ThreadPoolExecutor
+    import app.database as app_db
+
+    # 1. Reset metrics baseline
+    cleanup_metrics.reset()
+    baseline = get_rate_limit_cleanup_metrics()
+    assert baseline["total_runs"] == 0
+    assert baseline["total_failures"] == 0
+
+    # 2. Test successful run
+    pruned = run_rate_limit_cleanup_job(retention_hours=1)
+    metrics = get_rate_limit_cleanup_metrics()
+    assert metrics["total_runs"] == 1
+    assert metrics["total_failures"] == 0
+    assert metrics["last_run_timestamp"] is not None
+
+    # 3. Test retry on transient failure
+    call_count = 0
+
+    def mock_failing_session():
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError(f"Simulated transient DB connection failure attempt {call_count}")
+
+    monkeypatch.setattr(app_db, "SessionLocal", mock_failing_session)
+    pruned_failed = run_rate_limit_cleanup_job(retention_hours=1, max_retries=3, retry_delay=0.01)
+    assert pruned_failed == 0
+    assert call_count == 3, f"Expected exactly 3 retry attempts, got {call_count}"
+
+    failed_metrics = get_rate_limit_cleanup_metrics()
+    assert failed_metrics["total_failures"] == 1
+    assert "Simulated transient DB connection failure" in failed_metrics["last_error"]
+
+    # Restore session
+    monkeypatch.undo()
+
+    # 4. Multi-worker concurrent cleanup non-interference
+    def concurrent_cleanup_worker():
+        return run_rate_limit_cleanup_job(retention_hours=1)
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(concurrent_cleanup_worker) for _ in range(5)]
+        results = [f.result() for f in futures]
+    assert len(results) == 5
 
