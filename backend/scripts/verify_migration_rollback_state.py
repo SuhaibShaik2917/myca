@@ -383,9 +383,9 @@ def main():
     run_cmd(["alembic", "upgrade", "head"])
     classify_and_verify_auditor_state(conn, "Step 2: Head 0030", "AUDITORS_VERIFIED_CLEAN")
     state_head = capture_database_state(conn)
-    print(f"  Head State (0030): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
-    assert len(state_head["grants"]) == 120, f"Expected 120 grants at 0030, got {len(state_head['grants'])}"
-    assert len(state_head["policies"]) == 96, f"Expected 96 policies at 0030, got {len(state_head['policies'])}"
+    print(f"  Head State (0033): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
+    assert len(state_head["grants"]) == 122, f"Expected 122 grants at 0033, got {len(state_head['grants'])}"
+    assert len(state_head["policies"]) == 98, f"Expected 98 policies at 0033, got {len(state_head['policies'])}"
 
     # Verify nonce index, nonce registry table, idp_authentication_nonces table, and auth_rate_limits table exist at 0030
     with conn.cursor() as cur:
@@ -780,8 +780,8 @@ def main():
     run_cmd(["alembic", "upgrade", "head"])
     classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0030", "AUDITORS_VERIFIED_CLEAN")
     state_re_head = capture_database_state(conn)
-    assert len(state_re_head["grants"]) == 120, f"Expected 120 grants at 0030, got {len(state_re_head['grants'])}"
-    assert len(state_re_head["policies"]) == 96, f"Expected 96 policies at 0030, got {len(state_re_head['policies'])}"
+    assert len(state_re_head["grants"]) == 122, f"Expected 122 grants at 0033, got {len(state_re_head['grants'])}"
+    assert len(state_re_head["policies"]) == 98, f"Expected 98 policies at 0033, got {len(state_re_head['policies'])}"
     print("PASS: Downgrade rollback and re-upgrade cycles verified with zero fake auditor identities.")
 
     print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
@@ -840,9 +840,9 @@ def main():
     assert final_head_state["grants"] == state_head["grants"]
     assert final_head_state["policies"] == state_head["policies"]
     assert final_head_state["rls_flags"] == state_head["rls_flags"]
-    assert len(final_head_state["grants"]) == 120
-    assert len(final_head_state["policies"]) == 96
-    print("  PASS: Re-upgrade to head completely restored production security state (120 grants, 96 policies).")
+    assert len(final_head_state["grants"]) == 122
+    assert len(final_head_state["policies"]) == 98
+    print("  PASS: Re-upgrade to head completely restored production security state (122 grants, 98 policies).")
 
     conn.close()
     print("\nALL MIGRATION ROLLBACK & INDEPENDENT BASELINE REFERENCE INVARIANTS 100% VERIFIED!")

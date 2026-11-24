@@ -54,7 +54,8 @@ def prepare_gstr3b_return(
     # Check if target return for tax period already exists (with row-level lock)
     existing_filing = session.execute(
         text("""
-            SELECT id, filing_status, revision_number, table_3_1_data, table_4_data, offset_data, checker_id, checker_remarks, updated_at
+            SELECT id, filing_status, revision_number, table_3_1_data, table_4_data, offset_data,
+                   maker_id, maker_remarks, checker_id, checker_remarks, previous_snapshot, updated_at
             FROM public.gstr3b_filings 
             WHERE org_id = :org AND registration_id = :reg AND tax_period = :period
             FOR UPDATE;
@@ -63,6 +64,7 @@ def prepare_gstr3b_return(
     ).fetchone()
 
     prev_snapshot_json = None
+    rejected_archive_row = None
     target_revision = 1
 
     if existing_filing:
@@ -93,11 +95,25 @@ def prepare_gstr3b_return(
                 "table_3_1": existing_filing.table_3_1_data,
                 "table_4": existing_filing.table_4_data,
                 "offset": existing_filing.offset_data,
+                "maker_id": str(existing_filing.maker_id) if existing_filing.maker_id else None,
                 "checker_id": str(existing_filing.checker_id) if existing_filing.checker_id else None,
+                "maker_remarks": existing_filing.maker_remarks,
                 "checker_remarks": existing_filing.checker_remarks,
                 "rejected_at": existing_filing.updated_at.isoformat() if existing_filing.updated_at else None
             }
             prev_snapshot_json = json.dumps(prev_snapshot_dict)
+            rejected_archive_row = {
+                "filing_id": str(existing_filing.id),
+                "org_id": org_id,
+                "rev_num": curr_rev,
+                "t31": json.dumps(existing_filing.table_3_1_data),
+                "t4": json.dumps(existing_filing.table_4_data),
+                "offset": json.dumps(existing_filing.offset_data),
+                "maker_id": str(existing_filing.maker_id) if existing_filing.maker_id else None,
+                "checker_id": str(existing_filing.checker_id) if existing_filing.checker_id else None,
+                "maker_remarks": existing_filing.maker_remarks,
+                "checker_remarks": existing_filing.checker_remarks,
+            }
         elif status == "DRAFT":
             target_revision = existing_filing.revision_number or 1
             if getattr(existing_filing, "previous_snapshot", None):
@@ -324,6 +340,23 @@ def prepare_gstr3b_return(
         session.rollback()
         raise GSTR3BServiceError(
             f"Cannot re-prepare GSTR-3B return for tax period '{tax_period}': filing status prohibits re-preparation."
+        )
+
+    if rejected_archive_row is not None:
+        session.execute(
+            text("""
+            INSERT INTO public.gstr3b_revision_history (
+                filing_id, org_id, revision_number,
+                table_3_1_data, table_4_data, offset_data,
+                maker_id, checker_id, maker_remarks, checker_remarks, archived_at
+            ) VALUES (
+                :filing_id, :org_id, :rev_num,
+                CAST(:t31 AS jsonb), CAST(:t4 AS jsonb), CAST(:offset AS jsonb),
+                :maker_id, :checker_id, :maker_remarks, :checker_remarks, clock_timestamp()
+            )
+            ON CONFLICT (filing_id, revision_number) DO NOTHING;
+            """),
+            rejected_archive_row
         )
 
     session.commit()
@@ -602,3 +635,41 @@ def get_gstr3b_status(
         "updated_at": row.updated_at.isoformat(),
         "disclaimer": GSTR3B_STATUTORY_DISCLAIMER
     }
+
+
+def get_gstr3b_revision_history(
+    session: Session,
+    org_id: str,
+    filing_id: str
+) -> List[Dict[str, Any]]:
+    """Retrieves durable, append-only revision history for a GSTR-3B filing."""
+    set_tenant_context(session, org_id=org_id, user_id=None)
+    rows = session.execute(
+        text("""
+        SELECT id, filing_id, org_id, revision_number,
+               table_3_1_data, table_4_data, offset_data,
+               maker_id, checker_id, maker_remarks, checker_remarks, archived_at
+        FROM public.gstr3b_revision_history
+        WHERE org_id = :org AND filing_id = :fid
+        ORDER BY revision_number ASC;
+        """),
+        {"org": org_id, "fid": filing_id}
+    ).fetchall()
+
+    return [
+        {
+            "id": str(r.id),
+            "filing_id": str(r.filing_id),
+            "org_id": str(r.org_id),
+            "revision_number": r.revision_number,
+            "table_3_1": r.table_3_1_data,
+            "table_4": r.table_4_data,
+            "offset": r.offset_data,
+            "maker_id": str(r.maker_id) if r.maker_id else None,
+            "checker_id": str(r.checker_id) if r.checker_id else None,
+            "maker_remarks": r.maker_remarks,
+            "checker_remarks": r.checker_remarks,
+            "archived_at": r.archived_at.isoformat() if r.archived_at else None,
+        }
+        for r in rows
+    ]
