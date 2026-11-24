@@ -2,9 +2,9 @@ import ipaddress
 import logging
 import os
 import uuid
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response, status, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
@@ -12,7 +12,11 @@ from app.config import settings
 from app.core.security import create_access_token
 from app.database import SessionLocal, verify_and_resolve_tenant_membership, set_tenant_context
 from app.modules.auth.idp_verifier import validate_idp_token
-from app.modules.auth.nonce_service import create_idp_login_nonce, consume_idp_login_nonce
+from app.modules.auth.nonce_service import (
+    create_idp_login_nonce,
+    consume_idp_login_nonce,
+    schedule_rate_limit_cleanup_if_due,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,36 +132,92 @@ def issue_demo_token(payload: DemoTokenRequest) -> DemoTokenResponse:
     )
 
 
+def is_trusted_proxy(ip_str: str, trusted_list: List[str]) -> bool:
+    """
+    Checks if an IP address matches any trusted proxy IP address or CIDR network block.
+    """
+    try:
+        ip_obj = ipaddress.ip_address(ip_str.strip())
+    except ValueError:
+        return False
+
+    for item in trusted_list:
+        entry = item.strip()
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                if ip_obj in ipaddress.ip_network(entry, strict=False):
+                    return True
+            else:
+                if ip_obj == ipaddress.ip_address(entry):
+                    return True
+        except ValueError:
+            continue
+    return False
+
+
 def extract_client_ip(request: Request) -> str:
     """
     Safely resolves client IP address while defending against header spoofing.
-    X-Forwarded-For is only trusted if the direct connection originates from a configured TRUSTED_PROXIES peer.
-    Direct connections from untrusted peers strictly use request.client.host.
-    Validates that extracted IP addresses conform to RFC IPv4/IPv6 address syntax.
+
+    Security Contract (RFC 7239 / Proxy Trust Chain):
+    1. Direct connection originates from request.client.host (peer_ip).
+    2. If peer_ip is NOT in TRUSTED_PROXIES, X-Forwarded-For is strictly ignored,
+       and peer_ip is returned directly.
+    3. If peer_ip IS a trusted proxy:
+       - Reverse proxies append downstream addresses to the right of X-Forwarded-For.
+       - We traverse hops from RIGHT to LEFT.
+       - Each hop in TRUSTED_PROXIES represents an internal reverse proxy; we continue left.
+       - The FIRST UNTRUSTED IP address encountered from the right is the genuine client IP.
+       - Attacker-supplied values positioned to the left of the true client are completely ignored.
+    4. All IP addresses are strictly validated against RFC IPv4/IPv6 syntax.
     """
     peer_ip = request.client.host if request.client and request.client.host else "127.0.0.1"
 
-    trusted_proxies = getattr(settings, "TRUSTED_PROXIES", ["127.0.0.1", "::1"])
-    if isinstance(trusted_proxies, str):
-        trusted_proxies = [p.strip() for p in trusted_proxies.split(",") if p.strip()]
-    trusted_set = set(trusted_proxies)
-
-    if peer_ip in trusted_set:
-        xff = request.headers.get("X-Forwarded-For")
-        if xff:
-            for hop in xff.split(","):
-                candidate = hop.strip()
-                try:
-                    ip_obj = ipaddress.ip_address(candidate)
-                    return str(ip_obj)
-                except ValueError:
-                    continue
-
     try:
-        ip_obj = ipaddress.ip_address(peer_ip)
-        return str(ip_obj)
+        peer_obj = ipaddress.ip_address(peer_ip.strip())
+        clean_peer = str(peer_obj)
     except ValueError:
         return "127.0.0.1"
+
+    raw_trusted = getattr(settings, "TRUSTED_PROXIES", ["127.0.0.1", "::1"])
+    if isinstance(raw_trusted, str):
+        trusted_list = [p.strip() for p in raw_trusted.split(",") if p.strip()]
+    elif isinstance(raw_trusted, (list, tuple, set)):
+        trusted_list = [str(p).strip() for p in raw_trusted if str(p).strip()]
+    else:
+        trusted_list = ["127.0.0.1", "::1"]
+
+    # Direct connection from untrusted peer: do NOT trust X-Forwarded-For
+    if not is_trusted_proxy(clean_peer, trusted_list):
+        return clean_peer
+
+    # Peer is trusted: inspect X-Forwarded-For from right to left
+    xff = request.headers.get("X-Forwarded-For")
+    if not xff or not xff.strip():
+        return clean_peer
+
+    hops = [h.strip() for h in xff.split(",") if h.strip()]
+    for hop in reversed(hops):
+        try:
+            hop_obj = ipaddress.ip_address(hop)
+            hop_str = str(hop_obj)
+        except ValueError:
+            # Skip invalid / malformed IP strings
+            continue
+
+        if not is_trusted_proxy(hop_str, trusted_list):
+            return hop_str
+
+    # If all valid hops in X-Forwarded-For are trusted proxies, fallback to leftmost valid or peer
+    for hop in hops:
+        try:
+            return str(ipaddress.ip_address(hop))
+        except ValueError:
+            continue
+
+    return clean_peer
 
 
 @router.post("/idp-nonce", response_model=IdpNonceResponse)
@@ -165,6 +225,7 @@ def request_idp_login_nonce(
     payload: IdpNonceRequest,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
 ) -> IdpNonceResponse:
     """
     Issues a server-tracked single-use OIDC login nonce bound to an organization,
@@ -201,6 +262,9 @@ def request_idp_login_nonce(
             path="/api/v1/auth",
         )
 
+        # Dispatch opportunistic rate-limit cleanup if interval has elapsed
+        schedule_rate_limit_cleanup_if_due(background_tasks)
+
         return IdpNonceResponse(
             nonce=result["nonce"],
             expires_in=result["expires_in"],
@@ -218,6 +282,7 @@ def exchange_idp_token(
     payload: IdpTokenExchangeRequest,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
 ) -> DemoTokenResponse:
     """
     Production authenticated login flow via federated Identity Provider (IdP).
@@ -327,6 +392,9 @@ def exchange_idp_token(
             )
     finally:
         db.close()
+
+    # Dispatch opportunistic rate-limit cleanup if interval has elapsed
+    schedule_rate_limit_cleanup_if_due(background_tasks)
 
     token = create_access_token(subject=user_id, org_id=payload.org_id)
     return DemoTokenResponse(

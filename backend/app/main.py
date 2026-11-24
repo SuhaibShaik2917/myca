@@ -1,4 +1,6 @@
+import asyncio
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 # Add local vendor packages to sys.path
@@ -10,6 +12,7 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.modules.auth.api import router as auth_router
+from app.modules.auth.nonce_service import run_periodic_rate_limit_cleanup
 from app.modules.invoice_brain.api import router as invoice_brain_router
 from app.modules.reconciliation.api import router as reconciliation_router
 from app.modules.gstr3b.api import router as gstr3b_router
@@ -17,10 +20,39 @@ from app.modules.credit_builder.api import router as credit_builder_router
 from app.modules.scheme_navigator.api import router as scheme_navigator_router
 from app.modules.ai_assistant.api import router as ai_assistant_router
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application lifespan context manager.
+    Initializes and manages background rate-limit cleanup scheduling.
+    """
+    stop_event = asyncio.Event()
+    cleanup_task = asyncio.create_task(
+        run_periodic_rate_limit_cleanup(
+            interval_seconds=getattr(settings, "RATE_LIMIT_CLEANUP_INTERVAL_SECONDS", 3600),
+            retention_hours=getattr(settings, "RATE_LIMIT_RETENTION_HOURS", 1),
+            stop_event=stop_event,
+        )
+    )
+    app.state.rate_limit_cleanup_task = cleanup_task
+    app.state.rate_limit_cleanup_stop_event = stop_event
+    try:
+        yield
+    finally:
+        stop_event.set()
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    description="Autonomous Financial Intelligence Platform for Indian MSMEs"
+    description="Autonomous Financial Intelligence Platform for Indian MSMEs",
+    lifespan=lifespan,
 )
 
 # CORS restricted to configured frontend origins

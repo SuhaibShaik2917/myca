@@ -99,7 +99,7 @@ def run_cmd(cmd_list):
     return res.stdout
 
 DISPOSABLE_MARKER_TABLE = "disposable_database_marker"
-DISPOSABLE_MARKER_TOKEN = "MYCA_VERIFIED_DISPOSABLE_TEST_DATABASE_TOKEN_V1_0_16"
+DISPOSABLE_MARKER_TOKEN = "MYCA_VERIFIED_DISPOSABLE_TEST_DATABASE_TOKEN_V1_0_17"
 
 def assert_database_disposable_marker(conn):
     """

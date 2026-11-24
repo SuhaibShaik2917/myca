@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -5,6 +6,8 @@ import logging
 import os
 import re
 import secrets
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -38,6 +41,9 @@ def check_distributed_rate_limit(
     Atomically enforces distributed rolling 60-second rate limits using PostgreSQL row locking on public.auth_rate_limits.
     Unlike calendar-minute fixed windows, this sliding window tracks exact request timestamps over a 60-second rolling window,
     completely preventing boundary bursts across minute transitions.
+    
+    Returns an explicit acceptance boolean from the atomic SQL operation rather than inferring acceptance
+    from timestamp array membership, eliminating collision/conflation ambiguities across identical timestamps.
     Shared across all worker processes, threads, and instances without memory synchronization gaps.
     """
     now = current_time or datetime.now(timezone.utc)
@@ -54,38 +60,43 @@ def check_distributed_rate_limit(
     )
     ip_result = db.execute(
         text("""
+            WITH locked_row AS (
+                SELECT rate_key, timestamps
+                FROM public.auth_rate_limits
+                WHERE rate_key = :key
+                FOR UPDATE
+            ),
+            current_state AS (
+                SELECT 
+                    locked_row.rate_key,
+                    coalesce(array_agg(t_item ORDER BY t_item) FILTER (WHERE t_item IS NOT NULL), '{}'::timestamptz[]) AS filtered_ts,
+                    count(t_item) AS current_count
+                FROM locked_row
+                LEFT JOIN LATERAL unnest(locked_row.timestamps) AS t_item ON t_item > :now - INTERVAL '60 seconds'
+                GROUP BY locked_row.rate_key
+            )
             UPDATE public.auth_rate_limits
-            SET timestamps = CASE
-                    WHEN (
-                        SELECT count(*)
-                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
-                        WHERE t_item > :now - INTERVAL '60 seconds'
-                    ) < :max_ip
-                    THEN (
-                        SELECT coalesce(array_agg(t_item ORDER BY t_item), '{}'::timestamptz[]) || :now
-                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
-                        WHERE t_item > :now - INTERVAL '60 seconds'
-                    )
-                    ELSE (
-                        SELECT coalesce(array_agg(t_item ORDER BY t_item), '{}'::timestamptz[])
-                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
-                        WHERE t_item > :now - INTERVAL '60 seconds'
-                    )
+            SET 
+                timestamps = CASE 
+                    WHEN current_state.current_count < :max_ip 
+                    THEN current_state.filtered_ts || :now 
+                    ELSE current_state.filtered_ts 
                 END,
                 updated_at = :now
-            WHERE rate_key = :key
+            FROM current_state
+            WHERE public.auth_rate_limits.rate_key = current_state.rate_key
             RETURNING 
-                (public.auth_rate_limits.timestamps @> ARRAY[:now]) AS is_allowed,
-                (
-                    SELECT count(*)
-                    FROM unnest(public.auth_rate_limits.timestamps) AS t_item
-                    WHERE t_item > :now - INTERVAL '60 seconds'
-                ) AS active_count;
+                (current_state.current_count < :max_ip) AS is_accepted,
+                CASE 
+                    WHEN current_state.current_count < :max_ip 
+                    THEN current_state.current_count + 1 
+                    ELSE current_state.current_count 
+                END AS active_count;
         """),
         {"key": ip_key, "now": now, "max_ip": max_ip},
     ).fetchone()
 
-    ip_allowed = ip_result[0] if ip_result else False
+    ip_allowed = bool(ip_result[0]) if ip_result else False
     if not ip_allowed:
         db.commit()
         raise HTTPException(
@@ -105,38 +116,43 @@ def check_distributed_rate_limit(
     )
     org_result = db.execute(
         text("""
+            WITH locked_row AS (
+                SELECT rate_key, timestamps
+                FROM public.auth_rate_limits
+                WHERE rate_key = :key
+                FOR UPDATE
+            ),
+            current_state AS (
+                SELECT 
+                    locked_row.rate_key,
+                    coalesce(array_agg(t_item ORDER BY t_item) FILTER (WHERE t_item IS NOT NULL), '{}'::timestamptz[]) AS filtered_ts,
+                    count(t_item) AS current_count
+                FROM locked_row
+                LEFT JOIN LATERAL unnest(locked_row.timestamps) AS t_item ON t_item > :now - INTERVAL '60 seconds'
+                GROUP BY locked_row.rate_key
+            )
             UPDATE public.auth_rate_limits
-            SET timestamps = CASE
-                    WHEN (
-                        SELECT count(*)
-                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
-                        WHERE t_item > :now - INTERVAL '60 seconds'
-                    ) < :max_org
-                    THEN (
-                        SELECT coalesce(array_agg(t_item ORDER BY t_item), '{}'::timestamptz[]) || :now
-                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
-                        WHERE t_item > :now - INTERVAL '60 seconds'
-                    )
-                    ELSE (
-                        SELECT coalesce(array_agg(t_item ORDER BY t_item), '{}'::timestamptz[])
-                        FROM unnest(public.auth_rate_limits.timestamps) AS t_item
-                        WHERE t_item > :now - INTERVAL '60 seconds'
-                    )
+            SET 
+                timestamps = CASE 
+                    WHEN current_state.current_count < :max_org 
+                    THEN current_state.filtered_ts || :now 
+                    ELSE current_state.filtered_ts 
                 END,
                 updated_at = :now
-            WHERE rate_key = :key
+            FROM current_state
+            WHERE public.auth_rate_limits.rate_key = current_state.rate_key
             RETURNING 
-                (public.auth_rate_limits.timestamps @> ARRAY[:now]) AS is_allowed,
-                (
-                    SELECT count(*)
-                    FROM unnest(public.auth_rate_limits.timestamps) AS t_item
-                    WHERE t_item > :now - INTERVAL '60 seconds'
-                ) AS active_count;
+                (current_state.current_count < :max_org) AS is_accepted,
+                CASE 
+                    WHEN current_state.current_count < :max_org 
+                    THEN current_state.current_count + 1 
+                    ELSE current_state.current_count 
+                END AS active_count;
         """),
         {"key": org_key, "now": now, "max_org": max_org},
     ).fetchone()
 
-    org_allowed = org_result[0] if org_result else False
+    org_allowed = bool(org_result[0]) if org_result else False
     if not org_allowed:
         db.commit()
         raise HTTPException(
@@ -162,6 +178,104 @@ def cleanup_expired_auth_rate_limits(db: Session, retention_hours: int = 1) -> i
     )
     db.commit()
     return res.rowcount or 0
+
+
+def run_rate_limit_cleanup_job(retention_hours: int = 1) -> int:
+    """
+    Standalone operational maintenance runner for expired rate limit records.
+    Opens an independent DB session, prunes records, and safely logs metrics.
+    Suitable for invocation by background workers, cron jobs, or schedulers.
+    """
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        pruned = cleanup_expired_auth_rate_limits(db, retention_hours=retention_hours)
+        if pruned > 0:
+            logger.info("Auth rate limit cleanup pruned %d expired record(s)", pruned)
+        return pruned
+    except Exception as exc:
+        logger.warning("Auth rate limit cleanup encountered exception: %s", exc)
+        return 0
+    finally:
+        db.close()
+
+
+async def run_periodic_rate_limit_cleanup(
+    interval_seconds: int = 3600,
+    retention_hours: int = 1,
+    stop_event: Optional[asyncio.Event] = None,
+) -> None:
+    """
+    Continuous asynchronous background runner for periodic rate-limit cleanup.
+    Designed for FastAPI lifespan integration or long-lived worker loops.
+    Executes in a separate thread to ensure zero event-loop blocking.
+    """
+    logger.info(
+        "Starting periodic rate-limit cleanup task (interval: %ds, retention: %dh)",
+        interval_seconds,
+        retention_hours,
+    )
+    while True:
+        if stop_event and stop_event.is_set():
+            break
+        try:
+            await asyncio.to_thread(run_rate_limit_cleanup_job, retention_hours)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("Periodic rate-limit cleanup loop exception: %s", exc)
+
+        try:
+            if stop_event:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            break
+
+    logger.info("Periodic rate-limit cleanup task stopped.")
+
+
+_last_cleanup_monotonic: float = 0.0
+_cleanup_dispatch_lock = threading.Lock()
+
+
+def schedule_rate_limit_cleanup_if_due(
+    background_tasks: Optional[Any] = None,
+    min_interval_seconds: int = 300,
+    retention_hours: int = 1,
+) -> bool:
+    """
+    Opportunistically dispatches rate-limit cleanup if min_interval_seconds have elapsed.
+    Thread-safe guard ensures only one cleanup dispatch occurs per interval window.
+    Dispatches through FastAPI BackgroundTasks if provided, or via a detached daemon thread.
+    Returns True if cleanup was dispatched, False if throttled.
+    """
+    global _last_cleanup_monotonic
+    now = time.monotonic()
+    if now - _last_cleanup_monotonic < min_interval_seconds:
+        return False
+
+    with _cleanup_dispatch_lock:
+        if now - _last_cleanup_monotonic < min_interval_seconds:
+            return False
+        _last_cleanup_monotonic = now
+
+    if background_tasks is not None:
+        background_tasks.add_task(run_rate_limit_cleanup_job, retention_hours)
+    else:
+        worker = threading.Thread(
+            target=run_rate_limit_cleanup_job,
+            args=(retention_hours,),
+            daemon=True,
+            name="auth_rate_limit_cleanup_worker",
+        )
+        worker.start()
+    return True
 
 
 def reset_auth_rate_limits(db: Session) -> None:

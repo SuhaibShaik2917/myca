@@ -1819,11 +1819,16 @@ def test_rate_limits_bounded_retention_and_cleanup():
         db.close()
 
 
-def test_trusted_proxy_client_ip_extraction():
+def test_trusted_proxy_client_ip_extraction(monkeypatch):
     """
-    TRUSTED PROXY & CLIENT IP SPOOFING DEFENSE TEST:
-    Proves that X-Forwarded-For is only honored when connecting through a configured TRUSTED_PROXIES peer,
-    and direct connections from untrusted peers ignore spoofed headers.
+    TRUSTED PROXY & CLIENT IP SPOOFING DEFENSE TEST (Finding 1):
+    Proves that:
+    1. Direct connections from untrusted peers ignore spoofed X-Forwarded-For headers.
+    2. Connections through a trusted proxy traverse X-Forwarded-For from right to left,
+       selecting the first untrusted IP and completely ignoring spoofed addresses on the left.
+    3. Multi-hop trusted proxy chains (e.g. CDN -> Ingress) traverse trusted hops until reaching the client.
+    4. CIDR network definitions in TRUSTED_PROXIES are correctly honored.
+    5. Malformed/malicious header injection attempts are safely rejected and sanitized.
     """
     from app.modules.auth.api import extract_client_ip
     from unittest.mock import MagicMock
@@ -1835,17 +1840,205 @@ def test_trusted_proxy_client_ip_extraction():
     ip = extract_client_ip(untrusted_req)
     assert ip == "203.0.113.195", "CRITICAL FLAW: Untrusted peer successfully spoofed IP via X-Forwarded-For header!"
 
-    # 2. Connection from trusted proxy (127.0.0.1) with valid X-Forwarded-For
+    # 2. Connection from trusted proxy (127.0.0.1) with spoofed X-Forwarded-For
+    # Attacker prepended '1.1.1.1', but real client connecting to proxy was '198.51.100.42'
+    # Walking right-to-left: '198.51.100.42' is untrusted -> selected. '1.1.1.1' is ignored.
     trusted_req = MagicMock()
     trusted_req.client.host = "127.0.0.1"
-    trusted_req.headers = {"X-Forwarded-For": "198.51.100.42, 10.0.0.1"}
+    trusted_req.headers = {"X-Forwarded-For": "1.1.1.1, 198.51.100.42"}
     ip = extract_client_ip(trusted_req)
-    assert ip == "198.51.100.42", f"Expected real client IP 198.51.100.42, got {ip}"
+    assert ip == "198.51.100.42", f"Expected real client IP 198.51.100.42 from right-to-left traversal, got {ip}"
 
-    # 3. Connection from trusted proxy with malicious/malformed header injection
+    # 3. Multi-hop proxy chain with trusted intermediate proxy (10.0.0.1):
+    # Attacker spoofs '1.1.1.1', connects from '198.51.100.42' through CDN '10.0.0.1' to Ingress '127.0.0.1'
+    # Header: "1.1.1.1, 198.51.100.42, 10.0.0.1"
+    chain_req = MagicMock()
+    chain_req.client.host = "127.0.0.1"
+    chain_req.headers = {"X-Forwarded-For": "1.1.1.1, 198.51.100.42, 10.0.0.1"}
+    with monkeypatch.context() as m:
+        m.setattr(settings, "TRUSTED_PROXIES", ["127.0.0.1", "10.0.0.1"])
+        ip = extract_client_ip(chain_req)
+        assert ip == "198.51.100.42", f"Expected untrusted client 198.51.100.42, got {ip}"
+
+    # 4. CIDR network block in TRUSTED_PROXIES:
+    cidr_req = MagicMock()
+    cidr_req.client.host = "127.0.0.1"
+    cidr_req.headers = {"X-Forwarded-For": "1.1.1.1, 203.0.113.88, 10.5.20.1"}
+    with monkeypatch.context() as m:
+        m.setattr(settings, "TRUSTED_PROXIES", ["127.0.0.1", "10.0.0.0/8"])
+        ip = extract_client_ip(cidr_req)
+        assert ip == "203.0.113.88", f"Expected untrusted client 203.0.113.88, got {ip}"
+
+    # 5. Connection from trusted proxy with malicious/malformed header injection
     malicious_req = MagicMock()
     malicious_req.client.host = "127.0.0.1"
     malicious_req.headers = {"X-Forwarded-For": "'; DROP TABLE users; --, 127.0.0.1"}
     ip = extract_client_ip(malicious_req)
     assert ip == "127.0.0.1", f"Malformed header injection was not sanitized: {ip}"
+
+
+def test_rate_limiter_explicit_acceptance_boolean_identical_timestamps():
+    """
+    RATE LIMITER EXPLICIT BOOLEAN ACCEPTANCE TEST (Finding 3):
+    Proves that the rate limiter evaluates acceptance via explicit boolean SQL return,
+    preventing microsecond timestamp collisions or identical timestamps from misclassifying
+    a rejected request as accepted.
+    """
+    _ensure_org_exists(ORG_ID)
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import check_distributed_rate_limit, reset_auth_rate_limits
+    from datetime import datetime, timezone
+
+    db = SessionLocal()
+    try:
+        reset_auth_rate_limits(db)
+        test_ip = "198.51.100.99"
+        test_org = str(uuid.uuid4())
+        fixed_now = datetime(2026, 11, 24, 12, 0, 0, tzinfo=timezone.utc)
+        limit = 3
+
+        # First 3 requests with the EXACT same timestamp must be accepted
+        for i in range(limit):
+            check_distributed_rate_limit(
+                db, client_ip=test_ip, org_id=test_org, max_ip=limit, max_org=10, current_time=fixed_now
+            )
+
+        # 4th request with the EXACT same timestamp MUST be rejected with HTTP 429
+        # (Even though fixed_now is already in the array, explicit boolean says False!)
+        with pytest.raises(HTTPException) as exc_info:
+            check_distributed_rate_limit(
+                db, client_ip=test_ip, org_id=test_org, max_ip=limit, max_org=10, current_time=fixed_now
+            )
+        assert exc_info.value.status_code == 429
+        assert "RATE_LIMIT_EXCEEDED" in exc_info.value.detail
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_scheduled_cleanup_operational():
+    """
+    RATE LIMIT SCHEDULED CLEANUP OPERATIONAL TEST (Finding 2):
+    Proves that rate-limit cleanup is fully operational across all execution paths:
+    1. Direct operational execution via run_rate_limit_cleanup_job().
+    2. Continuous background periodic task run_periodic_rate_limit_cleanup() with stop_event.
+    3. In-flow opportunistic scheduling via schedule_rate_limit_cleanup_if_due().
+    4. Bounded retention verification: expired records are purged while active records remain intact.
+    """
+    _ensure_org_exists(ORG_ID)
+    from app.database import SessionLocal
+    from app.modules.auth.nonce_service import (
+        cleanup_expired_auth_rate_limits,
+        run_rate_limit_cleanup_job,
+        run_periodic_rate_limit_cleanup,
+        schedule_rate_limit_cleanup_if_due,
+        check_distributed_rate_limit,
+        reset_auth_rate_limits,
+    )
+    from sqlalchemy import text
+    from datetime import datetime, timezone, timedelta
+    from fastapi import BackgroundTasks
+    import asyncio
+
+    db = SessionLocal()
+    try:
+        reset_auth_rate_limits(db)
+
+        # 1. Insert stale record (2 hours old) and active record (current)
+        stale_key = "ip:10.77.77.77"
+        active_key = "ip:10.88.88.88"
+        two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=2)
+
+        db.execute(
+            text("""
+                INSERT INTO public.auth_rate_limits (rate_key, timestamps, updated_at)
+                VALUES (:k, ARRAY[:t], :t);
+            """),
+            {"k": stale_key, "t": two_hours_ago},
+        )
+        db.commit()
+
+        # Insert active record
+        check_distributed_rate_limit(db, client_ip="10.88.88.88", org_id=ORG_ID)
+
+        # Verify both records exist initially
+        assert db.execute(text("SELECT 1 FROM public.auth_rate_limits WHERE rate_key = :k;"), {"k": stale_key}).scalar() == 1
+        assert db.execute(text("SELECT 1 FROM public.auth_rate_limits WHERE rate_key = :k;"), {"k": active_key}).scalar() == 1
+
+        # 2. Test operational runner run_rate_limit_cleanup_job
+        pruned = run_rate_limit_cleanup_job(retention_hours=1)
+        assert pruned >= 1, f"Expected at least 1 record pruned, got {pruned}"
+
+        # Verify stale record deleted, active record retained
+        assert db.execute(text("SELECT 1 FROM public.auth_rate_limits WHERE rate_key = :k;"), {"k": stale_key}).scalar() is None
+        assert db.execute(text("SELECT 1 FROM public.auth_rate_limits WHERE rate_key = :k;"), {"k": active_key}).scalar() == 1
+
+        # 3. Test opportunistic scheduling with BackgroundTasks
+        # Insert another stale record
+        stale_key_2 = "ip:10.66.66.66"
+        db.execute(
+            text("""
+                INSERT INTO public.auth_rate_limits (rate_key, timestamps, updated_at)
+                VALUES (:k, ARRAY[:t], :t);
+            """),
+            {"k": stale_key_2, "t": two_hours_ago},
+        )
+        db.commit()
+
+        bg_tasks = BackgroundTasks()
+        dispatched = schedule_rate_limit_cleanup_if_due(bg_tasks, min_interval_seconds=0, retention_hours=1)
+        assert dispatched is True, "Expected cleanup dispatch to succeed when due"
+        assert len(bg_tasks.tasks) == 1, "Expected 1 cleanup task to be scheduled on BackgroundTasks"
+        # Execute the background task
+        await bg_tasks()
+        assert db.execute(text("SELECT 1 FROM public.auth_rate_limits WHERE rate_key = :k;"), {"k": stale_key_2}).scalar() is None
+
+        # 4. Test async continuous periodic runner with stop_event
+        stale_key_3 = "ip:10.55.55.55"
+        db.execute(
+            text("""
+                INSERT INTO public.auth_rate_limits (rate_key, timestamps, updated_at)
+                VALUES (:k, ARRAY[:t], :t);
+            """),
+            {"k": stale_key_3, "t": two_hours_ago},
+        )
+        db.commit()
+
+        stop_ev = asyncio.Event()
+        cleanup_task = asyncio.create_task(
+            run_periodic_rate_limit_cleanup(interval_seconds=10, retention_hours=1, stop_event=stop_ev)
+        )
+        # Give worker a brief moment to run iteration
+        await asyncio.sleep(0.1)
+        stop_ev.set()
+        await cleanup_task
+
+        assert db.execute(text("SELECT 1 FROM public.auth_rate_limits WHERE rate_key = :k;"), {"k": stale_key_3}).scalar() is None
+    finally:
+        db.close()
+
+
+def test_idp_nonce_triggers_background_cleanup():
+    """
+    IN-FLOW CLEANUP TRIGGER TEST:
+    Proves that calling /api/v1/auth/idp-nonce through TestClient executes normally
+    and triggers background cleanup without raising exceptions or impacting response.
+    """
+    _ensure_org_exists(ORG_ID)
+    from app.main import app
+    client = TestClient(app)
+    verifier, challenge, state = generate_pkce_pair()
+    response = client.post(
+        "/api/v1/auth/idp-nonce",
+        json={
+            "org_id": ORG_ID,
+            "idp_provider": "google",
+            "state": state,
+            "code_challenge": challenge,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "nonce" in data
+    assert "myca_auth_session" in response.cookies
 
