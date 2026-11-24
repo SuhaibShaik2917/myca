@@ -113,6 +113,7 @@ def prepare_gstr3b_return(
                 "checker_id": str(existing_filing.checker_id) if existing_filing.checker_id else None,
                 "maker_remarks": existing_filing.maker_remarks,
                 "checker_remarks": existing_filing.checker_remarks,
+                "rejected_at": existing_filing.updated_at,
             }
         elif status == "DRAFT":
             target_revision = existing_filing.revision_number or 1
@@ -348,11 +349,11 @@ def prepare_gstr3b_return(
             INSERT INTO public.gstr3b_revision_history (
                 filing_id, org_id, revision_number,
                 table_3_1_data, table_4_data, offset_data,
-                maker_id, checker_id, maker_remarks, checker_remarks, archived_at
+                maker_id, checker_id, maker_remarks, checker_remarks, rejected_at, archived_at
             ) VALUES (
                 :filing_id, :org_id, :rev_num,
                 CAST(:t31 AS jsonb), CAST(:t4 AS jsonb), CAST(:offset AS jsonb),
-                :maker_id, :checker_id, :maker_remarks, :checker_remarks, clock_timestamp()
+                :maker_id, :checker_id, :maker_remarks, :checker_remarks, :rejected_at, clock_timestamp()
             )
             ON CONFLICT (filing_id, revision_number) DO NOTHING;
             """),
@@ -648,7 +649,7 @@ def get_gstr3b_revision_history(
         text("""
         SELECT id, filing_id, org_id, revision_number,
                table_3_1_data, table_4_data, offset_data,
-               maker_id, checker_id, maker_remarks, checker_remarks, archived_at
+               maker_id, checker_id, maker_remarks, checker_remarks, rejected_at, archived_at
         FROM public.gstr3b_revision_history
         WHERE org_id = :org AND filing_id = :fid
         ORDER BY revision_number ASC;
@@ -669,6 +670,7 @@ def get_gstr3b_revision_history(
             "checker_id": str(r.checker_id) if r.checker_id else None,
             "maker_remarks": r.maker_remarks,
             "checker_remarks": r.checker_remarks,
+            "rejected_at": r.rejected_at.isoformat() if r.rejected_at else None,
             "archived_at": r.archived_at.isoformat() if r.archived_at else None,
         }
         for r in rows

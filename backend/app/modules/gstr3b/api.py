@@ -9,7 +9,7 @@ from app.modules.gstr3b.schemas import (
 )
 from app.modules.gstr3b.service import (
     prepare_gstr3b_return, submit_gstr3b_for_review, review_gstr3b_decision,
-    file_gstr3b_to_gsp_sandbox, get_gstr3b_status, GSTR3BServiceError
+    file_gstr3b_to_gsp_sandbox, get_gstr3b_status, get_gstr3b_revision_history, GSTR3BServiceError
 )
 
 router = APIRouter(prefix="/gstr3b", tags=["Milestone 3: GSTR-3B Filing & Offset Engine"])
@@ -147,3 +147,21 @@ def file_to_gsp_sandbox_endpoint(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{filing_id}/revision-history")
+def get_revision_history_endpoint(
+    filing_id: str,
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
+    db: Session = Depends(get_tenant_db)
+):
+    """Retrieves durable append-only revision history for a GSTR-3B filing."""
+    effective_org, _ = validate_tenant_identity(db, x_org_id, None)
+    try:
+        return get_gstr3b_revision_history(
+            session=db,
+            org_id=effective_org,
+            filing_id=filing_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve revision history: {str(e)}")

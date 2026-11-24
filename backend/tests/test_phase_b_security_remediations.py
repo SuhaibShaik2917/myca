@@ -520,36 +520,30 @@ def test_maker_checker_database_check_constraint_blocks_self_approval(dual_tenan
 
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
-            filing_id = str(uuid.uuid4())
-            # Insert a draft with maker_id
-            cur.execute("""
-                INSERT INTO public.gstr3b_filings (
-                    id, org_id, registration_id, tax_period, filing_status,
-                    table_3_1_data, table_4_data, offset_data, maker_id
-                ) VALUES (
-                    %s, %s, %s, %s, 'DRAFT',
-                    '{}', '{}', '{}', %s
-                );
-            """, (filing_id, org_id, reg_id, tax_period, user_id))
-
-            # Attempt direct SQL UPDATE setting APPROVED_BY_CHECKER with maker_id == checker_id
+            # Attempt direct SQL INSERT setting APPROVED_BY_CHECKER with maker_id == checker_id
             with pytest.raises(psycopg.errors.CheckViolation) as exc_info:
                 cur.execute("""
-                    UPDATE public.gstr3b_filings
-                    SET filing_status = 'APPROVED_BY_CHECKER',
-                        checker_id = %s
-                    WHERE id = %s;
-                """, (user_id, filing_id))
+                    INSERT INTO public.gstr3b_filings (
+                        id, org_id, registration_id, tax_period, filing_status,
+                        table_3_1_data, table_4_data, offset_data, maker_id, checker_id
+                    ) VALUES (
+                        %s, %s, %s, %s, 'APPROVED_BY_CHECKER',
+                        '{}', '{}', '{}', %s, %s
+                    );
+                """, (str(uuid.uuid4()), org_id, reg_id, tax_period, user_id, user_id))
             assert exc_info.value.sqlstate == "23514"
             assert "chk_gstr3b_maker_checker_distinct" in str(exc_info.value)
 
-            # Attempt direct SQL UPDATE setting FILED with maker_id == checker_id
+            # Attempt direct SQL INSERT setting FILED with maker_id == checker_id
             with pytest.raises(psycopg.errors.CheckViolation) as exc_info:
                 cur.execute("""
-                    UPDATE public.gstr3b_filings
-                    SET filing_status = 'FILED',
-                        checker_id = %s
-                    WHERE id = %s;
-                """, (user_id, filing_id))
+                    INSERT INTO public.gstr3b_filings (
+                        id, org_id, registration_id, tax_period, filing_status,
+                        table_3_1_data, table_4_data, offset_data, maker_id, checker_id
+                    ) VALUES (
+                        %s, %s, %s, %s, 'FILED',
+                        '{}', '{}', '{}', %s, %s
+                    );
+                """, (str(uuid.uuid4()), org_id, reg_id, "2026-05", user_id, user_id))
             assert exc_info.value.sqlstate == "23514"
             assert "chk_gstr3b_maker_checker_distinct" in str(exc_info.value)
