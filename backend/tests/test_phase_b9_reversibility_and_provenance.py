@@ -676,6 +676,7 @@ def test_concurrent_downgrade_evidence_check_blocks_race():
         alembic_app_name = f"myca_b11_downgrade_{uuid.uuid4().hex[:8]}"
         downgrade_env = env.copy()
         downgrade_env["PGAPPNAME"] = alembic_app_name
+        popen = None
         t = None
 
         try:
@@ -689,22 +690,27 @@ def test_concurrent_downgrade_evidence_check_blocks_race():
                         {"o": org_id, "f": legacy_fid, "m": maker_id, "n": nonce, "s": sig},
                     )
 
-                    def _run_downgrade():
-                        p = subprocess.Popen(
-                            ["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"],
-                            cwd=backend_dir,
-                            env=downgrade_env,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                        )
-                        downgrade_result["popen"] = p
-                        stdout, stderr = p.communicate()
-                        downgrade_result["returncode"] = p.returncode
-                        downgrade_result["stdout"] = stdout
-                        downgrade_result["stderr"] = stderr
+                    # Create Popen in the controlling thread before starting the worker thread
+                    # so teardown always has the process handle with zero registration race.
+                    popen = subprocess.Popen(
+                        ["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"],
+                        cwd=backend_dir,
+                        env=downgrade_env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
 
-                    t = threading.Thread(target=_run_downgrade)
+                    def _communicate_downgrade():
+                        try:
+                            stdout, stderr = popen.communicate()
+                            downgrade_result["returncode"] = popen.returncode
+                            downgrade_result["stdout"] = stdout
+                            downgrade_result["stderr"] = stderr
+                        except Exception as exc:
+                            downgrade_result["error"] = exc
+
+                    t = threading.Thread(target=_communicate_downgrade)
                     t.start()
 
                     # Deterministically poll pg_stat_activity until the Alembic backend is blocked
@@ -753,20 +759,22 @@ def test_concurrent_downgrade_evidence_check_blocks_race():
                 finally:
                     if tx.is_active:
                         tx.rollback()
+                    if popen is not None and popen.poll() is None:
+                        popen.terminate()
+                        try:
+                            popen.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            popen.kill()
+                            popen.wait(timeout=5)
                     if t is not None and t.is_alive():
-                        popen = downgrade_result.get("popen")
-                        if popen is not None and popen.poll() is None:
-                            popen.terminate()
-                            t.join(timeout=5)
-                            if popen.poll() is None:
-                                popen.kill()
-                                t.join(timeout=5)
-                        else:
-                            t.join(timeout=5)
-                        assert not t.is_alive(), "Alembic downgrade worker thread failed to terminate during teardown"
+                        t.join(timeout=5)
+                    assert popen is None or popen.poll() is not None, "Alembic subprocess failed to terminate during teardown"
+                    assert t is None or not t.is_alive(), "Alembic downgrade worker thread failed to terminate during teardown"
         finally:
             app_eng.dispose()
 
+        assert "error" not in downgrade_result, f"Subprocess communication failed: {downgrade_result.get('error')}"
+        assert "returncode" in downgrade_result, "Subprocess did not produce a returncode"
         assert downgrade_result["returncode"] != 0
         assert "Refusing to downgrade migration 0039" in (downgrade_result["stderr"] + downgrade_result["stdout"])
 
