@@ -1,8 +1,10 @@
 import os
 import time
 import hashlib
+from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any, List
 import uuid
+from urllib.parse import urlparse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -15,13 +17,98 @@ ALLOWED_MIME_TYPES = {
 
 MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024  # 15 MB
 
+
 class StorageError(Exception):
     pass
+
 
 class DuplicateDocumentError(StorageError):
     def __init__(self, message: str, existing_document_id: str):
         super().__init__(message)
         self.existing_document_id = existing_document_id
+
+
+def is_s3_uri(file_path: str) -> bool:
+    return bool(file_path and str(file_path).strip().lower().startswith("s3://"))
+
+
+def parse_s3_uri(file_path: str) -> Tuple[str, str]:
+    parsed = urlparse(str(file_path).strip())
+    if parsed.scheme.lower() != "s3" or not parsed.netloc or not parsed.path:
+        raise StorageError(f"INVALID_S3_URI: '{file_path}' is not a valid s3://bucket/key URI.")
+    key = parsed.path.lstrip("/")
+    if not key or ".." in key.split("/"):
+        raise StorageError(f"INVALID_S3_KEY: Unsafe or empty object key in '{file_path}'.")
+    return parsed.netloc, key
+
+
+def _get_s3_client():
+    from app.config import settings
+
+    region = (os.getenv("AWS_REGION") or getattr(settings, "AWS_REGION", "ap-south-1") or "ap-south-1").strip()
+    try:
+        import boto3  # type: ignore
+    except ImportError as exc:
+        raise StorageError("S3_STORAGE_UNAVAILABLE: boto3 dependency is required for S3 storage operations.") from exc
+    return boto3.client("s3", region_name=region)
+
+
+def _assert_org_isolation(file_path: str, expected_org_id: Optional[str]) -> None:
+    if not expected_org_id:
+        return
+    org_clean = str(expected_org_id).strip()
+    if is_s3_uri(file_path):
+        _, key = parse_s3_uri(file_path)
+        if not key.startswith(f"{org_clean}/"):
+            raise StorageError(
+                f"TENANT_STORAGE_ISOLATION_VIOLATION: Object key '{key}' does not belong to org '{org_clean}'."
+            )
+    else:
+        norm = os.path.normpath(os.path.abspath(file_path))
+        expected_segment = f"{os.sep}{org_clean}{os.sep}"
+        if expected_segment not in norm:
+            raise StorageError(
+                f"TENANT_STORAGE_ISOLATION_VIOLATION: Path '{file_path}' does not belong to org '{org_clean}'."
+            )
+
+
+def read_document_bytes(file_path: str, expected_org_id: Optional[str] = None) -> bytes:
+    """Retrieves stored document bytes safely for either local filesystem or s3:// URI."""
+    _assert_org_isolation(file_path, expected_org_id)
+    if is_s3_uri(file_path):
+        bucket, key = parse_s3_uri(file_path)
+        s3_client = _get_s3_client()
+        resp = s3_client.get_object(Bucket=bucket, Key=key)
+        return resp["Body"].read()
+    with open(file_path, "rb") as f:
+        return f.read()
+
+
+def stat_document_size(file_path: str, expected_org_id: Optional[str] = None) -> int:
+    """Returns stored document byte size for either local filesystem or s3:// URI."""
+    _assert_org_isolation(file_path, expected_org_id)
+    if is_s3_uri(file_path):
+        bucket, key = parse_s3_uri(file_path)
+        s3_client = _get_s3_client()
+        head = s3_client.head_object(Bucket=bucket, Key=key)
+        return int(head.get("ContentLength", 0))
+    return int(os.stat(file_path).st_size)
+
+
+def delete_stored_document(file_path: str, expected_org_id: Optional[str] = None) -> bool:
+    """Deletes stored document from local filesystem or s3:// URI without passing URIs to os.remove."""
+    if not file_path:
+        return False
+    _assert_org_isolation(file_path, expected_org_id)
+    if is_s3_uri(file_path):
+        bucket, key = parse_s3_uri(file_path)
+        s3_client = _get_s3_client()
+        s3_client.delete_object(Bucket=bucket, Key=key)
+        return True
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        return True
+    return False
 
 def validate_magic_bytes(header: bytes) -> str:
     """
@@ -137,17 +224,63 @@ def compute_stream_sha256_and_save(
 
 def reconcile_storage_orphans(
     session: Session,
-    base_dir: str = "storage",
+    base_dir: Optional[str] = None,
     grace_period_seconds: int = 1800
 ) -> Dict[str, Any]:
     """
-    Periodic storage reconciliation mechanism:
+    Periodic storage reconciliation mechanism across configured backend ('local' or 's3'):
     1. Queries all active document file paths from PostgreSQL public.documents.
-    2. Recursively scans storage base directory.
-    3. Reclaims disk space by purging unreferenced orphan files whose age exceeds grace_period_seconds (default 30 mins).
-    4. Safely preserves in-flight uploads that are younger than grace_period_seconds.
+    2. Scans storage root (directory tree for local, list_objects_v2 for S3) ignoring cross-backend URIs.
+    3. Reclaims space by purging unreferenced orphan objects older than grace_period_seconds.
+    4. Safely preserves in-flight uploads younger than grace_period_seconds.
     """
-    if not os.path.exists(base_dir):
+    from app.config import settings
+
+    backend_mode = (os.getenv("STORAGE_BACKEND") or getattr(settings, "STORAGE_BACKEND", "local") or "local").strip().lower()
+    doc_stmt = text("SELECT file_path FROM public.documents WHERE file_path IS NOT NULL;")
+    rows = session.execute(doc_stmt).fetchall()
+
+    now = time.time()
+    scanned_count = 0
+    in_flight_count = 0
+    orphan_count = 0
+    reclaimed_bytes = 0
+    deleted_files: List[str] = []
+
+    if backend_mode == "s3":
+        bucket = (os.getenv("AWS_S3_BUCKET_NAME") or getattr(settings, "AWS_S3_BUCKET_NAME", None) or "").strip()
+        if not bucket:
+            raise StorageError("S3_STORAGE_UNAVAILABLE: AWS_S3_BUCKET_NAME must be configured for S3 orphan reconciliation.")
+        active_uris = {str(r[0]).strip() for r in rows if r[0] and is_s3_uri(r[0])}
+        s3_client = _get_s3_client()
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket):
+            for obj in page.get("Contents", []) or []:
+                key = obj["Key"]
+                uri = f"s3://{bucket}/{key}"
+                scanned_count += 1
+                if uri in active_uris:
+                    continue
+                last_mod = obj.get("LastModified")
+                mod_ts = last_mod.timestamp() if isinstance(last_mod, datetime) else now
+                if (now - mod_ts) < grace_period_seconds:
+                    in_flight_count += 1
+                    continue
+                s3_client.delete_object(Bucket=bucket, Key=key)
+                orphan_count += 1
+                reclaimed_bytes += int(obj.get("Size", 0))
+                deleted_files.append(uri)
+        return {
+            "scanned_files": scanned_count,
+            "active_db_files": len(active_uris),
+            "in_flight_files": in_flight_count,
+            "orphaned_files_deleted": orphan_count,
+            "reclaimed_bytes": reclaimed_bytes,
+            "deleted_file_paths": deleted_files,
+        }
+
+    effective_base_dir = base_dir or (os.getenv("STORAGE_LOCAL_ROOT") or getattr(settings, "STORAGE_LOCAL_ROOT", "storage") or "storage")
+    if not os.path.exists(effective_base_dir):
         return {
             "scanned_files": 0,
             "active_db_files": 0,
@@ -157,20 +290,13 @@ def reconcile_storage_orphans(
             "deleted_file_paths": []
         }
 
-    # 1. Fetch all registered document paths from DB
-    doc_stmt = text("SELECT file_path FROM public.documents WHERE file_path IS NOT NULL;")
-    rows = session.execute(doc_stmt).fetchall()
-    active_paths = {os.path.normcase(os.path.abspath(r[0])) for r in rows if r[0]}
+    active_paths = {
+        os.path.normcase(os.path.abspath(r[0]))
+        for r in rows
+        if r[0] and not is_s3_uri(r[0])
+    }
 
-    now = time.time()
-    scanned_count = 0
-    in_flight_count = 0
-    orphan_count = 0
-    reclaimed_bytes = 0
-    deleted_files: List[str] = []
-
-    # 2. Walk storage directory
-    for root, dirs, files in os.walk(base_dir):
+    for root, dirs, files in os.walk(effective_base_dir):
         for f in files:
             if f == ".gitkeep":
                 continue
@@ -181,7 +307,6 @@ def reconcile_storage_orphans(
             if norm_path in active_paths:
                 continue
 
-            # Check file age for grace period
             try:
                 st = os.stat(full_path)
                 file_age = now - st.st_mtime

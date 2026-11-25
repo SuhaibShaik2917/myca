@@ -5,6 +5,7 @@ from typing import Dict, Any, Optional
 from decimal import Decimal
 from pydantic import BaseModel
 from app.config import settings
+from app.modules.invoice_brain.storage import read_document_bytes, stat_document_size
 
 logger = logging.getLogger("invoice_brain.ocr")
 
@@ -78,10 +79,7 @@ def extract_invoice_with_gemini(file_path: str, mime_type: str) -> ExtractedInvo
         from google.genai import types
 
         client = genai.Client(api_key=api_key)
-        
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
-
+        file_bytes = read_document_bytes(file_path)
         file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
 
         try:
@@ -127,9 +125,9 @@ def extract_invoice_mock(file_path: str, mime_type: str) -> ExtractedInvoiceData
     Deterministic mock extractor for unit tests, offline staging, and CI environments.
     Extracts realistic, GST-compliant invoice data with consistent line items.
     """
-    # Deterministic generation based on file name or size
-    file_stat = os.stat(file_path)
-    file_seed = file_stat.st_size % 1000
+    # Deterministic generation based on file size (local or S3)
+    file_size = stat_document_size(file_path)
+    file_seed = file_size % 1000
 
     inv_num = f"INV-2026-{1000 + file_seed}"
     taxable_1 = 5000.00

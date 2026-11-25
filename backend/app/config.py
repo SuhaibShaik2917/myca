@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     MYCA_IDP_KEY_ID: Optional[str] = None
     MYCA_IDP_JWKS_URL: Optional[str] = None
     MYCA_IDP_DISCOVERY_URL: Optional[str] = None
+    MYCA_IDP_TOKEN_URL: Optional[str] = None
+    MYCA_IDP_CLIENT_SECRET: Optional[str] = None
+    MYCA_IDP_REDIRECT_URIS: List[str] = []
     MYCA_IDP_JWKS_CACHE_TTL_SECONDS: int = 300
     MYCA_IDP_JWKS_TIMEOUT_SECONDS: float = 5.0
     MYCA_IDP_ALLOWED_PROVIDERS: List[str] = ["google", "azuread", "okta", "auth0"]
@@ -127,7 +130,7 @@ class Settings(BaseSettings):
                 )
         return v
 
-    @field_validator("MYCA_IDP_JWKS_URL", "MYCA_IDP_DISCOVERY_URL")
+    @field_validator("MYCA_IDP_JWKS_URL", "MYCA_IDP_DISCOVERY_URL", "MYCA_IDP_TOKEN_URL")
     @classmethod
     def validate_idp_urls(cls, v, info):
         if v is None or not str(v).strip():
@@ -138,9 +141,31 @@ class Settings(BaseSettings):
         env_norm = str(raw_env).strip().lower() if raw_env else "development"
         if env_norm in ("production", "staging") and not cleaned.lower().startswith("https://"):
             raise ValueError(
-                "CRITICAL SECURITY ERROR: MYCA_IDP_JWKS_URL and MYCA_IDP_DISCOVERY_URL must use https:// in production/staging."
+                "CRITICAL SECURITY ERROR: MYCA_IDP_JWKS_URL, MYCA_IDP_DISCOVERY_URL, and MYCA_IDP_TOKEN_URL must use https:// in production/staging."
             )
         return cleaned
+
+    @field_validator("MYCA_IDP_REDIRECT_URIS", mode="before")
+    @classmethod
+    def validate_idp_redirect_uris(cls, v, info):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            entries = [u.strip() for u in v.split(",") if u.strip()]
+        elif isinstance(v, (list, tuple, set)):
+            entries = [str(u).strip() for u in v if str(u).strip()]
+        else:
+            raise ValueError("MYCA_IDP_REDIRECT_URIS must be a list of URIs or comma-separated string.")
+        data_env = info.data.get("ENVIRONMENT") if hasattr(info, "data") else None
+        raw_env = data_env or os.getenv("ENVIRONMENT")
+        env_norm = str(raw_env).strip().lower() if raw_env else "development"
+        if env_norm in ("production", "staging"):
+            for uri in entries:
+                if not uri.lower().startswith("https://"):
+                    raise ValueError(
+                        f"CRITICAL SECURITY ERROR: OIDC redirect URI '{uri}' must use https:// in production/staging."
+                    )
+        return entries
 
     @field_validator("GSP_MODE")
     @classmethod

@@ -166,15 +166,15 @@ export async function requestIdpNonce(
   return (await response.json()) as IdpNonceResponse;
 }
 
-export async function exchangeIdpToken(payload: {
+export async function exchangeIdpAuthCode(payload: {
   idp_provider: string;
-  idp_token: string;
   org_id: string;
-  nonce?: string;
+  code: string;
   state: string;
   code_verifier: string;
+  redirect_uri: string;
 }): Promise<DemoTokenResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/v1/auth/idp-exchange`, {
+  const response = await fetch(`${API_BASE_URL}/api/v1/auth/idp-code-exchange`, {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
@@ -196,8 +196,7 @@ export function buildOidcAuthorizeUrl(params: {
   scope?: string;
 }): string {
   const url = new URL(params.authorizeEndpoint);
-  url.searchParams.set("response_type", "id_token");
-  url.searchParams.set("response_mode", "fragment");
+  url.searchParams.set("response_type", "code");
   url.searchParams.set("client_id", params.clientId);
   url.searchParams.set("redirect_uri", params.redirectUri);
   url.searchParams.set("scope", params.scope ?? "openid email profile");

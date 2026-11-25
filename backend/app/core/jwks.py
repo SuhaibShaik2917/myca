@@ -76,13 +76,18 @@ def _parse_jwks_payload(payload: Any) -> Dict[str, Dict[str, Any]]:
         except Exception:
             continue
 
+        raw_alg = entry.get("alg")
+        alg_upper = str(raw_alg).strip().upper() if raw_alg else None
+        if alg_upper and (alg_upper == "NONE" or alg_upper.startswith("HS")):
+            continue
+
         raw_kid = entry.get("kid")
         kid_str = str(raw_kid).strip() if raw_kid else ""
         map_key = kid_str if kid_str else f"__nokid_{idx}"
         parsed_keys[map_key] = {
             "kid": kid_str or None,
             "key": pem,
-            "alg": str(entry["alg"]).upper() if entry.get("alg") else None,
+            "alg": alg_upper,
             "kty": kty,
             "has_explicit_kid": bool(kid_str),
         }
@@ -127,22 +132,53 @@ class JWKSClient:
         discovery_url: str,
         *,
         require_https: bool,
+        expected_issuer: Optional[str] = None,
         ttl_seconds: int = 300,
         timeout_seconds: float = 5.0,
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Optional[str]]:
         safe_url = validate_jwks_endpoint_url(discovery_url, require_https=require_https)
         now = time.monotonic()
         with self._lock:
             cached = self._discovery_cache.get(safe_url)
             if cached and (now - cached["fetched_at"]) < ttl_seconds:
-                return cached["data"]
+                resolved = cached["data"]
+                if expected_issuer and resolved["issuer"].lower() != expected_issuer.strip().lower():
+                    raise JWKSUnavailableError(
+                        f"OIDC discovery issuer '{resolved['issuer']}' does not match expected '{expected_issuer}'"
+                    )
+                return resolved
 
         doc = self._fetch_json(safe_url, require_https=require_https, timeout_seconds=timeout_seconds)
-        if not isinstance(doc, dict) or not doc.get("jwks_uri"):
+        if not isinstance(doc, dict):
+            raise JWKSUnavailableError("OIDC discovery document must be a JSON object")
+
+        raw_issuer = doc.get("issuer")
+        if not isinstance(raw_issuer, str) or not raw_issuer.strip():
+            raise JWKSUnavailableError("OIDC discovery document missing required 'issuer'")
+        issuer = raw_issuer.strip()
+        validate_jwks_endpoint_url(issuer, require_https=require_https)
+        if expected_issuer and issuer.lower() != expected_issuer.strip().lower():
+            raise JWKSUnavailableError(
+                f"OIDC discovery issuer '{issuer}' does not match expected '{expected_issuer}'"
+            )
+
+        raw_jwks_uri = doc.get("jwks_uri")
+        if not isinstance(raw_jwks_uri, str) or not raw_jwks_uri.strip():
             raise JWKSUnavailableError("OIDC discovery document missing required 'jwks_uri'")
-        jwks_uri = validate_jwks_endpoint_url(str(doc["jwks_uri"]), require_https=require_https)
-        issuer = str(doc.get("issuer") or "").strip()
-        resolved = {"jwks_uri": jwks_uri, "issuer": issuer}
+        jwks_uri = validate_jwks_endpoint_url(raw_jwks_uri, require_https=require_https)
+
+        raw_token_ep = doc.get("token_endpoint")
+        token_endpoint = None
+        if raw_token_ep is not None:
+            if not isinstance(raw_token_ep, str) or not raw_token_ep.strip():
+                raise JWKSUnavailableError("OIDC discovery document contains invalid 'token_endpoint'")
+            token_endpoint = validate_jwks_endpoint_url(raw_token_ep, require_https=require_https)
+
+        resolved: Dict[str, Optional[str]] = {
+            "jwks_uri": jwks_uri,
+            "issuer": issuer,
+            "token_endpoint": token_endpoint,
+        }
         with self._lock:
             self._discovery_cache[safe_url] = {"fetched_at": time.monotonic(), "data": resolved}
         return resolved

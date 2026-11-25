@@ -29,7 +29,7 @@ import {
   approveOutwardInvoice,
   buildOidcAuthorizeUrl,
   clearSession,
-  exchangeIdpToken,
+  exchangeIdpAuthCode,
   generatePkcePair,
   getStoredSession,
   isDemoAuthEnabled,
@@ -67,10 +67,16 @@ export default function App() {
   const demoEnabled = isDemoAuthEnabled();
 
   useEffect(() => {
-    const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-    const idToken = hashParams.get("id_token");
-    const returnedState = hashParams.get("state");
-    if (!idToken || !returnedState) return;
+    const queryParams = new URLSearchParams(window.location.search);
+    const oidcError = queryParams.get("error");
+    if (oidcError) {
+      setSessionError(`OIDC provider rejected sign-in: ${queryParams.get("error_description") || oidcError}`);
+      return;
+    }
+
+    const authCode = queryParams.get("code");
+    const returnedState = queryParams.get("state");
+    if (!authCode || !returnedState) return;
 
     const rawPending = sessionStorage.getItem(PKCE_STORAGE_KEY);
     if (!rawPending) {
@@ -86,22 +92,22 @@ export default function App() {
         if (pending.state !== returnedState) {
           throw new Error("OIDC state mismatch: possible login CSRF rejected.");
         }
-        const tokenResp = await exchangeIdpToken({
+        const tokenResp = await exchangeIdpAuthCode({
           idp_provider: pending.idpProvider,
-          idp_token: idToken,
           org_id: pending.orgId,
-          nonce: pending.nonce,
+          code: authCode,
           state: returnedState,
           code_verifier: pending.codeVerifier,
+          redirect_uri: pending.redirectUri,
         });
         sessionStorage.removeItem(PKCE_STORAGE_KEY);
-        window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
+        window.history.replaceState({}, document.title, window.location.pathname);
         const next = { ...getStoredSession(), token: tokenResp.access_token, userId: tokenResp.user_id, orgId: tokenResp.org_id };
         saveSession(next);
         setSession(next);
-        setUploadNotification("Federated OIDC authentication succeeded.");
+        setUploadNotification("Federated OIDC Authorization Code + PKCE sign-in succeeded.");
       } catch (err: any) {
-        setSessionError(err?.message || "OIDC token exchange failed.");
+        setSessionError(err?.message || "OIDC authorization code exchange failed.");
       } finally {
         setIsGettingToken(false);
       }
@@ -172,6 +178,7 @@ export default function App() {
     setIsGettingToken(true);
     setSessionError(null);
     try {
+      const redirectUri = window.location.origin + window.location.pathname;
       const pkce = await generatePkcePair();
       const nonceResp = await requestIdpNonce(session.orgId, idpProvider, pkce.state, pkce.codeChallenge);
       sessionStorage.setItem(
@@ -182,12 +189,13 @@ export default function App() {
           nonce: nonceResp.nonce,
           state: pkce.state,
           codeVerifier: pkce.codeVerifier,
+          redirectUri,
         })
       );
       const authUrl = buildOidcAuthorizeUrl({
         authorizeEndpoint: oidcAuthorizeUrl,
         clientId: oidcClientId,
-        redirectUri: window.location.origin + window.location.pathname,
+        redirectUri,
         state: pkce.state,
         nonce: nonceResp.nonce,
         codeChallenge: pkce.codeChallenge,
@@ -224,10 +232,16 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 font-sans">
-      {/* Production Integration Status Banner */}
-      <div className="bg-slate-900 text-slate-200 text-xs py-1.5 px-4 text-center font-medium flex items-center justify-center space-x-2 border-b border-slate-800">
-        <ShieldCheck className="w-4 h-4 text-emerald-400" />
-        <span>MyCA Production Workspace &mdash; 100% Product Scope Active across Inward Statutory, GSTR-3B &amp; Rule 88A Offset, Credit Builder, Scheme Navigator, and AI Copilot.</span>
+      {/* Integration & Sandbox Status Banner */}
+      <div className="bg-amber-950 text-amber-100 text-xs py-1.5 px-4 text-center font-medium flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-b border-amber-900">
+        <ShieldCheck className="w-4 h-4 text-amber-300" />
+        <span>
+          Mode: {demoEnabled ? "Development / Demo Auth Allowed" : "Staging / Production Guarded (Demo Auth Disabled)"}
+        </span>
+        <span>&bull;</span>
+        <span>Auth: {oidcAuthorizeUrl && oidcClientId ? "OIDC Auth Code + PKCE Configured" : "OIDC External Config Pending"}</span>
+        <span>&bull;</span>
+        <span>GSTN: GSP Sandbox Simulation Only (Live GSTN Transport Unavailable Pending Authorized Onboarding)</span>
       </div>
 
       {/* Header */}

@@ -543,6 +543,77 @@ def create_idp_login_nonce(
     }
 
 
+def preverify_idp_auth_transaction(
+    db: Session,
+    org_id: str,
+    idp_provider: str,
+    state: str,
+    code_verifier: str,
+    session_token: str,
+) -> str:
+    """
+    Verifies under PostgreSQL RLS that an active, unexpired OIDC login transaction
+    exists matching org_id, idp_provider, state, session_binding_hash, and PKCE S256
+    code_verifier BEFORE executing an outbound OIDC authorization code exchange.
+    Returns the bound transaction nonce without consuming it yet (consumed atomically
+    after cryptographic ID token validation).
+    """
+    if not state or not str(state).strip():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="MISSING_STATE: OIDC transaction state is required.")
+    if not code_verifier or not re.match(r"^[A-Za-z0-9_.~-]{43,128}$", str(code_verifier).strip()):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="INVALID_PKCE_VERIFIER: Invalid RFC 7636 code_verifier.")
+    if not session_token or not str(session_token).strip():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="MISSING_SESSION_COOKIE: Browser session cookie is required.")
+
+    clean_state = str(state).strip()
+    clean_verifier = str(code_verifier).strip()
+    provider_clean = (idp_provider or "").strip().lower()
+    computed_session_hash = hashlib.sha256(str(session_token).strip().encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(clean_verifier.encode("ascii")).digest()
+    computed_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+    set_tenant_context(db, org_id=org_id, user_id=None)
+    row = db.execute(
+        text(
+            """
+            SELECT nonce, state, code_challenge, session_binding_hash
+            FROM public.idp_authentication_nonces
+            WHERE org_id = :org_id
+              AND idp_provider = :idp_provider
+              AND state = :state
+              AND status = 'ACTIVE'
+              AND expires_at > NOW()
+            ORDER BY created_at DESC
+            LIMIT 1;
+            """
+        ),
+        {"org_id": org_id, "idp_provider": provider_clean, "state": clean_state},
+    ).fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="UNKNOWN_OR_EXPIRED_OIDC_TRANSACTION: No active OIDC transaction matches state and organization.",
+        )
+
+    db_nonce, db_state, db_challenge, db_sess_hash = row
+    if not db_sess_hash or not hmac.compare_digest(computed_session_hash, db_sess_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="SESSION_BINDING_MISMATCH: Authentication transaction does not match the initiating browser session.",
+        )
+    if not db_challenge or not hmac.compare_digest(computed_challenge, db_challenge):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="INVALID_PKCE_VERIFIER: PKCE code_verifier does not match transaction code_challenge.",
+        )
+    if not db_state or not hmac.compare_digest(clean_state, db_state):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="STATE_MISMATCH: OIDC transaction state mismatch.",
+        )
+    return str(db_nonce)
+
+
 def consume_idp_login_nonce(
     db: Session,
     nonce: str,

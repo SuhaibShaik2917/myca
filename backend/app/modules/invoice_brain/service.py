@@ -9,7 +9,11 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 import psycopg
 
-from app.modules.invoice_brain.storage import compute_stream_sha256_and_save, StorageError
+from app.modules.invoice_brain.storage import (
+    compute_stream_sha256_and_save,
+    delete_stored_document,
+    StorageError,
+)
 from app.modules.invoice_brain.ocr import extract_invoice_with_gemini
 from app.modules.invoice_brain.validator import validate_invoice_financials
 from app.schemas.invoice_brain import (
@@ -147,12 +151,11 @@ def upload_and_enqueue_invoice(
         session.flush()
 
     except Exception as e:
-        # Atomic storage cleanup: delete saved file if DB insert, enqueue, or constraint fails
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError:
-                pass
+        # Atomic storage cleanup: delete saved object (local or S3) if DB insert, enqueue, or constraint fails
+        try:
+            delete_stored_document(file_path, expected_org_id=org_id)
+        except Exception:
+            pass
 
         if isinstance(e, DuplicateDocumentError) or "uq_documents_org_sha256" in str(e) or "unique constraint" in str(e).lower():
             raise DuplicateDocumentError(f"Duplicate document detected (matches existing document SHA-256 {sha256_checksum})") from e

@@ -197,15 +197,11 @@ def validate_idp_token(
                 disc = default_jwks_client.resolve_discovery(
                     discovery_url,
                     require_https=is_prod_like,
+                    expected_issuer=idp_issuer,
                     ttl_seconds=ttl_seconds,
                     timeout_seconds=timeout_seconds,
                 )
                 resolved_jwks_url = disc["jwks_uri"]
-                if idp_issuer and disc.get("issuer") and disc["issuer"].lower() != idp_issuer.lower():
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail="IDP_INTEGRATION_UNAVAILABLE: OIDC discovery issuer does not match configured MYCA_IDP_ISSUER.",
-                    )
             assert resolved_jwks_url is not None
             jwk_meta = default_jwks_client.get_signing_key(
                 resolved_jwks_url,

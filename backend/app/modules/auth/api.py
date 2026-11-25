@@ -4,17 +4,20 @@ import os
 import uuid
 from typing import Optional, List
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request, Response, status, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.config import settings
+from app.core.jwks import JWKSUnavailableError, default_jwks_client, validate_jwks_endpoint_url
 from app.core.security import create_access_token
 from app.database import SessionLocal, verify_and_resolve_tenant_membership, set_tenant_context
-from app.modules.auth.idp_verifier import validate_idp_token
+from app.modules.auth.idp_verifier import validate_idp_token, _resolve_trust_settings
 from app.modules.auth.nonce_service import (
     create_idp_login_nonce,
     consume_idp_login_nonce,
+    preverify_idp_auth_transaction,
     schedule_rate_limit_cleanup_if_due,
 )
 
@@ -60,6 +63,15 @@ class IdpTokenExchangeRequest(BaseModel):
     state: str = Field(..., min_length=16, max_length=128, description="OIDC transaction state")
     code_verifier: str = Field(..., min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_.~-]{43,128}$", description="RFC 7636 PKCE code verifier (43-128 unreserved chars)")
     user_email: Optional[str] = None
+
+
+class IdpCodeExchangeRequest(BaseModel):
+    idp_provider: str
+    org_id: str
+    code: str = Field(..., min_length=4, max_length=2048, description="OIDC Authorization Code")
+    state: str = Field(..., min_length=16, max_length=128, description="OIDC transaction state")
+    code_verifier: str = Field(..., min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_.~-]{43,128}$", description="RFC 7636 PKCE code verifier (43-128 unreserved chars)")
+    redirect_uri: str = Field(..., min_length=8, max_length=512, description="Exact redirect_uri used in authorization request")
 
 
 def is_demo_token_allowed() -> bool:
@@ -305,21 +317,174 @@ def request_idp_login_nonce(
         db.close()
 
 
-@router.post("/idp-exchange", response_model=DemoTokenResponse)
-def exchange_idp_token(
-    payload: IdpTokenExchangeRequest,
+def _finalize_idp_login(
+    db,
+    *,
+    org_id: str,
+    idp_provider: str,
+    idp_token: str,
+    expected_nonce: Optional[str],
+    session_token: str,
+    state: str,
+    code_verifier: str,
+    env: str,
+    response: Response,
+    background_tasks: BackgroundTasks,
+) -> DemoTokenResponse:
+    """Shared OIDC token verification, atomic nonce consumption, and tenant membership resolution."""
+    verified_claims = validate_idp_token(
+        idp_provider,
+        idp_token,
+        env=env,
+        expected_nonce=expected_nonce,
+    )
+    verified_email = verified_claims["email"].strip().lower()
+    token_nonce = verified_claims.get("nonce")
+    if not token_nonce or not str(token_nonce).strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MISSING_IDP_NONCE: IdP token must contain an authentication transaction nonce claim.",
+        )
+
+    consume_idp_login_nonce(
+        db=db,
+        nonce=str(token_nonce).strip(),
+        org_id=org_id,
+        idp_provider=idp_provider,
+        email=verified_email,
+        session_token=session_token,
+        state=state,
+        code_verifier=code_verifier,
+    )
+    response.delete_cookie("myca_auth_session", path="/api/v1/auth")
+    set_tenant_context(db, org_id=org_id, user_id=None)
+
+    user_row = None
+    try:
+        user_row = db.execute(
+            text("SELECT id, email, membership_status FROM public.v_org_users WHERE LOWER(email) = :email;"),
+            {"email": verified_email},
+        ).fetchone()
+    except Exception as exc:
+        logger.debug("User lookup via v_org_users encountered exception: %s", exc)
+
+    if not user_row:
+        try:
+            g_row = db.execute(
+                text("SELECT id, email, is_active FROM public.global_users WHERE LOWER(email) = :email;"),
+                {"email": verified_email},
+            ).fetchone()
+            if g_row:
+                user_row = g_row
+        except Exception as exc:
+            logger.debug("User lookup via global_users encountered exception: %s", exc)
+
+    if not user_row:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"UNREGISTERED_IDP_USER: User with email '{verified_email}' is not registered in MyCA.",
+        )
+
+    user_id = str(user_row[0])
+    status_val = user_row[2]
+    is_active = status_val in (True, "active", "ACTIVE", "true")
+    if not is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="SUSPENDED_USER: User account is inactive or suspended.",
+        )
+
+    if not verify_and_resolve_tenant_membership(db, user_id, org_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="TENANT_MEMBERSHIP_REQUIRED: User does not possess active membership in the requested organization.",
+        )
+
+    schedule_rate_limit_cleanup_if_due(background_tasks)
+    token = create_access_token(subject=user_id, org_id=org_id)
+    return DemoTokenResponse(
+        access_token=token,
+        user_id=user_id,
+        org_id=org_id,
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+
+
+def _validate_and_resolve_code_exchange_endpoints(
+    redirect_uri: str,
+    env: str,
+) -> tuple[str, str, Optional[str]]:
+    """Validates redirect_uri allowlist and resolves HTTPS OIDC token_endpoint + client_id."""
+    is_prod_like = env in ("production", "staging")
+    try:
+        clean_redirect = validate_jwks_endpoint_url(redirect_uri, require_https=is_prod_like)
+    except JWKSUnavailableError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"INVALID_REDIRECT_URI: {exc}") from exc
+
+    allowed_redirects = list(getattr(settings, "MYCA_IDP_REDIRECT_URIS", []) or [])
+    env_redirects = os.getenv("MYCA_IDP_REDIRECT_URIS")
+    if env_redirects:
+        allowed_redirects = [u.strip() for u in env_redirects.split(",") if u.strip()]
+
+    if is_prod_like and not allowed_redirects:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="IDP_INTEGRATION_UNAVAILABLE: MYCA_IDP_REDIRECT_URIS allowlist must be configured in production/staging.",
+        )
+    if allowed_redirects and clean_redirect not in allowed_redirects:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="INVALID_REDIRECT_URI: Supplied redirect_uri is not in configured MYCA_IDP_REDIRECT_URIS allowlist.",
+        )
+
+    idp_issuer, idp_audience, _, _, discovery_url = _resolve_trust_settings()
+    token_url = (os.getenv("MYCA_IDP_TOKEN_URL") or getattr(settings, "MYCA_IDP_TOKEN_URL", None) or "").strip() or None
+
+    if not token_url and discovery_url:
+        try:
+            disc = default_jwks_client.resolve_discovery(
+                discovery_url,
+                require_https=is_prod_like,
+                expected_issuer=idp_issuer,
+                ttl_seconds=int(getattr(settings, "MYCA_IDP_JWKS_CACHE_TTL_SECONDS", 300) or 300),
+                timeout_seconds=float(getattr(settings, "MYCA_IDP_JWKS_TIMEOUT_SECONDS", 5.0) or 5.0),
+            )
+            token_url = disc.get("token_endpoint")
+        except JWKSUnavailableError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"IDP_INTEGRATION_UNAVAILABLE: Failed to resolve OIDC token_endpoint: {exc}",
+            ) from exc
+
+    if not token_url or not idp_audience:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="IDP_INTEGRATION_UNAVAILABLE: OIDC token_endpoint and client_id (MYCA_IDP_AUDIENCE) are required for authorization code exchange.",
+        )
+
+    try:
+        safe_token_url = validate_jwks_endpoint_url(token_url, require_https=is_prod_like)
+    except JWKSUnavailableError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"IDP_INTEGRATION_UNAVAILABLE: {exc}") from exc
+
+    client_secret = (os.getenv("MYCA_IDP_CLIENT_SECRET") or getattr(settings, "MYCA_IDP_CLIENT_SECRET", None) or "").strip() or None
+    return safe_token_url, idp_audience, client_secret
+
+
+@router.post("/idp-code-exchange", response_model=DemoTokenResponse)
+def exchange_idp_authorization_code(
+    payload: IdpCodeExchangeRequest,
     request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
 ) -> DemoTokenResponse:
     """
-    Production authenticated login flow via federated Identity Provider (IdP).
-    Rigorously validates IdP token signature, algorithm confusion defenses, issuer,
-    audience, expiration, and claims.
-    
-    Validates and atomically consumes single-use authentication transaction nonces
-    under PostgreSQL RLS, validating PKCE S256 and browser session binding to prevent
-    token replay, login CSRF, and cross-session transaction substitution.
+    Standards-compliant OIDC Authorization Code + PKCE (S256) exchange.
+    1. Verifies browser HttpOnly session cookie, state, and PKCE S256 verifier BEFORE calling IdP token_endpoint.
+    2. Validates redirect_uri against MYCA_IDP_REDIRECT_URIS.
+    3. Exchanges authorization code + code_verifier at the trusted IdP token_endpoint over HTTPS.
+    4. Cryptographically verifies returned id_token signature (via JWKS), issuer, audience, expiry, email_verified, and nonce.
+    5. Atomically consumes single-use nonce under PostgreSQL RLS and issues MyCA tenant-scoped access token.
     """
     try:
         uuid.UUID(payload.org_id)
@@ -329,26 +494,6 @@ def exchange_idp_token(
     raw_env = os.getenv("ENVIRONMENT") or getattr(settings, "ENVIRONMENT", "")
     env = str(raw_env).strip().lower() if raw_env else "development"
 
-    # Cryptographically validate the IdP token and its claims (fails closed on invalid/untrusted tokens)
-    verified_claims = validate_idp_token(
-        payload.idp_provider,
-        payload.idp_token,
-        env=env,
-        expected_nonce=payload.nonce,
-    )
-    
-    # Extract identity strictly from verified token claims (never from unauthenticated payload fields)
-    verified_email = verified_claims["email"].strip().lower()
-
-    # Extract and validate transaction nonce for replay protection
-    token_nonce = verified_claims.get("nonce")
-    if not token_nonce or not str(token_nonce).strip():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="MISSING_IDP_NONCE: IdP token must contain an authentication transaction nonce claim.",
-        )
-
-    # Resolve browser session token: strictly from HttpOnly cookie only (no headers or body fallback)
     session_token = request.cookies.get("myca_auth_session")
     if not session_token or not str(session_token).strip():
         raise HTTPException(
@@ -358,76 +503,126 @@ def exchange_idp_token(
 
     db = SessionLocal()
     try:
-        # Atomically consume the single-use nonce enforcing RLS, browser session binding, and PKCE S256
-        consume_idp_login_nonce(
+        expected_nonce = preverify_idp_auth_transaction(
             db=db,
-            nonce=str(token_nonce).strip(),
             org_id=payload.org_id,
             idp_provider=payload.idp_provider,
-            email=verified_email,
+            state=payload.state,
+            code_verifier=payload.code_verifier,
+            session_token=session_token,
+        )
+
+        token_url, client_id, client_secret = _validate_and_resolve_code_exchange_endpoints(
+            payload.redirect_uri, env
+        )
+
+        form_data = {
+            "grant_type": "authorization_code",
+            "code": payload.code,
+            "redirect_uri": payload.redirect_uri,
+            "client_id": client_id,
+            "code_verifier": payload.code_verifier,
+        }
+        if client_secret:
+            form_data["client_secret"] = client_secret
+
+        timeout_s = float(getattr(settings, "MYCA_IDP_JWKS_TIMEOUT_SECONDS", 5.0) or 5.0)
+        try:
+            with httpx.Client(timeout=timeout_s, follow_redirects=False) as client:
+                token_resp = client.post(
+                    token_url,
+                    data=form_data,
+                    headers={"Accept": "application/json"},
+                )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"IDP_TOKEN_ENDPOINT_UNAVAILABLE: Unable to reach IdP token endpoint: {exc}",
+            ) from exc
+
+        if token_resp.status_code >= 500:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"IDP_TOKEN_ENDPOINT_UNAVAILABLE: IdP returned HTTP {token_resp.status_code}.",
+            )
+        if token_resp.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"IDP_CODE_EXCHANGE_FAILED: IdP rejected authorization code (HTTP {token_resp.status_code}).",
+            )
+
+        try:
+            token_json = token_resp.json()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"INVALID_IDP_TOKEN_RESPONSE: Invalid JSON from IdP token endpoint: {exc}",
+            ) from exc
+
+        id_token = token_json.get("id_token") if isinstance(token_json, dict) else None
+        if not id_token or not isinstance(id_token, str):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="MISSING_ID_TOKEN: IdP token response omitted required OIDC 'id_token'.",
+            )
+
+        return _finalize_idp_login(
+            db,
+            org_id=payload.org_id,
+            idp_provider=payload.idp_provider,
+            idp_token=id_token,
+            expected_nonce=expected_nonce,
             session_token=session_token,
             state=payload.state,
             code_verifier=payload.code_verifier,
+            env=env,
+            response=response,
+            background_tasks=background_tasks,
         )
-
-        # Clear session cookie on successful transaction consumption
-        response.delete_cookie("myca_auth_session", path="/api/v1/auth")
-
-        # Set tenant org context so security_barrier view v_org_users allows reading org users
-        set_tenant_context(db, org_id=payload.org_id, user_id=None)
-
-        # Query user identity and membership via canonical secure view public.v_org_users
-        user_row = None
-        try:
-            user_row = db.execute(
-                text("SELECT id, email, membership_status FROM public.v_org_users WHERE LOWER(email) = :email;"),
-                {"email": verified_email},
-            ).fetchone()
-        except Exception as exc:
-            logger.debug("User lookup via v_org_users encountered exception: %s", exc)
-
-        if not user_row:
-            # Fallback for platform/global lookup if permitted
-            try:
-                g_row = db.execute(
-                    text("SELECT id, email, is_active FROM public.global_users WHERE LOWER(email) = :email;"),
-                    {"email": verified_email},
-                ).fetchone()
-                if g_row:
-                    user_row = g_row
-            except Exception as exc:
-                logger.debug("User lookup via global_users encountered exception: %s", exc)
-
-        if not user_row:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"UNREGISTERED_IDP_USER: User with email '{verified_email}' is not registered in MyCA.",
-            )
-
-        user_id = str(user_row[0])
-        status_val = user_row[2]
-        is_active = status_val in (True, "active", "ACTIVE", "true")
-        if not is_active:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="SUSPENDED_USER: User account is inactive or suspended.",
-            )
-
-        if not verify_and_resolve_tenant_membership(db, user_id, payload.org_id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="TENANT_MEMBERSHIP_REQUIRED: User does not possess active membership in the requested organization.",
-            )
     finally:
         db.close()
 
-    # Dispatch opportunistic rate-limit cleanup if interval has elapsed
-    schedule_rate_limit_cleanup_if_due(background_tasks)
 
-    token = create_access_token(subject=user_id, org_id=payload.org_id)
-    return DemoTokenResponse(
-        access_token=token,
-        user_id=user_id,
-        org_id=payload.org_id,
-        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-    )
+@router.post("/idp-exchange", response_model=DemoTokenResponse)
+def exchange_idp_token(
+    payload: IdpTokenExchangeRequest,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+) -> DemoTokenResponse:
+    """
+    Direct OIDC ID Token exchange endpoint (kept for existing API integration compatibility;
+    interactive browser clients use /idp-code-exchange with Authorization Code + PKCE).
+    """
+    try:
+        uuid.UUID(payload.org_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid org_id format")
+
+    raw_env = os.getenv("ENVIRONMENT") or getattr(settings, "ENVIRONMENT", "")
+    env = str(raw_env).strip().lower() if raw_env else "development"
+
+    session_token = request.cookies.get("myca_auth_session")
+    if not session_token or not str(session_token).strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MISSING_SESSION_COOKIE: Browser authentication requires myca_auth_session HttpOnly cookie.",
+        )
+
+    db = SessionLocal()
+    try:
+        return _finalize_idp_login(
+            db,
+            org_id=payload.org_id,
+            idp_provider=payload.idp_provider,
+            idp_token=payload.idp_token,
+            expected_nonce=payload.nonce,
+            session_token=session_token,
+            state=payload.state,
+            code_verifier=payload.code_verifier,
+            env=env,
+            response=response,
+            background_tasks=background_tasks,
+        )
+    finally:
+        db.close()
