@@ -44,6 +44,39 @@ def _sign_gstr3b_review_attestation(
     message = f"{org_id}:{filing_id}:{checker_id}:{new_status}:{nonce}".encode("utf-8")
     return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
 
+def _compute_gstr3b_payload_digest(t31_text: str, t4_text: str, offset_text: str) -> str:
+    return hashlib.sha256(f"{t31_text}:{t4_text}:{offset_text}".encode("utf-8")).hexdigest()
+
+
+def _sign_gstr3b_creation_attestation(
+    org_id: str,
+    filing_id: str,
+    reg_id: str,
+    tax_period: str,
+    maker_id: str,
+    payload_digest: str,
+    nonce: str,
+) -> str:
+    """Computes server-side HMAC-SHA256 attestation for GSTR-3B DRAFT creation/preparation."""
+    raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
+    derived_secret = hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
+    message = f"{org_id}:{filing_id}:{reg_id}:{tax_period}:{maker_id}:DRAFT:{payload_digest}:{nonce}".encode("utf-8")
+    return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
+
+
+def _sign_gstr3b_legacy_maker_claim(
+    org_id: str,
+    filing_id: str,
+    maker_id: str,
+    nonce: str,
+) -> str:
+    """Computes server-side HMAC-SHA256 attestation for one-time legacy NULL maker_id claim."""
+    raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
+    derived_secret = hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
+    message = f"{org_id}:{filing_id}:{maker_id}:LEGACY_MAKER_CLAIM:{nonce}".encode("utf-8")
+    return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
+
+
 def _sign_gstr3b_filing_attestation(
     org_id: str,
     filing_id: str,
@@ -323,53 +356,74 @@ def prepare_gstr3b_return(
         credit=t4.c_net_itc
     )
 
-    # 5. Upsert into public.gstr3b_filings
-    filing_id = str(uuid.uuid4())
+    # 5. Upsert into public.gstr3b_filings via restricted SECURITY DEFINER creation function
+    filing_id = str(existing_filing.id) if existing_filing else str(uuid.uuid4())
+    effective_maker_id = (
+        str(existing_filing.maker_id)
+        if (existing_filing and existing_filing.maker_id)
+        else user_id
+    )
+    if not effective_maker_id:
+        session.rollback()
+        raise GSTR3BServiceError("Authenticated maker_id is required to prepare a GSTR-3B return.")
+
     now_ts = datetime.now(timezone.utc)
 
     t31_dict = t31.model_dump(mode="json")
     t4_dict = t4.model_dump(mode="json")
     offset_dict = offset.model_dump(mode="json")
 
+    t31_text = json.dumps(t31_dict, sort_keys=True, separators=(",", ":"))
+    t4_text = json.dumps(t4_dict, sort_keys=True, separators=(",", ":"))
+    offset_text = json.dumps(offset_dict, sort_keys=True, separators=(",", ":"))
+    payload_digest = _compute_gstr3b_payload_digest(t31_text, t4_text, offset_text)
+    nonce = secrets.token_hex(24)
+    signature = _sign_gstr3b_creation_attestation(
+        org_id=str(org_id),
+        filing_id=filing_id,
+        reg_id=str(registration_id),
+        tax_period=tax_period,
+        maker_id=str(effective_maker_id),
+        payload_digest=payload_digest,
+        nonce=nonce,
+    )
+
     upsert_stmt = text("""
-        INSERT INTO public.gstr3b_filings (
-            id, org_id, registration_id, tax_period, filing_status,
-            table_3_1_data, table_4_data, offset_data, maker_id,
-            maker_remarks, revision_number, previous_snapshot, updated_at
-        ) VALUES (
-            :id, :org_id, :reg_id, :period, 'DRAFT',
-            CAST(:t31 AS jsonb), CAST(:t4 AS jsonb), CAST(:offset AS jsonb), :maker_id,
-            'Prepared by MyCA rules engine from reconciled registers.', :rev, CAST(:prev_snap AS jsonb), :now
-        )
-        ON CONFLICT (org_id, registration_id, tax_period)
-        DO UPDATE SET
-            table_3_1_data = EXCLUDED.table_3_1_data,
-            table_4_data = EXCLUDED.table_4_data,
-            offset_data = EXCLUDED.offset_data,
-            filing_status = 'DRAFT',
-            maker_id = COALESCE(public.gstr3b_filings.maker_id, EXCLUDED.maker_id),
-            maker_remarks = EXCLUDED.maker_remarks,
-            revision_number = EXCLUDED.revision_number,
-            previous_snapshot = EXCLUDED.previous_snapshot,
-            checker_id = NULL,
-            checker_remarks = NULL,
-            updated_at = EXCLUDED.updated_at
-        WHERE public.gstr3b_filings.filing_status IN ('DRAFT', 'REJECTED_BY_CHECKER')
-        RETURNING id, filing_status, revision_number;
+        SELECT id, filing_status, revision_number
+        FROM public.execute_gstr3b_prepare_upsert(
+            CAST(:id AS uuid),
+            CAST(:org_id AS uuid),
+            CAST(:reg_id AS uuid),
+            :period,
+            :t31_text,
+            :t4_text,
+            :offset_text,
+            CAST(:maker_id AS uuid),
+            'Prepared by MyCA rules engine from reconciled registers.',
+            :rev,
+            :prev_snap_text,
+            :now,
+            :digest,
+            :nonce,
+            :sig
+        );
     """)
 
     res = session.execute(upsert_stmt, {
         "id": filing_id,
-        "org_id": org_id,
-        "reg_id": registration_id,
+        "org_id": str(org_id),
+        "reg_id": str(registration_id),
         "period": tax_period,
-        "t31": json.dumps(t31_dict),
-        "t4": json.dumps(t4_dict),
-        "offset": json.dumps(offset_dict),
-        "maker_id": user_id,
+        "t31_text": t31_text,
+        "t4_text": t4_text,
+        "offset_text": offset_text,
+        "maker_id": str(effective_maker_id),
         "rev": target_revision,
-        "prev_snap": prev_snapshot_json,
-        "now": now_ts
+        "prev_snap_text": prev_snapshot_json,
+        "now": now_ts,
+        "digest": payload_digest,
+        "nonce": nonce,
+        "sig": signature,
     }).fetchone()
 
     if res is None:
@@ -419,7 +473,7 @@ def submit_gstr3b_for_review(
     """Maker submits prepared return for checker / CA review."""
     set_tenant_context(session, org_id=org_id, user_id=user_id)
     filing = session.execute(
-        text("SELECT id, filing_status FROM public.gstr3b_filings WHERE id = :id AND org_id = :org FOR UPDATE;"),
+        text("SELECT id, filing_status, maker_id FROM public.gstr3b_filings WHERE id = :id AND org_id = :org FOR UPDATE;"),
         {"id": filing_id, "org": org_id}
     ).fetchone()
     if not filing:
@@ -429,16 +483,34 @@ def submit_gstr3b_for_review(
         session.rollback()
         raise GSTR3BServiceError(f"Cannot submit return in status '{filing.filing_status}'. Must be DRAFT or REJECTED_BY_CHECKER.")
 
+    if filing.maker_id is None:
+        if not user_id:
+            session.rollback()
+            raise GSTR3BServiceError("Authenticated maker identity required to claim legacy GSTR-3B filing.")
+        claim_nonce = secrets.token_hex(24)
+        claim_sig = _sign_gstr3b_legacy_maker_claim(str(org_id), str(filing_id), str(user_id), claim_nonce)
+        session.execute(
+            text("""
+            SELECT public.claim_legacy_null_maker(
+                CAST(:org AS uuid),
+                CAST(:id AS uuid),
+                CAST(:uid AS uuid),
+                :nonce,
+                :sig
+            );
+            """),
+            {"org": str(org_id), "id": str(filing_id), "uid": str(user_id), "nonce": claim_nonce, "sig": claim_sig}
+        )
+
     session.execute(
         text("""
         UPDATE public.gstr3b_filings
         SET filing_status = 'SUBMITTED_FOR_REVIEW',
-            maker_id = COALESCE(maker_id, :uid),
             maker_remarks = :rem,
             updated_at = clock_timestamp()
         WHERE id = :id AND org_id = :org;
         """),
-        {"id": filing_id, "org": org_id, "uid": user_id, "rem": remarks or "Submitted for CA review."}
+        {"id": filing_id, "org": org_id, "rem": remarks or "Submitted for CA review."}
     )
     session.commit()
     return {"id": filing_id, "status": "SUBMITTED_FOR_REVIEW", "message": "Return successfully submitted for Checker / CA review."}

@@ -345,11 +345,10 @@ def audit_m1_m5_cross_tenant_isolation():
             VALUES (:id, :org_id, '2025-11-01', 50000, 'credit', 'sales', 'Alpha Client');
         """), {"id": fin_tx_id_a, "org_id": org_a})
 
-        filing_id_a = str(uuid.uuid4())
-        db.execute(text("""
-            INSERT INTO public.gstr3b_filings (id, org_id, registration_id, tax_period, filing_status, maker_id)
-            VALUES (:id, :org_id, :reg_id, '112025', 'DRAFT', :user_id);
-        """), {"id": filing_id_a, "org_id": org_a, "reg_id": reg_id_a, "user_id": user_a})
+        from app.modules.gstr3b.service import prepare_gstr3b_return
+        prep_a = prepare_gstr3b_return(db, org_a, reg_id_a, '112025', user_id=user_a)
+        filing_id_a = prep_a["id"]
+        set_tenant_context(db, org_id=org_a, user_id=user_a)
 
         summary_id_a = str(uuid.uuid4())
         db.execute(text("""
@@ -520,9 +519,14 @@ def audit_m1_m5_cross_tenant_isolation():
             # Phase 1: Prove positive INSERT succeeds under Tenant Alpha context
             set_tenant_context(db, org_id=org_a, user_id=user_a)
             alpha_params = param_gen(org_a)
-            sp_a = db.begin_nested()
-            db.execute(text(sql), alpha_params)
-            sp_a.commit()
+            if tbl == "gstr3b_filings":
+                prep_pos = prepare_gstr3b_return(db, org_a, reg_id_a, alpha_params["tax_period"], user_id=user_a)
+                alpha_params["id"] = prep_pos["id"]
+                set_tenant_context(db, org_id=org_a, user_id=user_a)
+            else:
+                sp_a = db.begin_nested()
+                db.execute(text(sql), alpha_params)
+                sp_a.commit()
             # Verify row actually exists in table
             pk_col = "nonce" if tbl == "idp_authentication_nonces" else "id"
             pk_val = alpha_params.get(pk_col)
