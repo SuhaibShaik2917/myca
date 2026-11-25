@@ -40,20 +40,36 @@ def compute_stream_sha256_and_save(
     file_stream,
     org_id: str,
     doc_id: str,
-    base_dir: str = "storage"
+    base_dir: Optional[str] = None
 ) -> Tuple[str, int, str, str]:
     """
     Streams file from input, validates magic bytes and size, computes SHA-256,
-    and writes to isolated path: {base_dir}/{org_id}/{hash_prefix}/{doc_id}.bin.
-    Returns: (file_path, file_size_bytes, sha256_hex, mime_type)
+    and writes to configured STORAGE_BACKEND ('local' or fail-closed 's3').
+    Returns: (storage_path_or_uri, file_size_bytes, sha256_hex, mime_type)
     """
+    from app.config import settings
+
+    backend_mode = (os.getenv("STORAGE_BACKEND") or getattr(settings, "STORAGE_BACKEND", "local") or "local").strip().lower()
+    if backend_mode == "s3":
+        bucket = (os.getenv("AWS_S3_BUCKET_NAME") or getattr(settings, "AWS_S3_BUCKET_NAME", None) or "").strip()
+        if not bucket:
+            raise StorageError("S3_STORAGE_UNAVAILABLE: AWS_S3_BUCKET_NAME must be configured when STORAGE_BACKEND=s3.")
+        try:
+            import boto3  # type: ignore
+        except ImportError as exc:
+            raise StorageError("S3_STORAGE_UNAVAILABLE: boto3 dependency is required for STORAGE_BACKEND=s3.") from exc
+    elif backend_mode != "local":
+        raise StorageError(f"UNSUPPORTED_STORAGE_BACKEND: '{backend_mode}'")
+
+    effective_base_dir = base_dir or (os.getenv("STORAGE_LOCAL_ROOT") or getattr(settings, "STORAGE_LOCAL_ROOT", "storage") or "storage")
+
     hasher = hashlib.sha256()
     total_bytes = 0
     header_bytes = bytearray()
     mime_type: Optional[str] = None
 
     # Temporary staging directory to prevent partial uploads on error
-    target_dir = os.path.join(base_dir, str(org_id))
+    target_dir = os.path.join(effective_base_dir, str(org_id))
     os.makedirs(target_dir, exist_ok=True)
     temp_path = os.path.join(target_dir, f"tmp_{doc_id}.bin")
 
@@ -83,7 +99,27 @@ def compute_stream_sha256_and_save(
 
         sha256_hex = hasher.hexdigest()
         hash_prefix = sha256_hex[:2]
-        final_dir = os.path.join(base_dir, str(org_id), hash_prefix)
+
+        if backend_mode == "s3":
+            s3_key = f"{org_id}/{hash_prefix}/{doc_id}.bin"
+            region = (os.getenv("AWS_REGION") or getattr(settings, "AWS_REGION", "ap-south-1") or "ap-south-1").strip()
+            kms_key = (os.getenv("AWS_S3_KMS_KEY_ID") or getattr(settings, "AWS_S3_KMS_KEY_ID", None) or "").strip()
+            put_kwargs: Dict[str, Any] = {
+                "Bucket": bucket,
+                "Key": s3_key,
+                "ContentType": mime_type,
+                "ServerSideEncryption": "aws:kms" if kms_key else "AES256",
+            }
+            if kms_key:
+                put_kwargs["SSEKMSKeyId"] = kms_key
+            s3_client = boto3.client("s3", region_name=region)
+            with open(temp_path, "rb") as f_in:
+                put_kwargs["Body"] = f_in
+                s3_client.put_object(**put_kwargs)
+            os.remove(temp_path)
+            return f"s3://{bucket}/{s3_key}", total_bytes, sha256_hex, mime_type
+
+        final_dir = os.path.join(effective_base_dir, str(org_id), hash_prefix)
         os.makedirs(final_dir, exist_ok=True)
         final_path = os.path.join(final_dir, f"{doc_id}.bin")
 

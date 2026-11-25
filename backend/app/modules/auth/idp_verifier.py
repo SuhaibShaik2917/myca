@@ -1,15 +1,20 @@
 import os
-import time
 from typing import Any, Dict, List, Optional, Set
 from fastapi import HTTPException, status
 from jose import jwt
 from jose.exceptions import JWTError, ExpiredSignatureError, JWTClaimsError
 from app.config import settings
+from app.core.jwks import (
+    JWKSKeyNotFoundError,
+    JWKSUnavailableError,
+    default_jwks_client,
+)
 
 ASYMMETRIC_ALGORITHMS: Set[str] = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
 DEFAULT_ALLOWED_PROVIDERS: Set[str] = {"google", "azuread", "okta", "auth0"}
 
-# Canonical exact trusted issuers per provider (strictly prohibiting loose substring matching)
+# Canonical exact trusted issuers per provider (strictly prohibiting loose substring matching).
+# Per-tenant providers (okta, auth0, tenant-scoped azuread) require explicit MYCA_IDP_ISSUER.
 PROVIDER_CANONICAL_ISSUERS: Dict[str, Set[str]] = {
     "google": {"https://accounts.google.com", "accounts.google.com"},
     "azuread": {
@@ -22,14 +27,31 @@ PROVIDER_CANONICAL_ISSUERS: Dict[str, Set[str]] = {
     },
 }
 
+TENANT_SCOPED_PROVIDERS: Set[str] = {"okta", "auth0"}
+
 # Strict approved signing algorithms per provider
 PROVIDER_ALLOWED_ALGORITHMS: Dict[str, Set[str]] = {
     "google": {"RS256"},
     "azuread": {"RS256"},
-    "okta": {"RS256"},
-    "auth0": {"RS256"},
+    "okta": {"RS256", "ES256"},
+    "auth0": {"RS256", "ES256"},
     "test-idp": {"RS256", "HS256"},
 }
+
+
+def _resolve_trust_settings():
+    idp_issuer = os.getenv("MYCA_IDP_ISSUER") or getattr(settings, "MYCA_IDP_ISSUER", None)
+    idp_audience = os.getenv("MYCA_IDP_AUDIENCE") or getattr(settings, "MYCA_IDP_AUDIENCE", None)
+    idp_pubkey = os.getenv("MYCA_IDP_PUBLIC_KEY") or getattr(settings, "MYCA_IDP_PUBLIC_KEY", None)
+    jwks_url = os.getenv("MYCA_IDP_JWKS_URL") or getattr(settings, "MYCA_IDP_JWKS_URL", None)
+    discovery_url = os.getenv("MYCA_IDP_DISCOVERY_URL") or getattr(settings, "MYCA_IDP_DISCOVERY_URL", None)
+    return (
+        idp_issuer.strip() if idp_issuer else None,
+        idp_audience.strip() if idp_audience else None,
+        idp_pubkey.strip() if idp_pubkey else None,
+        jwks_url.strip() if jwks_url else None,
+        discovery_url.strip() if discovery_url else None,
+    )
 
 
 def validate_idp_token(
@@ -44,9 +66,9 @@ def validate_idp_token(
     Enforces:
     1. Provider authorization against allowed providers and configured trust configuration.
     2. Strict token format (compact 3-part JWT).
-    3. Production fail-closed trust anchor check (issuer, audience, and public key).
+    3. Production fail-closed trust anchor check (issuer, audience, and public key / JWKS / OIDC discovery).
     4. Header inspection, algorithm verification, and algorithm confusion defense.
-    5. Cryptographic signature verification using trusted public key.
+    5. Cryptographic signature verification using pinned key or cached rotating JWKS.
     6. Token expiration, not-before freshness, issuer, audience claims.
     7. Exact provider-to-issuer binding check (strictly no loose substring matching).
     8. Strict email claim (non-empty string with '@'; no sub fallback).
@@ -59,11 +81,13 @@ def validate_idp_token(
     else:
         env = env.strip().lower()
 
+    is_prod_like = env in ("production", "staging")
+
     # 1. Provider validation
     provider_clean = (idp_provider or "").strip().lower()
     allowed_providers = set(getattr(settings, "MYCA_IDP_ALLOWED_PROVIDERS", DEFAULT_ALLOWED_PROVIDERS))
     allowed_providers = {p.lower() for p in allowed_providers}
-    if env in ("development", "test"):
+    if not is_prod_like:
         allowed_providers.add("test-idp")
 
     if not provider_clean or provider_clean not in allowed_providers:
@@ -88,15 +112,19 @@ def validate_idp_token(
         )
 
     # 3. Resolve Trust Anchors & Production Fail-Closed Check
-    idp_issuer = os.getenv("MYCA_IDP_ISSUER") or getattr(settings, "MYCA_IDP_ISSUER", None)
-    idp_audience = os.getenv("MYCA_IDP_AUDIENCE") or getattr(settings, "MYCA_IDP_AUDIENCE", None)
-    idp_pubkey = os.getenv("MYCA_IDP_PUBLIC_KEY") or getattr(settings, "MYCA_IDP_PUBLIC_KEY", None)
+    idp_issuer, idp_audience, idp_pubkey, jwks_url, discovery_url = _resolve_trust_settings()
+    has_key_source = bool(idp_pubkey or jwks_url or discovery_url)
 
-    if env in ("production", "staging"):
-        if not (idp_issuer and idp_pubkey and idp_audience):
+    if is_prod_like:
+        if not (idp_issuer and idp_audience and has_key_source):
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="IDP_INTEGRATION_UNAVAILABLE: External Identity Provider trust anchor (issuer, audience, and public key) is not fully configured in this environment.",
+                detail="IDP_INTEGRATION_UNAVAILABLE: External Identity Provider trust anchor (issuer, audience, and public key or JWKS/discovery URL) is not fully configured in this environment.",
+            )
+        if provider_clean in TENANT_SCOPED_PROVIDERS and not idp_issuer.lower().startswith("https://"):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"IDP_INTEGRATION_UNAVAILABLE: Provider '{provider_clean}' requires an explicit https:// MYCA_IDP_ISSUER in {env}.",
             )
 
     # 4. Header inspection & algorithm confusion defense
@@ -117,24 +145,21 @@ def validate_idp_token(
     alg_upper = alg.strip().upper()
 
     # Defense against JWT Algorithm Confusion attacks (RFC 8725)
-    # Never allow symmetric algorithms (HS256/384/512) when validating against public keys
-    # Never allow symmetric algorithms in production or staging environments
     if alg_upper.startswith("HS"):
-        if env in ("production", "staging"):
+        if is_prod_like:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"ALGORITHM_CONFUSION_REJECTED: Symmetric algorithm '{alg_upper}' is strictly prohibited in {env} environments. Asymmetric signatures (RS256/ES256) are required.",
             )
-        # Even in local/test, if a public key is configured, symmetric algorithm is rejected
-        if idp_pubkey and "PUBLIC KEY" in str(idp_pubkey):
+        if (idp_pubkey and "PUBLIC KEY" in str(idp_pubkey)) or jwks_url or discovery_url:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"ALGORITHM_CONFUSION_REJECTED: Token specifies symmetric algorithm '{alg_upper}' but asymmetric public key is configured as trust anchor.",
+                detail=f"ALGORITHM_CONFUSION_REJECTED: Token specifies symmetric algorithm '{alg_upper}' but asymmetric public key/JWKS is configured as trust anchor.",
             )
 
     # Enforce strict provider-approved signing algorithms
     allowed_provider_algs = set(PROVIDER_ALLOWED_ALGORITHMS.get(provider_clean, {"RS256"}))
-    if env in ("development", "test") and not (idp_pubkey and "PUBLIC KEY" in str(idp_pubkey)):
+    if not is_prod_like and not ((idp_pubkey and "PUBLIC KEY" in str(idp_pubkey)) or jwks_url or discovery_url):
         allowed_provider_algs.add("HS256")
     if alg_upper not in allowed_provider_algs:
         raise HTTPException(
@@ -142,15 +167,14 @@ def validate_idp_token(
             detail=f"ALGORITHM_NOT_PERMITTED: Algorithm '{alg_upper}' is not permitted for provider '{idp_provider}'. Allowed: {sorted(list(allowed_provider_algs))}",
         )
 
-    # In production/staging, only permitted asymmetric algorithms are allowed
     allowed_algs = set(getattr(settings, "MYCA_IDP_ALLOWED_ALGORITHMS", list(ASYMMETRIC_ALGORITHMS)))
-    if env in ("production", "staging") and alg_upper not in allowed_algs:
+    if is_prod_like and alg_upper not in allowed_algs:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"ASYMMETRIC_ALGORITHM_REQUIRED: Algorithm '{alg_upper}' is not in approved asymmetric algorithms: {sorted(list(allowed_algs))}",
         )
 
-    # Key ID check (if configured)
+    # Key ID check (if pinned)
     expected_kid = os.getenv("MYCA_IDP_KEY_ID") or getattr(settings, "MYCA_IDP_KEY_ID", None)
     token_kid = header.get("kid")
     if expected_kid:
@@ -160,13 +184,59 @@ def validate_idp_token(
                 detail=f"UNTRUSTED_KEY_ID: Token key ID '{token_kid}' does not match trusted key ID '{expected_kid}'.",
             )
 
-    # 5. Resolve verification key and allowed algorithms for decoding
+    # 5. Resolve verification key (JWKS / OIDC Discovery takes precedence when configured without pinned PEM, or when pubkey is absent)
     verification_key: Optional[str] = None
     decoding_algorithms: List[str] = [alg_upper]
+    ttl_seconds = int(getattr(settings, "MYCA_IDP_JWKS_CACHE_TTL_SECONDS", 300) or 300)
+    timeout_seconds = float(getattr(settings, "MYCA_IDP_JWKS_TIMEOUT_SECONDS", 5.0) or 5.0)
 
-    if idp_pubkey:
+    if jwks_url or discovery_url:
+        try:
+            resolved_jwks_url = jwks_url
+            if not resolved_jwks_url and discovery_url:
+                disc = default_jwks_client.resolve_discovery(
+                    discovery_url,
+                    require_https=is_prod_like,
+                    ttl_seconds=ttl_seconds,
+                    timeout_seconds=timeout_seconds,
+                )
+                resolved_jwks_url = disc["jwks_uri"]
+                if idp_issuer and disc.get("issuer") and disc["issuer"].lower() != idp_issuer.lower():
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="IDP_INTEGRATION_UNAVAILABLE: OIDC discovery issuer does not match configured MYCA_IDP_ISSUER.",
+                    )
+            assert resolved_jwks_url is not None
+            jwk_meta = default_jwks_client.get_signing_key(
+                resolved_jwks_url,
+                kid=token_kid,
+                require_https=is_prod_like,
+                ttl_seconds=ttl_seconds,
+                timeout_seconds=timeout_seconds,
+            )
+            if jwk_meta.get("alg") and jwk_meta["alg"] != alg_upper:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=f"ALGORITHM_MISMATCH: Token algorithm '{alg_upper}' does not match JWKS key algorithm '{jwk_meta['alg']}'.",
+                )
+            verification_key = jwk_meta["key"]
+        except HTTPException:
+            raise
+        except JWKSKeyNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"UNTRUSTED_KEY_ID: {exc}",
+            ) from exc
+        except JWKSUnavailableError as exc:
+            if not idp_pubkey:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"IDP_INTEGRATION_UNAVAILABLE: Unable to retrieve IdP JWKS keys: {exc}",
+                ) from exc
+            verification_key = idp_pubkey
+    elif idp_pubkey:
         verification_key = idp_pubkey
-    elif env in ("development", "test"):
+    elif not is_prod_like:
         if alg_upper == "HS256":
             verification_key = getattr(settings, "SECRET_KEY", "dev-insecure-secret-key-replace-in-production-with-min-32-chars")
         else:
@@ -232,7 +302,6 @@ def validate_idp_token(
     token_iss = str(claims.get("iss", "")).strip().lower()
     if provider_clean in PROVIDER_CANONICAL_ISSUERS:
         canonical_issuers = {iss.lower() for iss in PROVIDER_CANONICAL_ISSUERS[provider_clean]}
-        # Also allow explicitly configured issuer if set
         if idp_issuer:
             canonical_issuers.add(idp_issuer.strip().lower())
         if token_iss not in canonical_issuers:
@@ -246,6 +315,11 @@ def validate_idp_token(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"PROVIDER_ISSUER_MISMATCH: Token issuer '{claims.get('iss')}' does not match configured issuer '{idp_issuer}'.",
             )
+    elif is_prod_like:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="IDP_INTEGRATION_UNAVAILABLE: Configured provider requires explicit MYCA_IDP_ISSUER.",
+        )
 
     # 8. Strict Email Claim Check (Require actual email claim; do not use sub as email)
     if "email" not in claims or claims.get("email") is None:

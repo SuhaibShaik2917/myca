@@ -16,7 +16,8 @@ from app.modules.gstr3b.schemas import (
     OffsetResult, GSTR3BStatusResponse, GSTR3BFilingResponse
 )
 from app.modules.gstr3b.offset_engine import compute_statutory_tax_offset
-from app.modules.gstr3b.gsp_sandbox import simulate_gsp_gstn_filing, GSPSandboxFilingError
+from app.modules.gstr3b.gsp_sandbox import GSPSandboxFilingError
+from app.modules.gstr3b.gsp_client import dispatch_gstr3b_filing, GSPIntegrationUnavailableError
 from app.modules.reconciliation.gstr3b_itc import generate_gstr3b_table4_summary
 from app.database import set_tenant_context
 
@@ -731,7 +732,7 @@ def file_gstr3b_to_gsp_sandbox(
     }
 
     try:
-        arn, cin, filing_date_iso, payload_hash = simulate_gsp_gstn_filing(
+        arn, cin, filing_date_iso, payload_hash, is_live_portal_filing = dispatch_gstr3b_filing(
             gstin=filing.gstin,
             tax_period=filing.tax_period,
             payload_dict=payload_dict,
@@ -816,7 +817,7 @@ def file_gstr3b_to_gsp_sandbox(
         offset=OffsetResult.model_validate(filing.offset_data),
         maker_remarks=filing.maker_remarks,
         checker_remarks=filing.checker_remarks,
-        is_live_portal_filing=False,
+        is_live_portal_filing=is_live_portal_filing,
         disclaimer=GSTR3B_STATUTORY_DISCLAIMER
     )
 

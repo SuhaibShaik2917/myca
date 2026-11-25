@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -8,8 +9,9 @@ vendor_dir = Path(__file__).resolve().parent.parent / "vendor"
 if vendor_dir.exists() and str(vendor_dir) not in sys.path:
     sys.path.insert(0, str(vendor_dir))
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from app.config import settings
 from app.modules.auth.api import router as auth_router
 from app.modules.auth.nonce_service import run_periodic_rate_limit_cleanup
@@ -79,6 +81,16 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept", "X-User-Id", "X-Org-Id"],
 )
 
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
 # Mount Routers
 app.include_router(auth_router, prefix=settings.API_V1_STR)
 app.include_router(invoice_brain_router, prefix=settings.API_V1_STR)
@@ -96,6 +108,35 @@ def health_check():
         "version": settings.VERSION,
         "environment": settings.ENVIRONMENT
     }
+
+
+@app.get("/ready")
+def readiness_check():
+    from app.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1;")).scalar()
+        alembic_rev = db.execute(text("SELECT version_num FROM alembic_version LIMIT 1;")).scalar()
+        if not alembic_rev:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="DATABASE_NOT_MIGRATED: alembic_version missing.",
+            )
+        return {
+            "status": "ready",
+            "environment": settings.ENVIRONMENT,
+            "alembic_revision": str(alembic_rev),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"DEPENDENCY_UNREADY: PostgreSQL readiness check failed: {exc}",
+        ) from exc
+    finally:
+        db.close()
 
 @app.get("/")
 def root():

@@ -85,6 +85,10 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
   return (await response.json()) as T;
 }
 
+export function isDemoAuthEnabled(): boolean {
+  return Boolean(env.DEV || String(env.VITE_ENABLE_DEMO_AUTH ?? "").toLowerCase() === "true");
+}
+
 export interface DemoTokenResponse {
   access_token: string;
   token_type: string;
@@ -94,6 +98,9 @@ export interface DemoTokenResponse {
 }
 
 export async function requestDemoToken(userId: string, orgId: string): Promise<DemoTokenResponse> {
+  if (!isDemoAuthEnabled()) {
+    throw new Error("Demo authentication is disabled in production builds. Use federated OIDC IdP sign-in.");
+  }
   const response = await fetch(`${API_BASE_URL}/api/v1/auth/demo-token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -103,6 +110,102 @@ export async function requestDemoToken(userId: string, orgId: string): Promise<D
     throw new Error(await parseError(response));
   }
   return (await response.json()) as DemoTokenResponse;
+}
+
+export interface IdpNonceResponse {
+  nonce: string;
+  expires_in: number;
+  org_id: string;
+  idp_provider: string;
+  state: string;
+  code_challenge: string;
+}
+
+function toBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export async function generatePkcePair(): Promise<{ codeVerifier: string; codeChallenge: string; state: string }> {
+  const verifierBytes = new Uint8Array(48);
+  crypto.getRandomValues(verifierBytes);
+  const codeVerifier = toBase64Url(verifierBytes);
+
+  const stateBytes = new Uint8Array(24);
+  crypto.getRandomValues(stateBytes);
+  const state = toBase64Url(stateBytes);
+
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier));
+  const codeChallenge = toBase64Url(new Uint8Array(digest));
+  return { codeVerifier, codeChallenge, state };
+}
+
+export async function requestIdpNonce(
+  orgId: string,
+  idpProvider: string,
+  state: string,
+  codeChallenge: string,
+): Promise<IdpNonceResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/auth/idp-nonce`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      org_id: orgId,
+      idp_provider: idpProvider,
+      state,
+      code_challenge: codeChallenge,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as IdpNonceResponse;
+}
+
+export async function exchangeIdpToken(payload: {
+  idp_provider: string;
+  idp_token: string;
+  org_id: string;
+  nonce?: string;
+  state: string;
+  code_verifier: string;
+}): Promise<DemoTokenResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/auth/idp-exchange`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as DemoTokenResponse;
+}
+
+export function buildOidcAuthorizeUrl(params: {
+  authorizeEndpoint: string;
+  clientId: string;
+  redirectUri: string;
+  state: string;
+  nonce: string;
+  codeChallenge: string;
+  scope?: string;
+}): string {
+  const url = new URL(params.authorizeEndpoint);
+  url.searchParams.set("response_type", "id_token");
+  url.searchParams.set("response_mode", "fragment");
+  url.searchParams.set("client_id", params.clientId);
+  url.searchParams.set("redirect_uri", params.redirectUri);
+  url.searchParams.set("scope", params.scope ?? "openid email profile");
+  url.searchParams.set("state", params.state);
+  url.searchParams.set("nonce", params.nonce);
+  url.searchParams.set("code_challenge", params.codeChallenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  return url.toString();
 }
 
 export interface PurchaseDocumentApi {
@@ -203,8 +306,8 @@ export function getItcLedgerSummary(): Promise<ItcLedgerSummary> {
 // -------------------------------------------------------------
 export interface Gstr3bFilingResponse {
   filing_id: string;
-  org_id: string;
-  registration_id: string;
+  org_id?: string;
+  registration_id?: string;
   tax_period: string;
   filing_status: string;
   table_3_1: any;
@@ -213,30 +316,68 @@ export interface Gstr3bFilingResponse {
   arn?: string | null;
   cin?: string | null;
   filing_date?: string | null;
-  created_at: string;
-  message: string;
+  created_at?: string;
+  is_live_portal_filing?: boolean;
+  disclaimer?: string;
+  message?: string;
 }
 
-export function prepareGstr3b(registrationId: string, taxPeriod: string): Promise<Gstr3bFilingResponse> {
-  return apiFetch<Gstr3bFilingResponse>("/api/v1/gstr3b/prepare", {
+function normalizeGstr3bFiling(raw: any): Gstr3bFilingResponse {
+  return {
+    ...raw,
+    filing_id: raw.filing_id ?? raw.id,
+    filing_status: raw.filing_status ?? raw.status,
+    offset_result: raw.offset_result ?? raw.offset,
+    is_live_portal_filing: Boolean(raw.is_live_portal_filing),
+  };
+}
+
+export async function prepareGstr3b(registrationId: string, taxPeriod: string): Promise<Gstr3bFilingResponse> {
+  const raw = await apiFetch<any>("/api/v1/gstr3b/prepare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ registration_id: registrationId, tax_period: taxPeriod }),
   });
+  return normalizeGstr3bFiling(raw);
 }
 
-export function reviewGstr3b(filingId: string, action: string, remarks?: string): Promise<Gstr3bFilingResponse> {
-  return apiFetch<Gstr3bFilingResponse>(`/api/v1/gstr3b/${filingId}/review`, {
+export async function getGstr3bStatus(registrationId: string, taxPeriod: string): Promise<Gstr3bFilingResponse> {
+  const params = new URLSearchParams({
+    registration_id: registrationId,
+    tax_period: taxPeriod,
+  });
+  const raw = await apiFetch<any>(`/api/v1/gstr3b/status?${params.toString()}`);
+  return normalizeGstr3bFiling(raw);
+}
+
+export function submitGstr3bForReview(filingId: string, remarks?: string): Promise<{ id: string; status: string; message: string }> {
+  return apiFetch<{ id: string; status: string; message: string }>(`/api/v1/gstr3b/${filingId}/submit-review`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, remarks }),
+    body: JSON.stringify({ remarks: remarks || "Submitted for CA / Checker statutory review." }),
   });
 }
 
-export function fileGstr3bSandbox(filingId: string): Promise<Gstr3bFilingResponse> {
-  return apiFetch<Gstr3bFilingResponse>(`/api/v1/gstr3b/${filingId}/file-sandbox`, {
+export function reviewGstr3b(
+  filingId: string,
+  decision: "APPROVED" | "REJECTED",
+  remarks: string,
+): Promise<{ id: string; status: string; decision: string; remarks: string }> {
+  return apiFetch<{ id: string; status: string; decision: string; remarks: string }>(
+    `/api/v1/gstr3b/${filingId}/review-decision`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision, remarks }),
+    },
+  );
+}
+
+export async function fileGstr3bSandbox(filingId: string): Promise<Gstr3bFilingResponse> {
+  const raw = await apiFetch<any>(`/api/v1/gstr3b/${filingId}/file`, {
     method: "POST",
   });
+  return normalizeGstr3bFiling(raw);
 }
 
 // -------------------------------------------------------------
@@ -458,6 +599,23 @@ export function promoteInvoiceToPurchase(invoiceId: string): Promise<any> {
   });
 }
 
-export function listInvoices(): Promise<any[]> {
-  return apiFetch<any[]>("/api/v1/invoices/");
+export function listInvoices(statusFilter?: string): Promise<any[]> {
+  const qs = statusFilter ? `?status=${encodeURIComponent(statusFilter)}` : "";
+  return apiFetch<any[]>(`/api/v1/invoices${qs}`);
+}
+
+export function uploadOutwardInvoice(profileId: string, file: File): Promise<any> {
+  const form = new FormData();
+  form.append("profile_id", profileId);
+  form.append("file", file);
+  return apiFetch<any>("/api/v1/invoices/upload", {
+    method: "POST",
+    body: form,
+  });
+}
+
+export function approveOutwardInvoice(invoiceId: string): Promise<any> {
+  return apiFetch<any>(`/api/v1/invoices/${invoiceId}/approve`, {
+    method: "POST",
+  });
 }

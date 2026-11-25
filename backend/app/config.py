@@ -21,8 +21,26 @@ class Settings(BaseSettings):
     MYCA_IDP_AUDIENCE: Optional[str] = None
     MYCA_IDP_PUBLIC_KEY: Optional[str] = None
     MYCA_IDP_KEY_ID: Optional[str] = None
+    MYCA_IDP_JWKS_URL: Optional[str] = None
+    MYCA_IDP_DISCOVERY_URL: Optional[str] = None
+    MYCA_IDP_JWKS_CACHE_TTL_SECONDS: int = 300
+    MYCA_IDP_JWKS_TIMEOUT_SECONDS: float = 5.0
     MYCA_IDP_ALLOWED_PROVIDERS: List[str] = ["google", "azuread", "okta", "auth0"]
     MYCA_IDP_ALLOWED_ALGORITHMS: List[str] = ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"]
+
+    # GSP / GSTN Gateway Settings (Sandbox by default; live filing fails closed without credentials)
+    GSP_MODE: str = "sandbox"
+    GSTN_GSP_BASE_URL: Optional[str] = None
+    GSTN_GSP_CLIENT_ID: Optional[str] = None
+    GSTN_GSP_CLIENT_SECRET: Optional[str] = None
+    GSTN_GSP_TIMEOUT_SECONDS: float = 15.0
+
+    # Document Storage Settings
+    STORAGE_BACKEND: str = "local"
+    STORAGE_LOCAL_ROOT: str = "storage"
+    AWS_S3_BUCKET_NAME: Optional[str] = None
+    AWS_REGION: str = "ap-south-1"
+    AWS_S3_KMS_KEY_ID: Optional[str] = None
     
     # Database (Application runtime uses least-privilege app_service_user)
     DATABASE_URL: str = "postgresql+psycopg://app_service_user:secret@localhost:5432/myca"
@@ -108,6 +126,37 @@ class Settings(BaseSettings):
                     "in production and staging to prevent JWT algorithm confusion attacks. Use asymmetric algorithms (RS256, ES256, etc.)."
                 )
         return v
+
+    @field_validator("MYCA_IDP_JWKS_URL", "MYCA_IDP_DISCOVERY_URL")
+    @classmethod
+    def validate_idp_urls(cls, v, info):
+        if v is None or not str(v).strip():
+            return None
+        cleaned = str(v).strip()
+        data_env = info.data.get("ENVIRONMENT") if hasattr(info, "data") else None
+        raw_env = data_env or os.getenv("ENVIRONMENT")
+        env_norm = str(raw_env).strip().lower() if raw_env else "development"
+        if env_norm in ("production", "staging") and not cleaned.lower().startswith("https://"):
+            raise ValueError(
+                "CRITICAL SECURITY ERROR: MYCA_IDP_JWKS_URL and MYCA_IDP_DISCOVERY_URL must use https:// in production/staging."
+            )
+        return cleaned
+
+    @field_validator("GSP_MODE")
+    @classmethod
+    def validate_gsp_mode(cls, v):
+        norm = str(v or "sandbox").strip().lower()
+        if norm not in ("sandbox", "live"):
+            raise ValueError("GSP_MODE must be 'sandbox' or 'live'.")
+        return norm
+
+    @field_validator("STORAGE_BACKEND")
+    @classmethod
+    def validate_storage_backend(cls, v):
+        norm = str(v or "local").strip().lower()
+        if norm not in ("local", "s3"):
+            raise ValueError("STORAGE_BACKEND must be 'local' or 's3'.")
+        return norm
     
     @field_validator("SECRET_KEY")
     @classmethod

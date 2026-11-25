@@ -56,7 +56,11 @@ docker compose exec -T db pg_restore -U postgres -d myca -v /var/lib/postgresql/
 4. Verify migration head matches Alembic version table:
    ```bash
    docker compose exec db psql -U postgres -d myca -c "SELECT version_num FROM alembic_version;"
-   # Expected head: 0020_m4_m5_grants_and_policies
+   # Expected head: 0039_gstr3b_legacy_claim_meta
+   ```
+5. Verify API readiness (`/ready` probes PostgreSQL + Alembic version; `/health` is process liveness only):
+   ```bash
+   curl -fsS http://localhost:8000/ready
    ```
 
 ---

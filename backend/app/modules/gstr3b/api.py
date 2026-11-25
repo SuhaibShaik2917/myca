@@ -9,7 +9,8 @@ from app.modules.gstr3b.schemas import (
 )
 from app.modules.gstr3b.service import (
     prepare_gstr3b_return, submit_gstr3b_for_review, review_gstr3b_decision,
-    file_gstr3b_to_gsp_sandbox, get_gstr3b_status, get_gstr3b_revision_history, GSTR3BServiceError
+    file_gstr3b_to_gsp_sandbox, get_gstr3b_status, get_gstr3b_revision_history,
+    GSTR3BServiceError, GSPIntegrationUnavailableError,
 )
 
 router = APIRouter(prefix="/gstr3b", tags=["Milestone 3: GSTR-3B Filing & Offset Engine"])
@@ -36,6 +37,9 @@ def prepare_return_endpoint(
             snapshot_id=payload.snapshot_id
         )
         return res
+    except GSPIntegrationUnavailableError as e:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=str(e))
     except GSTR3BServiceError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -87,6 +91,9 @@ def submit_for_review_endpoint(
             user_id=effective_user,
             remarks=payload.remarks
         )
+    except GSPIntegrationUnavailableError as e:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=str(e))
     except GSTR3BServiceError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -115,6 +122,9 @@ def review_decision_endpoint(
             decision=payload.decision,
             remarks=payload.remarks
         )
+    except GSPIntegrationUnavailableError as e:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=str(e))
     except GSTR3BServiceError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -142,6 +152,9 @@ def file_to_gsp_sandbox_endpoint(
             user_id=effective_user
         )
         return res
+    except GSPIntegrationUnavailableError as e:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=str(e))
     except GSTR3BServiceError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timezone
 from typing import List, Optional
+from app.config import settings
 from app.modules.ai_assistant.schemas import (
     ChatMessageIn, ChatResponseOut, GroundingContextSummary
 )
@@ -145,7 +146,7 @@ def answer_ai_query(
             system_prompt = build_system_prompt(ctx)
             contents = [f"{m.role.upper()}: {m.content}" for m in messages]
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=settings.GEMINI_MODEL,
                 contents="\n".join(contents),
                 config={"system_instruction": system_prompt}
             )

@@ -27,6 +27,7 @@ from datetime import datetime, timezone, timedelta, date
 from typing import Dict, Any, Optional, Tuple
 from jose import jwt, jwk, JWTError
 from sqlalchemy import text
+from app.core.jwks import JWKSKeyNotFoundError, JWKSUnavailableError, default_jwks_client
 
 # Configured trusted ICAI gateway parameters
 OFFICIAL_ICAI_GATEWAY_ISSUER = "https://gateway.icai.org"
@@ -120,8 +121,10 @@ def load_official_icai_trust_store() -> Dict[str, Dict[str, Any]]:
 
 def is_official_icai_gateway_configured() -> bool:
     """
-    Checks if an official production ICAI trust anchor is configured and valid.
+    Checks if an official production ICAI trust anchor (local JWKS, PEM key, or remote JWKS URL) is configured.
     """
+    if os.environ.get("ICAI_GATEWAY_JWKS_URL", "").strip():
+        return True
     registry = load_official_icai_trust_store()
     return len(registry) > 0
 
@@ -235,6 +238,31 @@ def verify_icai_gateway_signed_response(
     if not trusted_key_meta:
         official_store = load_official_icai_trust_store()
         trusted_key_meta = official_store.get(kid)
+
+    if not trusted_key_meta:
+        jwks_url = os.environ.get("ICAI_GATEWAY_JWKS_URL", "").strip()
+        if jwks_url:
+            is_prod_like = env not in ("test", "testing", "development")
+            try:
+                jwk_meta = default_jwks_client.get_signing_key(
+                    jwks_url,
+                    kid=kid,
+                    require_https=is_prod_like,
+                )
+                trusted_key_meta = {
+                    "kid": jwk_meta.get("kid") or kid,
+                    "key": jwk_meta["key"],
+                    "algorithm": jwk_meta.get("alg") or alg.upper(),
+                    "issuer": OFFICIAL_ICAI_GATEWAY_ISSUER,
+                    "valid_from": datetime(2025, 1, 1, tzinfo=timezone.utc),
+                    "valid_until": datetime(2035, 1, 1, tzinfo=timezone.utc),
+                    "is_revoked": False,
+                    "is_test_key": False,
+                }
+            except JWKSKeyNotFoundError:
+                return False, f"UNKNOWN_KEY_ID: Key identifier '{kid}' is not recognized in the trusted gateway JWKS.", {}
+            except JWKSUnavailableError as exc:
+                return False, f"TRUST_ANCHOR_UNAVAILABLE: Unable to retrieve official ICAI JWKS: {exc}", {}
 
     if not trusted_key_meta:
         if not is_official_icai_gateway_configured() and env not in ("test", "testing", "development"):

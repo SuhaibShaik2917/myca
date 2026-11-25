@@ -31,7 +31,8 @@ def generate_cin(bank_code: str = "HDFC", amount_cents: int = 0) -> str:
     14-digit CPIN / sequence + 3-digit bank code + Date DDMMYYYY.
     """
     ts = datetime.now(timezone.utc).strftime("%d%m%Y")
-    seq = str(abs(hash(f"{bank_code}_{ts}_{amount_cents}")) % 100000000000000).zfill(14)
+    digest_int = int(hashlib.sha256(f"{bank_code}_{ts}_{amount_cents}".encode("utf-8")).hexdigest()[:12], 16)
+    seq = str(digest_int % 100000000000000).zfill(14)
     return f"{seq}{bank_code}{ts}"
 
 def simulate_gsp_gstn_filing(

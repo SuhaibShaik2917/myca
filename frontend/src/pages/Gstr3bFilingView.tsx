@@ -16,6 +16,8 @@ import {
 } from "lucide-react";
 import { 
   prepareGstr3b, 
+  getGstr3bStatus,
+  submitGstr3bForReview,
   reviewGstr3b, 
   fileGstr3bSandbox, 
   getStoredSession,
@@ -24,7 +26,7 @@ import {
 
 export function Gstr3bFilingView() {
   const session = getStoredSession();
-  const [taxPeriod, setTaxPeriod] = useState(session.returnPeriod || "102025");
+  const [taxPeriod, setTaxPeriod] = useState(session.returnPeriod || "2026-11");
   const [filing, setFiling] = useState<Gstr3bFilingResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
@@ -38,7 +40,7 @@ export function Gstr3bFilingView() {
     try {
       const res = await prepareGstr3b(session.registrationId, taxPeriod);
       setFiling(res);
-      setNotification(res.message);
+      setNotification(res.message || `Prepared GSTR-3B for ${taxPeriod}`);
       setTimeout(() => setNotification(null), 4000);
     } catch (err: any) {
       setError(err?.message || "Failed to prepare GSTR-3B.");
@@ -52,9 +54,20 @@ export function Gstr3bFilingView() {
     setActionLoading(true);
     setError(null);
     try {
-      const res = await reviewGstr3b(filing.filing_id, action, remarks || undefined);
-      setFiling(res);
-      setNotification(`Status updated to ${res.filing_status}`);
+      if (action === "SUBMIT_FOR_REVIEW") {
+        await submitGstr3bForReview(filing.filing_id, remarks || undefined);
+      } else {
+        const decision = action === "APPROVE" ? "APPROVED" : "REJECTED";
+        const effectiveRemarks = (remarks || "").trim().length >= 3
+          ? remarks.trim()
+          : decision === "APPROVED"
+            ? "Verified and approved by CA Checker."
+            : "Returned for correction by CA Checker.";
+        await reviewGstr3b(filing.filing_id, decision, effectiveRemarks);
+      }
+      const refreshed = await getGstr3bStatus(session.registrationId, taxPeriod);
+      setFiling(refreshed);
+      setNotification(`Status updated to ${refreshed.filing_status}`);
       setRemarks("");
       setTimeout(() => setNotification(null), 4000);
     } catch (err: any) {
@@ -100,7 +113,7 @@ export function Gstr3bFilingView() {
             value={taxPeriod}
             onChange={(e) => setTaxPeriod(e.target.value)}
             className="px-3 py-1.5 text-xs font-mono border border-slate-300 rounded-lg w-28"
-            placeholder="MMYYYY"
+            placeholder="YYYY-MM"
           />
           <button
             onClick={handlePrepare}
@@ -242,10 +255,10 @@ export function Gstr3bFilingView() {
                 <tbody className="divide-y divide-slate-100 font-mono">
                   <tr>
                     <td className="py-2 px-3 font-sans font-medium text-slate-700">3.1(a) Taxable Outward</td>
-                    <td className="py-2 px-3 text-right">{filing.table_3_1?.taxable_outward_supplies?.taxable_value || "0.00"}</td>
-                    <td className="py-2 px-3 text-right">{filing.table_3_1?.taxable_outward_supplies?.igst || "0.00"}</td>
-                    <td className="py-2 px-3 text-right">{filing.table_3_1?.taxable_outward_supplies?.cgst || "0.00"}</td>
-                    <td className="py-2 px-3 text-right">{filing.table_3_1?.taxable_outward_supplies?.sgst || "0.00"}</td>
+                    <td className="py-2 px-3 text-right">{filing.table_3_1?.a_taxable_supplies?.taxable_value || "0.00"}</td>
+                    <td className="py-2 px-3 text-right">{filing.table_3_1?.a_taxable_supplies?.igst || "0.00"}</td>
+                    <td className="py-2 px-3 text-right">{filing.table_3_1?.a_taxable_supplies?.cgst || "0.00"}</td>
+                    <td className="py-2 px-3 text-right">{filing.table_3_1?.a_taxable_supplies?.sgst || "0.00"}</td>
                   </tr>
                   <tr className="bg-slate-50 font-bold">
                     <td className="py-2 px-3 font-sans">Total Output Liability</td>
@@ -280,16 +293,16 @@ export function Gstr3bFilingView() {
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-mono">
                   <tr>
-                    <td className="py-2 px-3 font-sans font-medium text-slate-700">4(A)(5) All Other ITC</td>
-                    <td className="py-2 px-3 text-right">{filing.table_4?.a_itc_available?.all_other_itc?.igst || "0.00"}</td>
-                    <td className="py-2 px-3 text-right">{filing.table_4?.a_itc_available?.all_other_itc?.cgst || "0.00"}</td>
-                    <td className="py-2 px-3 text-right">{filing.table_4?.a_itc_available?.all_other_itc?.sgst || "0.00"}</td>
+                    <td className="py-2 px-3 font-sans font-medium text-slate-700">4(A) Eligible ITC Available</td>
+                    <td className="py-2 px-3 text-right">{filing.table_4?.a_itc_available?.igst || "0.00"}</td>
+                    <td className="py-2 px-3 text-right">{filing.table_4?.a_itc_available?.cgst || "0.00"}</td>
+                    <td className="py-2 px-3 text-right">{filing.table_4?.a_itc_available?.sgst || "0.00"}</td>
                   </tr>
                   <tr>
                     <td className="py-2 px-3 font-sans text-rose-700">4(B) ITC Reversed</td>
-                    <td className="py-2 px-3 text-right text-rose-700">({filing.table_4?.b_itc_reversed?.total_reversed?.igst || "0.00"})</td>
-                    <td className="py-2 px-3 text-right text-rose-700">({filing.table_4?.b_itc_reversed?.total_reversed?.cgst || "0.00"})</td>
-                    <td className="py-2 px-3 text-right text-rose-700">({filing.table_4?.b_itc_reversed?.total_reversed?.sgst || "0.00"})</td>
+                    <td className="py-2 px-3 text-right text-rose-700">({filing.table_4?.b_itc_reversed?.igst || "0.00"})</td>
+                    <td className="py-2 px-3 text-right text-rose-700">({filing.table_4?.b_itc_reversed?.cgst || "0.00"})</td>
+                    <td className="py-2 px-3 text-right text-rose-700">({filing.table_4?.b_itc_reversed?.sgst || "0.00"})</td>
                   </tr>
                   <tr className="bg-slate-50 font-bold text-indigo-900">
                     <td className="py-2 px-3 font-sans">4(C) Net ITC Available</td>
@@ -317,7 +330,7 @@ export function Gstr3bFilingView() {
               <div className="text-right">
                 <span className="text-[11px] text-slate-400 uppercase font-semibold">Net Cash Payable (PMT-06)</span>
                 <div className="text-2xl font-black text-rose-700 font-mono">
-                  ₹{filing.offset_result?.pmt06_cash_required?.total || "0.00"}
+                  ₹{filing.offset_result?.total_challan_required || "0.00"}
                 </div>
               </div>
             </div>
@@ -326,25 +339,25 @@ export function Gstr3bFilingView() {
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                 <span className="text-[11px] font-bold text-slate-500">IGST Cash Challan</span>
                 <div className="text-lg font-bold font-mono text-slate-900 mt-1">
-                  ₹{filing.offset_result?.pmt06_cash_required?.igst || "0.00"}
+                  ₹{filing.offset_result?.igst?.challan_required || "0.00"}
                 </div>
               </div>
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                 <span className="text-[11px] font-bold text-slate-500">CGST Cash Challan</span>
                 <div className="text-lg font-bold font-mono text-slate-900 mt-1">
-                  ₹{filing.offset_result?.pmt06_cash_required?.cgst || "0.00"}
+                  ₹{filing.offset_result?.cgst?.challan_required || "0.00"}
                 </div>
               </div>
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                 <span className="text-[11px] font-bold text-slate-500">SGST Cash Challan</span>
                 <div className="text-lg font-bold font-mono text-slate-900 mt-1">
-                  ₹{filing.offset_result?.pmt06_cash_required?.sgst || "0.00"}
+                  ₹{filing.offset_result?.sgst?.challan_required || "0.00"}
                 </div>
               </div>
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                 <span className="text-[11px] font-bold text-slate-500">Cess Cash Challan</span>
                 <div className="text-lg font-bold font-mono text-slate-900 mt-1">
-                  ₹{filing.offset_result?.pmt06_cash_required?.cess || "0.00"}
+                  ₹{filing.offset_result?.cess?.challan_required || "0.00"}
                 </div>
               </div>
             </div>
