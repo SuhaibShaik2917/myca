@@ -94,5 +94,8 @@ class GSTR3BStatusResponse(BaseModel):
     updated_at: str
     revision_number: int = 1
     previous_snapshot: Optional[Dict[str, Any]] = None
-    maker_provenance: str = "ESTABLISHED_AT_CREATION"
+    maker_provenance: str = Field(
+        default="UNKNOWN_LEGACY_NULL",
+        description="Maker attribution provenance: ESTABLISHED_AT_CREATION, LEGACY_CLAIMED, or UNKNOWN_LEGACY_NULL.",
+    )
     legacy_maker_claim: Optional[Dict[str, Any]] = None

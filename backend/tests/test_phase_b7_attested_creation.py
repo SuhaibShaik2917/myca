@@ -88,13 +88,27 @@ def b7_org_setup():
                 (other_reg_id, other_org_id, gstin_b),
             )
 
-    return {
+    yield {
         "org_id": org_id,
         "other_org_id": other_org_id,
         "reg_id": reg_id,
         "other_reg_id": other_reg_id,
         **users,
     }
+
+    with psycopg.connect(DB_ADMIN, autocommit=False) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL session_replication_role = 'replica';")
+            for oid in (org_id, other_org_id):
+                cur.execute("DELETE FROM public.gstr3b_legacy_maker_claims WHERE org_id = %s;", (oid,))
+                cur.execute("DELETE FROM public.gstr3b_revision_history WHERE org_id = %s;", (oid,))
+                cur.execute("DELETE FROM public.gstr3b_filings WHERE org_id = %s;", (oid,))
+                cur.execute("DELETE FROM public.gst_registrations WHERE org_id = %s;", (oid,))
+                cur.execute("DELETE FROM public.organization_memberships WHERE org_id = %s;", (oid,))
+                cur.execute("DELETE FROM public.organizations WHERE id = %s;", (oid,))
+            for uid in users.values():
+                cur.execute("DELETE FROM public.global_users WHERE id = %s;", (uid,))
+        conn.commit()
 
 
 def _app_exec(org_id: str, user_id: str, sql: str, params: tuple = ()):

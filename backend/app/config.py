@@ -1,7 +1,7 @@
 import ipaddress
 import os
 from pydantic_settings import BaseSettings
-from pydantic import ConfigDict, field_validator
+from pydantic import ConfigDict, Field, field_validator
 from typing import Optional, List
 
 VALID_ENVIRONMENTS = {"production", "staging", "development", "test"}
@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     
     # Security
     SECRET_KEY: str = "dev-insecure-secret-key-replace-in-production-with-min-32-chars"
-    GSTR3B_REVIEW_ATTESTATION_KEY: Optional[str] = None
+    GSTR3B_REVIEW_ATTESTATION_KEY: Optional[str] = Field(default=None, validate_default=True)
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
     TRUSTED_PROXIES: List[str] = ["127.0.0.1", "::1"]
     RATE_LIMIT_CLEANUP_INTERVAL_SECONDS: int = 3600
@@ -125,17 +125,15 @@ class Settings(BaseSettings):
     @field_validator("GSTR3B_REVIEW_ATTESTATION_KEY")
     @classmethod
     def validate_gstr3b_attestation_key(cls, v, info):
-        if v is None:
-            return v
         raw_env = os.getenv("ENVIRONMENT")
         if not raw_env and hasattr(info, "data"):
             raw_env = info.data.get("ENVIRONMENT")
         env_norm = str(raw_env).strip().lower() if raw_env else "development"
         if env_norm in ("production", "staging"):
             insecure_markers = ("dev-insecure", "test_secret", "test-secret", "myca_jwt_test", "default")
-            if not v.strip() or any(marker in v.lower() for marker in insecure_markers) or len(v) < 32:
+            if not v or not str(v).strip() or any(marker in str(v).lower() for marker in insecure_markers) or len(str(v)) < 32:
                 raise ValueError(
-                    "CRITICAL SECURITY ERROR: GSTR3B_REVIEW_ATTESTATION_KEY in production/staging must be at least 32 characters and free of default/test markers."
+                    "CRITICAL SECURITY ERROR: GSTR3B_REVIEW_ATTESTATION_KEY is required in production/staging, must be at least 32 characters, and must be free of default/test markers."
                 )
             secret_key = info.data.get("SECRET_KEY") if hasattr(info, "data") else None
             if secret_key and v == secret_key:

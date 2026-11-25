@@ -25,8 +25,23 @@ from app.modules.ai_assistant.api import router as ai_assistant_router
 async def lifespan(app: FastAPI):
     """
     Application lifespan context manager.
-    Initializes and manages background rate-limit cleanup scheduling.
+    Initializes and manages background rate-limit cleanup scheduling, and
+    verifies GSTR-3B trust anchor alignment on startup in production/staging.
     """
+    env_norm = (settings.ENVIRONMENT or "").strip().lower()
+    if env_norm in ("production", "staging"):
+        from app.database import SessionLocal
+        from app.modules.gstr3b.service import verify_gstr3b_trust_anchor_sync
+
+        db = SessionLocal()
+        try:
+            if not verify_gstr3b_trust_anchor_sync(db):
+                raise RuntimeError(
+                    "CRITICAL SECURITY ERROR: GSTR3B_REVIEW_ATTESTATION_KEY does not match database trust anchor."
+                )
+        finally:
+            db.close()
+
     stop_event = asyncio.Event()
     cleanup_task = asyncio.create_task(
         run_periodic_rate_limit_cleanup(

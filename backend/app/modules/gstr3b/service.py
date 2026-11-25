@@ -54,6 +54,19 @@ def _get_gstr3b_attestation_key() -> bytes:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
 
 
+def verify_gstr3b_trust_anchor_sync(session: Session) -> bool:
+    """
+    Verifies that the configured GSTR3B attestation key matches the database
+    trust anchor without modifying or rotating the stored trust anchor.
+    """
+    expected_digest = _get_gstr3b_attestation_key().decode("utf-8")
+    matched = session.execute(
+        text("SELECT public.verify_gstr3b_trust_anchor_match(:expected);"),
+        {"expected": expected_digest},
+    ).scalar()
+    return bool(matched)
+
+
 def _sign_gstr3b_review_attestation(
     org_id: str,
     filing_id: str,
@@ -845,6 +858,13 @@ def get_gstr3b_status(
             "claimed_at": claim_row.claimed_at.isoformat() if claim_row.claimed_at else None,
         }
 
+    if legacy_claim:
+        maker_provenance = "LEGACY_CLAIMED"
+    elif row.maker_id is None:
+        maker_provenance = "UNKNOWN_LEGACY_NULL"
+    else:
+        maker_provenance = "ESTABLISHED_AT_CREATION"
+
     return {
         "id": str(row.id),
         "registration_id": str(row.registration_id),
@@ -852,7 +872,7 @@ def get_gstr3b_status(
         "filing_status": row.filing_status,
         "revision_number": getattr(row, "revision_number", 1) or 1,
         "previous_snapshot": getattr(row, "previous_snapshot", None),
-        "maker_provenance": "LEGACY_CLAIMED" if legacy_claim else "ESTABLISHED_AT_CREATION",
+        "maker_provenance": maker_provenance,
         "legacy_maker_claim": legacy_claim,
         "table_3_1": row.table_3_1_data,
         "table_4": row.table_4_data,
