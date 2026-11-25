@@ -14,6 +14,7 @@ import uuid
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
 
@@ -415,16 +416,23 @@ def test_missing_prod_staging_key_fails_fast_and_trust_anchor_sync(monkeypatch):
 
 def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
     db_name = "myca_b9_rollback"
-    admin_root = create_engine("postgresql://postgres:postgres@localhost:5432/postgres", isolation_level="AUTOCOMMIT")
+    admin_root_url = make_url(DB_ADMIN).set(database="postgres")
+    b9_admin_url = make_url(DB_ADMIN).set(database=db_name)
+    b9_app_url = make_url(DB_APP).set(database=db_name)
+    b9_admin_str = b9_admin_url.render_as_string(hide_password=False)
+    b9_app_str = b9_app_url.render_as_string(hide_password=False)
+
+    admin_root = create_engine(admin_root_url, isolation_level="AUTOCOMMIT")
     with admin_root.connect() as c:
         c.execute(text(f"DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"))
         c.execute(text(f"CREATE DATABASE {db_name}"))
 
     env = os.environ.copy()
     env["ENVIRONMENT"] = "test"
-    env["DATABASE_ADMIN_URL"] = f"postgresql+psycopg://postgres:postgres@localhost:5432/{db_name}"
-    env["DB_ADMIN_URL"] = f"postgresql://postgres:postgres@localhost:5432/{db_name}"
-    env["DATABASE_URL"] = f"postgresql+psycopg://app_service_user:secret@localhost:5432/{db_name}"
+    env["DATABASE_ADMIN_URL"] = b9_admin_str
+    env["DB_ADMIN_URL"] = b9_admin_str
+    env["TEST_DATABASE_URL"] = b9_admin_str
+    env["DATABASE_URL"] = b9_app_str
     env["ALLOW_DISPOSABLE_DATABASE_ROLLBACK"] = "true"
 
     backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -434,7 +442,7 @@ def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
         # Single-revision downgrade 0039 -> 0038 when no claims exist
         subprocess.run(["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"], cwd=backend_dir, env=env, check=True)
 
-        e_db = create_engine(f"postgresql://postgres:postgres@localhost:5432/{db_name}")
+        e_db = create_engine(b9_admin_str)
         with e_db.connect() as c:
             funcs = c.execute(
                 text(
@@ -477,7 +485,7 @@ def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
             c.execute(text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:uid, 'b7@test.local', 'B7', true)"), {"uid": maker_id})
             c.execute(text("INSERT INTO public.organization_memberships (id, org_id, user_id, role, status) VALUES (:mid, :oid, :uid, 'accountant', 'active')"), {"mid": str(uuid.uuid4()), "oid": org_id, "uid": maker_id})
 
-        app_b7 = create_engine(f"postgresql://app_service_user:secret@localhost:5432/{db_name}")
+        app_b7 = create_engine(b9_app_str)
         raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
         derived = hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
         import hmac as _hmac
@@ -522,7 +530,7 @@ def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
                 ),
                 {"fid": legacy_fid, "oid": org_id, "rid": reg_id},
             )
-        app_b9 = create_engine(f"postgresql://app_service_user:secret@localhost:5432/{db_name}")
+        app_b9 = create_engine(b9_app_str)
         c_nonce = uuid.uuid4().hex
         c_sig = _sign_gstr3b_legacy_maker_claim(org_id, legacy_fid, maker_id, "LEGACY_SUBMISSION_CLAIM", c_nonce)
         with app_b9.begin() as c:
