@@ -416,7 +416,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # 1. Refuse downgrade if recorded legacy Maker provenance audit evidence exists
+    # 1. Acquire ACCESS EXCLUSIVE lock before counting to prevent concurrent claim inserts
+    #    between the evidence check and DROP TABLE.
     op.execute("""
     DO $$
     DECLARE
@@ -426,6 +427,7 @@ def downgrade() -> None:
             SELECT 1 FROM information_schema.tables
             WHERE table_schema = 'public' AND table_name = 'gstr3b_legacy_maker_claims'
         ) THEN
+            LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE;
             SELECT count(*) INTO v_claim_count FROM public.gstr3b_legacy_maker_claims;
             IF v_claim_count > 0 THEN
                 RAISE EXCEPTION 'Refusing to downgrade migration 0039: % legacy maker claim provenance record(s) exist in public.gstr3b_legacy_maker_claims. Export or archive audit evidence before rolling back (42501).', v_claim_count
@@ -593,7 +595,8 @@ def downgrade() -> None:
     REVOKE ALL ON FUNCTION public.execute_gstr3b_prepare_upsert(uuid, uuid, uuid, text, text, text, text, uuid, text, integer, text, timestamptz, text, text, text) FROM PUBLIC;
     GRANT EXECUTE ON FUNCTION public.execute_gstr3b_prepare_upsert(uuid, uuid, uuid, text, text, text, text, uuid, text, integer, text, timestamptz, text, text, text) TO app_service_user;
 
-    -- 3. Restore exact Phase B.7 (0038) 5-argument claim_legacy_null_maker definition
+    -- 3. Restore Phase B.7 (0038) 5-argument claim_legacy_null_maker signature as an explicit
+    --    rollback-window gate so legacy NULL-Maker filings cannot be claimed without provenance.
     CREATE OR REPLACE FUNCTION public.claim_legacy_null_maker(
         p_org_id uuid,
         p_filing_id uuid,
@@ -605,72 +608,9 @@ def downgrade() -> None:
     SECURITY DEFINER
     SET search_path = public, pg_catalog
     AS $$
-    DECLARE
-        v_secret text;
-        v_msg text;
-        v_expected text;
-        v_diff integer := 0;
-        v_i integer;
-        v_len integer;
-        v_maker_ok boolean;
     BEGIN
-        IF p_org_id IS NULL OR p_filing_id IS NULL OR p_maker_id IS NULL
-           OR NULLIF(p_nonce, '') IS NULL OR NULLIF(p_signature, '') IS NULL THEN
-            RAISE EXCEPTION 'Missing legacy maker claim parameters or attestation (42501).'
-                USING ERRCODE = '42501';
-        END IF;
-
-        SELECT EXISTS (
-            SELECT 1 FROM public.organization_memberships
-            WHERE org_id = p_org_id AND user_id = p_maker_id AND status = 'active'
-        ) INTO v_maker_ok;
-        IF NOT v_maker_ok THEN
-            RAISE EXCEPTION 'Maker % is not an active member of organization % (42501).', p_maker_id, p_org_id
-                USING ERRCODE = '42501';
-        END IF;
-
-        SELECT hmac_secret INTO v_secret FROM public.gstr3b_review_trust_anchors WHERE id = 'default';
-        IF v_secret IS NULL THEN
-            RAISE EXCEPTION 'Trust anchor not configured (42501).' USING ERRCODE = '42501';
-        END IF;
-
-        v_msg := p_org_id::text || ':' || p_filing_id::text || ':' || p_maker_id::text || ':LEGACY_MAKER_CLAIM:' || p_nonce;
-        v_expected := encode(public.hmac(convert_to(v_msg, 'UTF8'), convert_to(v_secret, 'UTF8'), 'sha256'), 'hex');
-
-        IF length(p_signature) != length(v_expected) THEN
-            RAISE EXCEPTION 'Invalid legacy maker claim attestation (42501).' USING ERRCODE = '42501';
-        END IF;
-        v_len := length(v_expected);
-        FOR v_i IN 1..v_len LOOP
-            IF substr(p_signature, v_i, 1) != substr(v_expected, v_i, 1) THEN
-                v_diff := 1;
-            END IF;
-        END LOOP;
-        IF v_diff != 0 THEN
-            RAISE EXCEPTION 'Invalid legacy maker claim attestation (42501).' USING ERRCODE = '42501';
-        END IF;
-
-        BEGIN
-            INSERT INTO public.gstr3b_review_attestation_nonces (nonce, filing_id, checker_id)
-            VALUES (p_nonce, p_filing_id, p_maker_id);
-        EXCEPTION WHEN unique_violation THEN
-            RAISE EXCEPTION 'Replayed legacy maker claim nonce rejected (42501).' USING ERRCODE = '42501';
-        END;
-
-        INSERT INTO public.gstr3b_verified_review_tokens (tx_id, pid, filing_id, checker_id, new_status)
-        VALUES (txid_current(), pg_backend_pid(), p_filing_id, p_maker_id, 'LEGACY_MAKER_CLAIM')
-        ON CONFLICT (tx_id, pid, filing_id) DO UPDATE SET
-            checker_id = EXCLUDED.checker_id,
-            new_status = EXCLUDED.new_status,
-            created_at = clock_timestamp();
-
-        UPDATE public.gstr3b_filings
-        SET maker_id = p_maker_id,
-            updated_at = clock_timestamp()
-        WHERE id = p_filing_id AND org_id = p_org_id AND maker_id IS NULL;
-
-        DELETE FROM public.gstr3b_verified_review_tokens
-        WHERE tx_id = txid_current() AND pid = pg_backend_pid() AND filing_id = p_filing_id;
+        RAISE EXCEPTION 'Legacy NULL-maker claim is disabled during migration 0039->0038 rollback window to prevent provenance loss; re-upgrade to 0039 to claim legacy filings (42501).'
+            USING ERRCODE = '42501';
     END;
     $$;
 

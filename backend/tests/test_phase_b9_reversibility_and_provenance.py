@@ -8,8 +8,12 @@ Phase B.9 Verification Tests:
 """
 
 import hashlib
+import hmac as _hmac
 import os
+import re
 import subprocess
+import threading
+import time
 import uuid
 import pytest
 from pydantic import ValidationError
@@ -414,8 +418,10 @@ def test_missing_prod_staging_key_fails_fast_and_trust_anchor_sync(monkeypatch):
         app.close()
 
 
-def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
-    db_name = "myca_b9_rollback"
+def _new_disposable_db(prefix: str):
+    db_name = f"{prefix}_{uuid.uuid4().hex[:12]}"
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", db_name):
+        raise ValueError(f"Unsafe disposable database name: {db_name}")
     admin_root_url = make_url(DB_ADMIN).set(database="postgres")
     b9_admin_url = make_url(DB_ADMIN).set(database=db_name)
     b9_app_url = make_url(DB_APP).set(database=db_name)
@@ -424,8 +430,13 @@ def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
 
     admin_root = create_engine(admin_root_url, isolation_level="AUTOCOMMIT")
     with admin_root.connect() as c:
-        c.execute(text(f"DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"))
-        c.execute(text(f"CREATE DATABASE {db_name}"))
+        c.execute(text(f'CREATE DATABASE "{db_name}"'))
+    return db_name, admin_root, b9_admin_str, b9_app_str
+
+
+def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
+    db_name, admin_root, b9_admin_str, b9_app_str = _new_disposable_db("myca_b9_rollback")
+    created_db = True
 
     env = os.environ.copy()
     env["ENVIRONMENT"] = "test"
@@ -436,6 +447,7 @@ def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
     env["ALLOW_DISPOSABLE_DATABASE_ROLLBACK"] = "true"
 
     backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    e_db = None
     try:
         subprocess.run(["python", "-m", "alembic", "upgrade", "head"], cwd=backend_dir, env=env, check=True)
 
@@ -511,8 +523,61 @@ def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
             assert str(res[0]) == filing_id
         app_b7.dispose()
 
+        # Verify rollback-window gate technically rejects 5-arg legacy claim (prevents provenance loss)
+        rollback_legacy_fid = str(uuid.uuid4())
+        with e_db.begin() as c:
+            c.execute(text("SET LOCAL session_replication_role = 'replica'"))
+            c.execute(
+                text(
+                    """
+                    INSERT INTO public.gstr3b_filings (
+                        id, org_id, registration_id, tax_period,
+                        table_3_1_data, table_4_data, offset_data,
+                        filing_status, maker_id, revision_number
+                    ) VALUES (:fid, :oid, :rid, '102025', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 'DRAFT', NULL, 1)
+                    """
+                ),
+                {"fid": rollback_legacy_fid, "oid": org_id, "rid": reg_id},
+            )
+        app_rw = create_engine(b9_app_str)
+        rw_nonce = uuid.uuid4().hex
+        rw_msg = f"{org_id}:{rollback_legacy_fid}:{maker_id}:LEGACY_MAKER_CLAIM:{rw_nonce}".encode("utf-8")
+        rw_sig = _hmac.new(derived, rw_msg, hashlib.sha256).hexdigest()
+        with pytest.raises(DBAPIError) as exc_rw:
+            with app_rw.begin() as c:
+                c.execute(text("SELECT set_config('app.current_org', :o, true)"), {"o": org_id})
+                c.execute(
+                    text("SELECT public.claim_legacy_null_maker(CAST(:o AS uuid), CAST(:f AS uuid), CAST(:m AS uuid), :n, :s)"),
+                    {"o": org_id, "f": rollback_legacy_fid, "m": maker_id, "n": rw_nonce, "s": rw_sig},
+                )
+        assert _sqlstate(exc_rw) == "42501"
+        app_rw.dispose()
+
         # Upgrade back to B.8/B.9 (0039)
         subprocess.run(["python", "-m", "alembic", "upgrade", "head"], cwd=backend_dir, env=env, check=True)
+
+        # Verify rollback_legacy_fid remained UNKNOWN_LEGACY_NULL (not misreported as ESTABLISHED_AT_CREATION)
+        app_check = create_engine(b9_app_str)
+        AppCheckSession = sessionmaker(bind=app_check, autocommit=False, autoflush=False)
+        s_check = AppCheckSession()
+        try:
+            _set_app_context(s_check, org_id, maker_id)
+            st_before = get_gstr3b_status(s_check, org_id, reg_id, "102025")
+            assert st_before is not None
+            assert st_before["maker_id"] is None
+            assert st_before["maker_provenance"] == "UNKNOWN_LEGACY_NULL"
+
+            _set_app_context(s_check, org_id, maker_id)
+            prepare_gstr3b_return(s_check, org_id, reg_id, "102025", user_id=maker_id)
+            s_check.commit()
+            _set_app_context(s_check, org_id, maker_id)
+            st_after = get_gstr3b_status(s_check, org_id, reg_id, "102025")
+            assert st_after["maker_provenance"] == "LEGACY_CLAIMED"
+            assert st_after["legacy_maker_claim"]["claimed_by_user_id"] == maker_id
+            assert st_after["legacy_maker_claim"]["claimed_at"] is not None
+        finally:
+            s_check.close()
+        app_check.dispose()
 
         # Record a legacy claim and verify downgrade refuses to silently delete audit evidence
         legacy_fid = str(uuid.uuid4())
@@ -554,6 +619,107 @@ def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
             assert c.execute(text("SELECT count(*) FROM public.gstr3b_legacy_maker_claims WHERE filing_id = :f"), {"f": legacy_fid}).scalar() == 1
         e_db.dispose()
     finally:
-        with admin_root.connect() as c:
-            c.execute(text(f"DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"))
+        if e_db is not None:
+            e_db.dispose()
+        if created_db:
+            with admin_root.connect() as c:
+                c.execute(text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
+        admin_root.dispose()
+
+
+def test_concurrent_downgrade_evidence_check_blocks_race():
+    db_name, admin_root, b9_admin_str, b9_app_str = _new_disposable_db("myca_b10_conc")
+    created_db = True
+
+    env = os.environ.copy()
+    env["ENVIRONMENT"] = "test"
+    env["DATABASE_ADMIN_URL"] = b9_admin_str
+    env["DB_ADMIN_URL"] = b9_admin_str
+    env["TEST_DATABASE_URL"] = b9_admin_str
+    env["DATABASE_URL"] = b9_app_str
+    env["ALLOW_DISPOSABLE_DATABASE_ROLLBACK"] = "true"
+
+    backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    e_db = None
+    try:
+        subprocess.run(["python", "-m", "alembic", "upgrade", "head"], cwd=backend_dir, env=env, check=True)
+        e_db = create_engine(b9_admin_str)
+
+        org_id = str(uuid.uuid4())
+        reg_id = str(uuid.uuid4())
+        maker_id = str(uuid.uuid4())
+        legacy_fid = str(uuid.uuid4())
+        with e_db.begin() as c:
+            c.execute(text("INSERT INTO public.organizations (id, legal_name, pan) VALUES (:id, 'B10 Conc', 'AABCB5678Z')"), {"id": org_id})
+            c.execute(text("INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, legal_name, registration_type, is_primary) VALUES (:rid, :oid, '27AABCB5678Z1Z5', '27', 'B10', 'REGULAR', true)"), {"rid": reg_id, "oid": org_id})
+            c.execute(text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:uid, 'b10@test.local', 'B10', true)"), {"uid": maker_id})
+            c.execute(text("INSERT INTO public.organization_memberships (id, org_id, user_id, role, status) VALUES (:mid, :oid, :uid, 'accountant', 'active')"), {"mid": str(uuid.uuid4()), "oid": org_id, "uid": maker_id})
+            c.execute(text("SET LOCAL session_replication_role = 'replica'"))
+            c.execute(
+                text(
+                    """
+                    INSERT INTO public.gstr3b_filings (
+                        id, org_id, registration_id, tax_period,
+                        table_3_1_data, table_4_data, offset_data,
+                        filing_status, maker_id, revision_number
+                    ) VALUES (:fid, :oid, :rid, '112025', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 'DRAFT', NULL, 1)
+                    """
+                ),
+                {"fid": legacy_fid, "oid": org_id, "rid": reg_id},
+            )
+
+        # Hold an in-progress claim transaction open while downgrade starts
+        app_eng = create_engine(b9_app_str)
+        nonce = uuid.uuid4().hex
+        sig = _sign_gstr3b_legacy_maker_claim(org_id, legacy_fid, maker_id, "LEGACY_SUBMISSION_CLAIM", nonce)
+        downgrade_result = {}
+
+        with app_eng.connect() as claim_conn:
+            tx = claim_conn.begin()
+            claim_conn.execute(text("SELECT set_config('app.current_org', :o, true)"), {"o": org_id})
+            claim_conn.execute(
+                text("SELECT public.claim_legacy_null_maker(CAST(:o AS uuid), CAST(:f AS uuid), CAST(:m AS uuid), 'LEGACY_SUBMISSION_CLAIM', :n, :s)"),
+                {"o": org_id, "f": legacy_fid, "m": maker_id, "n": nonce, "s": sig},
+            )
+
+            def _run_downgrade():
+                downgrade_result["proc"] = subprocess.run(
+                    ["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"],
+                    cwd=backend_dir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+
+            t = threading.Thread(target=_run_downgrade)
+            t.start()
+            # Give downgrade time to reach LOCK TABLE ... IN ACCESS EXCLUSIVE MODE and block on claim_conn
+            time.sleep(1.5)
+            assert t.is_alive(), "Downgrade did not block on ACCESS EXCLUSIVE lock while claim transaction was open"
+            tx.commit()
+            t.join(timeout=30)
+
+        app_eng.dispose()
+        proc = downgrade_result["proc"]
+        assert proc.returncode != 0
+        assert "Refusing to downgrade migration 0039" in (proc.stderr + proc.stdout)
+
+        # Verify revision, table, and claim data remain intact after refused downgrade
+        rev = subprocess.run(
+            ["python", "-m", "alembic", "current"],
+            cwd=backend_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "0039_gstr3b_legacy_claim_meta" in rev.stdout
+        with e_db.connect() as c:
+            assert c.execute(text("SELECT count(*) FROM public.gstr3b_legacy_maker_claims WHERE filing_id = :f"), {"f": legacy_fid}).scalar() == 1
+    finally:
+        if e_db is not None:
+            e_db.dispose()
+        if created_db:
+            with admin_root.connect() as c:
+                c.execute(text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
         admin_root.dispose()
