@@ -416,23 +416,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # 1. Acquire ACCESS EXCLUSIVE lock before counting to prevent concurrent claim inserts
-    #    between the evidence check and DROP TABLE.
+    # 1. Acquire ACCESS EXCLUSIVE lock as an explicit statement before counting to prevent
+    #    concurrent claim inserts between the evidence check and DROP TABLE.
+    op.execute("LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE;")
     op.execute("""
     DO $$
     DECLARE
         v_claim_count bigint;
     BEGIN
-        IF EXISTS (
-            SELECT 1 FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_name = 'gstr3b_legacy_maker_claims'
-        ) THEN
-            LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE;
-            SELECT count(*) INTO v_claim_count FROM public.gstr3b_legacy_maker_claims;
-            IF v_claim_count > 0 THEN
-                RAISE EXCEPTION 'Refusing to downgrade migration 0039: % legacy maker claim provenance record(s) exist in public.gstr3b_legacy_maker_claims. Export or archive audit evidence before rolling back (42501).', v_claim_count
-                    USING ERRCODE = '42501';
-            END IF;
+        SELECT count(*) INTO v_claim_count FROM public.gstr3b_legacy_maker_claims;
+        IF v_claim_count > 0 THEN
+            RAISE EXCEPTION 'Refusing to downgrade migration 0039: % legacy maker claim provenance record(s) exist in public.gstr3b_legacy_maker_claims. Export or archive audit evidence before rolling back (42501).', v_claim_count
+                USING ERRCODE = '42501';
         END IF;
     END $$;
 

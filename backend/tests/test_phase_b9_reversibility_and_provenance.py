@@ -673,9 +673,13 @@ def test_concurrent_downgrade_evidence_check_blocks_race():
         nonce = uuid.uuid4().hex
         sig = _sign_gstr3b_legacy_maker_claim(org_id, legacy_fid, maker_id, "LEGACY_SUBMISSION_CLAIM", nonce)
         downgrade_result = {}
+        alembic_app_name = f"myca_b11_downgrade_{uuid.uuid4().hex[:8]}"
+        downgrade_env = env.copy()
+        downgrade_env["PGAPPNAME"] = alembic_app_name
 
         with app_eng.connect() as claim_conn:
             tx = claim_conn.begin()
+            claim_pid = claim_conn.execute(text("SELECT pg_backend_pid()")).scalar()
             claim_conn.execute(text("SELECT set_config('app.current_org', :o, true)"), {"o": org_id})
             claim_conn.execute(
                 text("SELECT public.claim_legacy_null_maker(CAST(:o AS uuid), CAST(:f AS uuid), CAST(:m AS uuid), 'LEGACY_SUBMISSION_CLAIM', :n, :s)"),
@@ -686,16 +690,54 @@ def test_concurrent_downgrade_evidence_check_blocks_race():
                 downgrade_result["proc"] = subprocess.run(
                     ["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"],
                     cwd=backend_dir,
-                    env=env,
+                    env=downgrade_env,
                     capture_output=True,
                     text=True,
                 )
 
             t = threading.Thread(target=_run_downgrade)
             t.start()
-            # Give downgrade time to reach LOCK TABLE ... IN ACCESS EXCLUSIVE MODE and block on claim_conn
-            time.sleep(1.5)
-            assert t.is_alive(), "Downgrade did not block on ACCESS EXCLUSIVE lock while claim transaction was open"
+
+            # Deterministically poll pg_stat_activity until the Alembic backend is blocked
+            # on LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE by claim_pid
+            observed_lock_wait = False
+            last_rows = []
+            deadline = time.monotonic() + 20.0
+            with e_db.connect().execution_options(isolation_level="AUTOCOMMIT") as obs_conn:
+                while time.monotonic() < deadline:
+                    rows = obs_conn.execute(
+                        text(
+                            """
+                            SELECT pid, application_name, state, wait_event_type, wait_event, query,
+                                   pg_blocking_pids(pid) AS blockers
+                            FROM pg_stat_activity
+                            WHERE datname = :db
+                              AND pid != pg_backend_pid()
+                              AND pid != :claim_pid
+                            """
+                        ),
+                        {"db": db_name, "claim_pid": claim_pid},
+                    ).mappings().all()
+                    last_rows = [dict(r) for r in rows]
+                    for row in rows:
+                        if (
+                            row["application_name"] == alembic_app_name
+                            and row["state"] == "active"
+                            and row["wait_event_type"] == "Lock"
+                            and claim_pid in (row["blockers"] or [])
+                            and "LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE" in (row["query"] or "")
+                            and "DROP TABLE" not in (row["query"] or "")
+                        ):
+                            observed_lock_wait = True
+                            break
+                    if observed_lock_wait or not t.is_alive():
+                        break
+                    time.sleep(0.05)
+
+            assert observed_lock_wait, (
+                "Did not observe Alembic waiting on LOCK TABLE public.gstr3b_legacy_maker_claims "
+                f"IN ACCESS EXCLUSIVE MODE blocked by claim_pid={claim_pid}; last_rows={last_rows}"
+            )
             tx.commit()
             t.join(timeout=30)
 

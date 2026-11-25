@@ -234,13 +234,17 @@ def test_p1_legacy_previous_snapshot_backfill_on_upgrade():
     revision_number=2 and non-null previous_snapshot (revision 1), upgrades to 0034,
     and proves Revision 1 is backfilled with rejected_at and survives a second rejection cycle.
     """
+    import re
     base_url = DB_ADMIN.rsplit("/", 1)[0]
-    disp_db = "myca_b3_backfill_test"
+    disp_db = f"myca_b3_backfill_{uuid.uuid4().hex[:12]}"
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", disp_db):
+        raise ValueError(f"Unsafe disposable database name: {disp_db}")
     disp_admin = f"{base_url}/{disp_db}"
+    created_db = False
 
     with psycopg.connect(f"{base_url}/postgres", autocommit=True) as conn:
-        conn.execute(f"DROP DATABASE IF EXISTS {disp_db};")
-        conn.execute(f"CREATE DATABASE {disp_db};")
+        conn.execute(f'CREATE DATABASE "{disp_db}";')
+        created_db = True
 
     env = os.environ.copy()
     env["DB_ADMIN_URL"] = disp_admin
@@ -317,5 +321,6 @@ def test_p1_legacy_previous_snapshot_backfill_on_upgrade():
                 assert rows[0][5] is not None
                 assert rows[0][4] != rows[0][5]
     finally:
-        with psycopg.connect(f"{base_url}/postgres", autocommit=True) as conn:
-            conn.execute(f"DROP DATABASE IF EXISTS {disp_db};")
+        if created_db:
+            with psycopg.connect(f"{base_url}/postgres", autocommit=True) as conn:
+                conn.execute(f'DROP DATABASE IF EXISTS "{disp_db}";')

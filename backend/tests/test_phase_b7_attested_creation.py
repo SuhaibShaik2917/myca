@@ -363,13 +363,17 @@ def test_p1_dedicated_attestation_key_upgrade_from_0035_to_0038():
     enables a dedicated GSTR3B_REVIEW_ATTESTATION_KEY, upgrades to 0038,
     and proves gstr3b_review_trust_anchors is synchronized to the dedicated key.
     """
+    import re
     base_url = DB_ADMIN.rsplit("/", 1)[0]
-    disp_db = "myca_b7_key_sync_test"
+    disp_db = f"myca_b7_key_sync_{uuid.uuid4().hex[:12]}"
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", disp_db):
+        raise ValueError(f"Unsafe disposable database name: {disp_db}")
     disp_admin = f"{base_url}/{disp_db}"
+    created_db = False
 
     with psycopg.connect(f"{base_url}/postgres", autocommit=True) as conn:
-        conn.execute(f"DROP DATABASE IF EXISTS {disp_db};")
-        conn.execute(f"CREATE DATABASE {disp_db};")
+        conn.execute(f'CREATE DATABASE "{disp_db}";')
+        created_db = True
 
     dedicated_key = "MYCA_DEDICATED_GSTR3B_ATTESTATION_KEY_PHASE_B7_MIN32CHARS"
     expected_hash = hashlib.sha256(dedicated_key.encode("utf-8")).hexdigest()
@@ -393,5 +397,6 @@ def test_p1_dedicated_attestation_key_upgrade_from_0035_to_0038():
                 actual_hash = cur.fetchone()[0]
                 assert actual_hash == expected_hash
     finally:
-        with psycopg.connect(f"{base_url}/postgres", autocommit=True) as conn:
-            conn.execute(f"DROP DATABASE IF EXISTS {disp_db};")
+        if created_db:
+            with psycopg.connect(f"{base_url}/postgres", autocommit=True) as conn:
+                conn.execute(f'DROP DATABASE IF EXISTS "{disp_db}";')
