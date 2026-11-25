@@ -38,6 +38,7 @@ from app.modules.gstr3b.service import (
     submit_gstr3b_for_review,
     review_gstr3b_decision,
     _compute_gstr3b_payload_digest,
+    _compute_gstr3b_meta_digest,
     _sign_gstr3b_creation_attestation,
     _sign_gstr3b_filing_attestation,
 )
@@ -167,9 +168,10 @@ def test_p0_creation_attestation_and_forgery_defenses(b7_org_setup):
     t4_orig = '{"b":2}'
     off_orig = '{"c":3}'
     digest_orig = _compute_gstr3b_payload_digest(t31_orig, t4_orig, off_orig)
+    meta_digest_orig = _compute_gstr3b_meta_digest(1, "Valid", None)
     nonce_1 = f"create-{uuid.uuid4().hex}"
     sig_1 = _sign_gstr3b_creation_attestation(
-        s["org_id"], fid, s["reg_id"], "2026-04", s["maker"], digest_orig, nonce_1
+        s["org_id"], fid, s["reg_id"], "2026-04", s["maker"], digest_orig, meta_digest_orig, nonce_1
     )
 
     with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc_tamper_data:
@@ -179,10 +181,10 @@ def test_p0_creation_attestation_and_forgery_defenses(b7_org_setup):
             """
             SELECT * FROM public.execute_gstr3b_prepare_upsert(
                 %s::uuid, %s::uuid, %s::uuid, '2026-04',
-                '{"a":9999}', %s, %s, %s::uuid, 'Tampered', 1, NULL, clock_timestamp(), %s, %s, %s
+                '{"a":9999}', %s, %s, %s::uuid, 'Valid', 1, NULL, %s, %s, %s, %s
             );
             """,
-            (fid, s["org_id"], s["reg_id"], t4_orig, off_orig, s["maker"], digest_orig, nonce_1, sig_1),
+            (fid, s["org_id"], s["reg_id"], t4_orig, off_orig, s["maker"], digest_orig, meta_digest_orig, nonce_1, sig_1),
         )
     assert exc_tamper_data.value.sqlstate == "42501"
 
@@ -193,10 +195,10 @@ def test_p0_creation_attestation_and_forgery_defenses(b7_org_setup):
         """
         SELECT * FROM public.execute_gstr3b_prepare_upsert(
             %s::uuid, %s::uuid, %s::uuid, '2026-04',
-            %s, %s, %s, %s::uuid, 'Valid', 1, NULL, clock_timestamp(), %s, %s, %s
+            %s, %s, %s, %s::uuid, 'Valid', 1, NULL, %s, %s, %s, %s
         );
         """,
-        (fid, s["org_id"], s["reg_id"], t31_orig, t4_orig, off_orig, s["maker"], digest_orig, nonce_1, sig_1),
+        (fid, s["org_id"], s["reg_id"], t31_orig, t4_orig, off_orig, s["maker"], digest_orig, meta_digest_orig, nonce_1, sig_1),
     )
 
     with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc_replay:
@@ -206,10 +208,10 @@ def test_p0_creation_attestation_and_forgery_defenses(b7_org_setup):
             """
             SELECT * FROM public.execute_gstr3b_prepare_upsert(
                 %s::uuid, %s::uuid, %s::uuid, '2026-04',
-                %s, %s, %s, %s::uuid, 'Replay', 1, NULL, clock_timestamp(), %s, %s, %s
+                %s, %s, %s, %s::uuid, 'Valid', 1, NULL, %s, %s, %s, %s
             );
             """,
-            (fid, s["org_id"], s["reg_id"], t31_orig, t4_orig, off_orig, s["maker"], digest_orig, nonce_1, sig_1),
+            (fid, s["org_id"], s["reg_id"], t31_orig, t4_orig, off_orig, s["maker"], digest_orig, meta_digest_orig, nonce_1, sig_1),
         )
     assert exc_replay.value.sqlstate == "42501"
     assert "Replayed creation attestation nonce rejected" in str(exc_replay.value)
@@ -217,7 +219,7 @@ def test_p0_creation_attestation_and_forgery_defenses(b7_org_setup):
     # 6. Invalid or cross-organization registration -> 42501
     nonce_2 = f"create-{uuid.uuid4().hex}"
     sig_2 = _sign_gstr3b_creation_attestation(
-        s["org_id"], str(uuid.uuid4()), s["other_reg_id"], "2026-05", s["maker"], digest_orig, nonce_2
+        s["org_id"], str(uuid.uuid4()), s["other_reg_id"], "2026-05", s["maker"], digest_orig, meta_digest_orig, nonce_2
     )
     with pytest.raises(psycopg.errors.InsufficientPrivilege) as exc_bad_reg:
         _app_exec(
@@ -226,10 +228,10 @@ def test_p0_creation_attestation_and_forgery_defenses(b7_org_setup):
             """
             SELECT * FROM public.execute_gstr3b_prepare_upsert(
                 %s::uuid, %s::uuid, %s::uuid, '2026-05',
-                %s, %s, %s, %s::uuid, 'Bad reg', 1, NULL, clock_timestamp(), %s, %s, %s
+                %s, %s, %s, %s::uuid, 'Valid', 1, NULL, %s, %s, %s, %s
             );
             """,
-            (str(uuid.uuid4()), s["org_id"], s["other_reg_id"], t31_orig, t4_orig, off_orig, s["maker"], digest_orig, nonce_2, sig_2),
+            (str(uuid.uuid4()), s["org_id"], s["other_reg_id"], t31_orig, t4_orig, off_orig, s["maker"], digest_orig, meta_digest_orig, nonce_2, sig_2),
         )
     assert exc_bad_reg.value.sqlstate == "42501"
 

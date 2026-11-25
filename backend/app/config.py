@@ -122,6 +122,28 @@ class Settings(BaseSettings):
                 raise ValueError("CRITICAL SECURITY ERROR: Production and staging deployments require a secure SECRET_KEY of at least 32 characters (default or test SECRET_KEY is strictly prohibited).")
         return v
 
+    @field_validator("GSTR3B_REVIEW_ATTESTATION_KEY")
+    @classmethod
+    def validate_gstr3b_attestation_key(cls, v, info):
+        if v is None:
+            return v
+        raw_env = os.getenv("ENVIRONMENT")
+        if not raw_env and hasattr(info, "data"):
+            raw_env = info.data.get("ENVIRONMENT")
+        env_norm = str(raw_env).strip().lower() if raw_env else "development"
+        if env_norm in ("production", "staging"):
+            insecure_markers = ("dev-insecure", "test_secret", "test-secret", "myca_jwt_test", "default")
+            if not v.strip() or any(marker in v.lower() for marker in insecure_markers) or len(v) < 32:
+                raise ValueError(
+                    "CRITICAL SECURITY ERROR: GSTR3B_REVIEW_ATTESTATION_KEY in production/staging must be at least 32 characters and free of default/test markers."
+                )
+            secret_key = info.data.get("SECRET_KEY") if hasattr(info, "data") else None
+            if secret_key and v == secret_key:
+                raise ValueError(
+                    "CRITICAL SECURITY ERROR: GSTR3B_REVIEW_ATTESTATION_KEY must be distinct from SECRET_KEY in production/staging."
+                )
+        return v
+
     @field_validator("DATABASE_URL", "DATABASE_WORKER_URL")
     @classmethod
     def validate_database_urls(cls, v, info):

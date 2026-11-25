@@ -94,3 +94,5 @@ class GSTR3BStatusResponse(BaseModel):
     updated_at: str
     revision_number: int = 1
     previous_snapshot: Optional[Dict[str, Any]] = None
+    maker_provenance: str = "ESTABLISHED_AT_CREATION"
+    legacy_maker_claim: Optional[Dict[str, Any]] = None

@@ -31,6 +31,29 @@ class GSTR3BServiceError(Exception):
     pass
 
 
+def _get_gstr3b_attestation_key() -> bytes:
+    """
+    Returns derived HMAC key for GSTR-3B database attestations.
+    In production and staging, requires an explicit strong GSTR3B_REVIEW_ATTESTATION_KEY
+    distinct from SECRET_KEY (fails closed if missing).
+    """
+    env_norm = (settings.ENVIRONMENT or "").strip().lower()
+    if env_norm in ("production", "staging"):
+        key = settings.GSTR3B_REVIEW_ATTESTATION_KEY
+        if not key or not key.strip() or len(key) < 32:
+            raise GSTR3BServiceError(
+                "CRITICAL SECURITY ERROR: GSTR3B_REVIEW_ATTESTATION_KEY (>= 32 chars) is required in production and staging."
+            )
+        if key == settings.SECRET_KEY:
+            raise GSTR3BServiceError(
+                "CRITICAL SECURITY ERROR: GSTR3B_REVIEW_ATTESTATION_KEY must be distinct from SECRET_KEY in production and staging."
+            )
+        raw_key = key
+    else:
+        raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
+
+
 def _sign_gstr3b_review_attestation(
     org_id: str,
     filing_id: str,
@@ -38,14 +61,20 @@ def _sign_gstr3b_review_attestation(
     new_status: str,
     nonce: str,
 ) -> str:
-    """Computes server-side HMAC-SHA256 attestation using dedicated GSTR3B_REVIEW_ATTESTATION_KEY (or SECRET_KEY fallback)."""
-    raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
-    derived_secret = hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
+    """Computes server-side HMAC-SHA256 attestation for Checker review transition."""
+    derived_secret = _get_gstr3b_attestation_key()
     message = f"{org_id}:{filing_id}:{checker_id}:{new_status}:{nonce}".encode("utf-8")
     return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
 
+
 def _compute_gstr3b_payload_digest(t31_text: str, t4_text: str, offset_text: str) -> str:
     return hashlib.sha256(f"{t31_text}:{t4_text}:{offset_text}".encode("utf-8")).hexdigest()
+
+
+def _compute_gstr3b_meta_digest(rev: int, maker_remarks: Optional[str], prev_snap_text: Optional[str]) -> str:
+    return hashlib.sha256(
+        f"{rev}:{maker_remarks or ''}:{prev_snap_text or ''}".encode("utf-8")
+    ).hexdigest()
 
 
 def _sign_gstr3b_creation_attestation(
@@ -55,12 +84,14 @@ def _sign_gstr3b_creation_attestation(
     tax_period: str,
     maker_id: str,
     payload_digest: str,
+    meta_digest: str,
     nonce: str,
 ) -> str:
     """Computes server-side HMAC-SHA256 attestation for GSTR-3B DRAFT creation/preparation."""
-    raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
-    derived_secret = hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
-    message = f"{org_id}:{filing_id}:{reg_id}:{tax_period}:{maker_id}:DRAFT:{payload_digest}:{nonce}".encode("utf-8")
+    derived_secret = _get_gstr3b_attestation_key()
+    message = (
+        f"{org_id}:{filing_id}:{reg_id}:{tax_period}:{maker_id}:DRAFT:{payload_digest}:{meta_digest}:{nonce}"
+    ).encode("utf-8")
     return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
 
 
@@ -68,12 +99,12 @@ def _sign_gstr3b_legacy_maker_claim(
     org_id: str,
     filing_id: str,
     maker_id: str,
+    reason: str,
     nonce: str,
 ) -> str:
     """Computes server-side HMAC-SHA256 attestation for one-time legacy NULL maker_id claim."""
-    raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
-    derived_secret = hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
-    message = f"{org_id}:{filing_id}:{maker_id}:LEGACY_MAKER_CLAIM:{nonce}".encode("utf-8")
+    derived_secret = _get_gstr3b_attestation_key()
+    message = f"{org_id}:{filing_id}:{maker_id}:LEGACY_MAKER_CLAIM:{reason}:{nonce}".encode("utf-8")
     return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
 
 
@@ -87,8 +118,7 @@ def _sign_gstr3b_filing_attestation(
     nonce: str,
 ) -> str:
     """Computes server-side HMAC-SHA256 attestation for APPROVED_BY_CHECKER -> FILED transition."""
-    raw_key = settings.GSTR3B_REVIEW_ATTESTATION_KEY or f"MYCA_GSTR3B_REVIEW_TRUST_V1:{settings.SECRET_KEY}"
-    derived_secret = hashlib.sha256(raw_key.encode("utf-8")).hexdigest().encode("utf-8")
+    derived_secret = _get_gstr3b_attestation_key()
     message = f"{org_id}:{filing_id}:{actor_id}:FILED:{arn}:{cin or ''}:{payload_hash}:{nonce}".encode("utf-8")
     return hmac.new(derived_secret, message, hashlib.sha256).hexdigest()
 
@@ -367,7 +397,33 @@ def prepare_gstr3b_return(
         session.rollback()
         raise GSTR3BServiceError("Authenticated maker_id is required to prepare a GSTR-3B return.")
 
-    now_ts = datetime.now(timezone.utc)
+    # If re-preparing a legacy filing whose maker_id is NULL, execute attested one-time claim first
+    if existing_filing and existing_filing.maker_id is None:
+        claim_reason = "Claimed during re-preparation of legacy filing with unknown original maker."
+        claim_nonce = secrets.token_hex(24)
+        claim_sig = _sign_gstr3b_legacy_maker_claim(
+            str(org_id), filing_id, str(effective_maker_id), claim_reason, claim_nonce
+        )
+        session.execute(
+            text("""
+            SELECT public.claim_legacy_null_maker(
+                CAST(:org AS uuid),
+                CAST(:id AS uuid),
+                CAST(:uid AS uuid),
+                :reason,
+                :nonce,
+                :sig
+            );
+            """),
+            {
+                "org": str(org_id),
+                "id": filing_id,
+                "uid": str(effective_maker_id),
+                "reason": claim_reason,
+                "nonce": claim_nonce,
+                "sig": claim_sig,
+            }
+        )
 
     t31_dict = t31.model_dump(mode="json")
     t4_dict = t4.model_dump(mode="json")
@@ -376,7 +432,9 @@ def prepare_gstr3b_return(
     t31_text = json.dumps(t31_dict, sort_keys=True, separators=(",", ":"))
     t4_text = json.dumps(t4_dict, sort_keys=True, separators=(",", ":"))
     offset_text = json.dumps(offset_dict, sort_keys=True, separators=(",", ":"))
+    maker_remarks_val = "Prepared by MyCA rules engine from reconciled registers."
     payload_digest = _compute_gstr3b_payload_digest(t31_text, t4_text, offset_text)
+    meta_digest = _compute_gstr3b_meta_digest(target_revision, maker_remarks_val, prev_snapshot_json)
     nonce = secrets.token_hex(24)
     signature = _sign_gstr3b_creation_attestation(
         org_id=str(org_id),
@@ -385,6 +443,7 @@ def prepare_gstr3b_return(
         tax_period=tax_period,
         maker_id=str(effective_maker_id),
         payload_digest=payload_digest,
+        meta_digest=meta_digest,
         nonce=nonce,
     )
 
@@ -399,11 +458,11 @@ def prepare_gstr3b_return(
             :t4_text,
             :offset_text,
             CAST(:maker_id AS uuid),
-            'Prepared by MyCA rules engine from reconciled registers.',
+            :maker_remarks,
             :rev,
             :prev_snap_text,
-            :now,
             :digest,
+            :meta_digest,
             :nonce,
             :sig
         );
@@ -418,10 +477,11 @@ def prepare_gstr3b_return(
         "t4_text": t4_text,
         "offset_text": offset_text,
         "maker_id": str(effective_maker_id),
+        "maker_remarks": maker_remarks_val,
         "rev": target_revision,
         "prev_snap_text": prev_snapshot_json,
-        "now": now_ts,
         "digest": payload_digest,
+        "meta_digest": meta_digest,
         "nonce": nonce,
         "sig": signature,
     }).fetchone()
@@ -487,19 +547,28 @@ def submit_gstr3b_for_review(
         if not user_id:
             session.rollback()
             raise GSTR3BServiceError("Authenticated maker identity required to claim legacy GSTR-3B filing.")
+        claim_reason = "Claimed during submission of legacy filing with unknown original maker."
         claim_nonce = secrets.token_hex(24)
-        claim_sig = _sign_gstr3b_legacy_maker_claim(str(org_id), str(filing_id), str(user_id), claim_nonce)
+        claim_sig = _sign_gstr3b_legacy_maker_claim(str(org_id), str(filing_id), str(user_id), claim_reason, claim_nonce)
         session.execute(
             text("""
             SELECT public.claim_legacy_null_maker(
                 CAST(:org AS uuid),
                 CAST(:id AS uuid),
                 CAST(:uid AS uuid),
+                :reason,
                 :nonce,
                 :sig
             );
             """),
-            {"org": str(org_id), "id": str(filing_id), "uid": str(user_id), "nonce": claim_nonce, "sig": claim_sig}
+            {
+                "org": str(org_id),
+                "id": str(filing_id),
+                "uid": str(user_id),
+                "reason": claim_reason,
+                "nonce": claim_nonce,
+                "sig": claim_sig,
+            }
         )
 
     session.execute(
@@ -756,6 +825,26 @@ def get_gstr3b_status(
     if not row:
         return None
 
+    claim_row = session.execute(
+        text("""
+        SELECT original_maker_state, provenance_type, claimed_by_user_id, claim_reason, attestation_nonce, claimed_at
+        FROM public.gstr3b_legacy_maker_claims
+        WHERE org_id = :org AND filing_id = :fid;
+        """),
+        {"org": org_id, "fid": str(row.id)}
+    ).fetchone()
+
+    legacy_claim = None
+    if claim_row:
+        legacy_claim = {
+            "original_maker_state": claim_row.original_maker_state,
+            "provenance_type": claim_row.provenance_type,
+            "claimed_by_user_id": str(claim_row.claimed_by_user_id),
+            "claim_reason": claim_row.claim_reason,
+            "attestation_nonce": claim_row.attestation_nonce,
+            "claimed_at": claim_row.claimed_at.isoformat() if claim_row.claimed_at else None,
+        }
+
     return {
         "id": str(row.id),
         "registration_id": str(row.registration_id),
@@ -763,6 +852,8 @@ def get_gstr3b_status(
         "filing_status": row.filing_status,
         "revision_number": getattr(row, "revision_number", 1) or 1,
         "previous_snapshot": getattr(row, "previous_snapshot", None),
+        "maker_provenance": "LEGACY_CLAIMED" if legacy_claim else "ESTABLISHED_AT_CREATION",
+        "legacy_maker_claim": legacy_claim,
         "table_3_1": row.table_3_1_data,
         "table_4": row.table_4_data,
         "offset": row.offset_data,
