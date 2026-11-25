@@ -627,10 +627,247 @@ def test_single_revision_downgrade_0039_to_0038_and_claim_preservation():
         admin_root.dispose()
 
 
-def test_concurrent_downgrade_evidence_check_blocks_race():
-    db_name, admin_root, b9_admin_str, b9_app_str = _new_disposable_db("myca_b10_conc")
-    created_db = True
+class DowngradeTeardownSafetyError(RuntimeError):
+    """Raised when downgrade process/backend teardown cannot confirm safe termination."""
 
+    def __init__(self, message: str, outcome: dict):
+        super().__init__(message)
+        self.outcome = outcome
+
+
+def _poll_alembic_lock_wait(e_db, db_name: str, alembic_app_name: str, claim_pid: int, t: threading.Thread):
+    """Polls pg_stat_activity (AUTOCOMMIT) until Alembic waits on LOCK TABLE blocked by claim_pid."""
+    observed_lock_wait = False
+    last_rows = []
+    deadline = time.monotonic() + 20.0
+    with e_db.connect().execution_options(isolation_level="AUTOCOMMIT") as obs_conn:
+        while time.monotonic() < deadline:
+            rows = obs_conn.execute(
+                text(
+                    """
+                    SELECT pid, application_name, state, wait_event_type, wait_event, query,
+                           pg_blocking_pids(pid) AS blockers
+                    FROM pg_stat_activity
+                    WHERE datname = :db
+                      AND pid != pg_backend_pid()
+                      AND pid != :claim_pid
+                    """
+                ),
+                {"db": db_name, "claim_pid": claim_pid},
+            ).mappings().all()
+            last_rows = [dict(r) for r in rows]
+            for row in rows:
+                if (
+                    row["application_name"] == alembic_app_name
+                    and row["state"] == "active"
+                    and row["wait_event_type"] == "Lock"
+                    and claim_pid in (row["blockers"] or [])
+                    and "LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE" in (row["query"] or "")
+                    and "DROP TABLE" not in (row["query"] or "")
+                ):
+                    observed_lock_wait = True
+                    break
+            if observed_lock_wait or not t.is_alive():
+                break
+            time.sleep(0.05)
+    return observed_lock_wait, last_rows
+
+
+def _terminate_alembic_db_backends(
+    admin_db,
+    db_name: str,
+    alembic_app_name: str,
+    claim_pid: int | None,
+    errors: list[str],
+    wait_seconds: float = 5.0,
+) -> tuple[bool, bool]:
+    """
+    Emergency DB-level safeguard: uses admin_db (never claim_pid) to terminate any
+    live PostgreSQL backends matching alembic_app_name, then polls until absent.
+    Returns (attempted_terminate, backend_absent).
+    """
+    attempted = False
+    try:
+        with admin_db.connect().execution_options(isolation_level="AUTOCOMMIT") as c:
+            pids = c.execute(
+                text(
+                    """
+                    SELECT pid FROM pg_stat_activity
+                    WHERE datname = :db
+                      AND application_name = :app_name
+                      AND pid != pg_backend_pid()
+                      AND (:claim_pid IS NULL OR pid != :claim_pid)
+                    """
+                ),
+                {"db": db_name, "app_name": alembic_app_name, "claim_pid": claim_pid},
+            ).scalars().all()
+            for pid in pids:
+                attempted = True
+                term_ok = c.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid}).scalar()
+                if not term_ok:
+                    errors.append(f"pg_terminate_backend({pid}) returned false")
+
+            deadline = time.monotonic() + wait_seconds
+            while time.monotonic() < deadline:
+                remaining = c.execute(
+                    text(
+                        """
+                        SELECT count(*) FROM pg_stat_activity
+                        WHERE datname = :db
+                          AND application_name = :app_name
+                          AND pid != pg_backend_pid()
+                          AND (:claim_pid IS NULL OR pid != :claim_pid)
+                        """
+                    ),
+                    {"db": db_name, "app_name": alembic_app_name, "claim_pid": claim_pid},
+                ).scalar()
+                if remaining == 0:
+                    return attempted, True
+                time.sleep(0.05)
+            errors.append(f"Altered backend(s) for {alembic_app_name} remained in pg_stat_activity")
+            return attempted, False
+    except Exception as exc:
+        errors.append(f"DB backend termination failed: {exc}")
+        return attempted, False
+
+
+def _teardown_downgrade_process_before_rollback(
+    popen,
+    tx,
+    t,
+    *,
+    e_db=None,
+    db_name: str | None = None,
+    alembic_app_name: str | None = None,
+    claim_pid: int | None = None,
+    outcome_sink: dict | None = None,
+) -> dict:
+    """
+    Fail-closed teardown helper shared by all concurrent downgrade tests.
+    While tx holds its lock:
+      1. Gracefully terminates popen, waits, and escalates to kill() on timeout.
+      2. If OS termination fails or DB backend persists, invokes pg_terminate_backend()
+         on admin e_db (excluding claim_pid) and waits for backend/process exit.
+      3. Only when both OS process and DB backend are confirmed unable to continue does
+         it roll back tx, join/verify worker thread t, and allow DB cleanup.
+      4. If termination still cannot be confirmed, NEVER rolls back tx: emergency-commits
+         the already-attested claim tx so the waiting migration sees durable provenance,
+         marks the DB contaminated so outer cleanup will not drop it, and raises
+         DowngradeTeardownSafetyError.
+    """
+    outcome = {
+        "os_process_exited": popen is None,
+        "kill_escalated": False,
+        "db_backend_terminated": False,
+        "db_backend_absent": True,
+        "popen_exited_while_tx_active": False,
+        "emergency_committed": False,
+        "contaminated_db": False,
+        "errors": [],
+    }
+    if outcome_sink is not None:
+        outcome_sink.clear()
+        outcome_sink.update(outcome)
+
+    def _sync_sink():
+        if outcome_sink is not None:
+            outcome_sink.update(outcome)
+
+    # 1. OS-level termination while claim tx still holds its lock
+    if popen is not None:
+        try:
+            if popen.poll() is None:
+                try:
+                    popen.terminate()
+                except (ProcessLookupError, OSError) as exc:
+                    outcome["errors"].append(f"terminate failed: {exc}")
+                try:
+                    popen.wait(timeout=5)
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    outcome["errors"].append(f"wait after terminate failed: {exc}")
+
+                if popen.poll() is None:
+                    outcome["kill_escalated"] = True
+                    try:
+                        popen.kill()
+                    except (ProcessLookupError, OSError) as exc:
+                        outcome["errors"].append(f"kill failed: {exc}")
+                    try:
+                        popen.wait(timeout=5)
+                    except (subprocess.TimeoutExpired, OSError) as exc:
+                        outcome["errors"].append(f"wait after kill failed: {exc}")
+            outcome["os_process_exited"] = popen.poll() is not None
+        except Exception as exc:
+            outcome["errors"].append(f"unexpected OS poll/wait failure: {exc}")
+            outcome["os_process_exited"] = False
+
+    # 2. Database-level emergency safeguard via unique PGAPPNAME (never claim_pid)
+    if e_db is not None and db_name and alembic_app_name:
+        if not outcome["os_process_exited"]:
+            attempted, backend_absent = _terminate_alembic_db_backends(
+                e_db, db_name, alembic_app_name, claim_pid, outcome["errors"]
+            )
+            outcome["db_backend_terminated"] = attempted and backend_absent
+            outcome["db_backend_absent"] = backend_absent
+            if backend_absent and popen is not None and not outcome["os_process_exited"]:
+                try:
+                    popen.wait(timeout=5)
+                    outcome["os_process_exited"] = popen.poll() is not None
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    outcome["errors"].append(f"wait after DB termination failed: {exc}")
+        else:
+            # Verify no orphan Alembic backend lingers in pg_stat_activity
+            _, backend_absent = _terminate_alembic_db_backends(
+                e_db, db_name, alembic_app_name, claim_pid, outcome["errors"], wait_seconds=1.0
+            )
+            outcome["db_backend_absent"] = backend_absent
+    elif not outcome["os_process_exited"]:
+        outcome["db_backend_absent"] = False
+
+    confirmed_stopped = outcome["os_process_exited"] and outcome["db_backend_absent"]
+    outcome["popen_exited_while_tx_active"] = confirmed_stopped and tx.is_active
+
+    # 3. Absolute fail-safe: NEVER roll back tx if subprocess/backend cannot be confirmed stopped
+    if not confirmed_stopped:
+        outcome["contaminated_db"] = True
+        if tx.is_active:
+            try:
+                tx.commit()
+                outcome["emergency_committed"] = True
+            except Exception as exc:
+                outcome["errors"].append(f"emergency tx commit failed: {exc}")
+        if t is not None and t.is_alive():
+            t.join(timeout=1)
+        _sync_sink()
+        raise DowngradeTeardownSafetyError(
+            "FAIL-SAFE TRIGGERED: Unable to confirm Alembic downgrade stop; "
+            f"tx rollback blocked, emergency_committed={outcome['emergency_committed']}, "
+            f"db_contaminated=True, errors={outcome['errors']}",
+            outcome,
+        )
+
+    # 4. Safe path: process & DB backend confirmed stopped -> roll back active claim tx
+    if tx.is_active:
+        tx.rollback()
+
+    if t is not None and t.is_alive():
+        t.join(timeout=5)
+    if t is not None and t.is_alive():
+        outcome["contaminated_db"] = True
+        outcome["errors"].append("worker thread still alive after join(timeout=5)")
+        _sync_sink()
+        raise DowngradeTeardownSafetyError(
+            "FAIL-SAFE TRIGGERED: Alembic downgrade worker thread did not terminate",
+            outcome,
+        )
+
+    _sync_sink()
+    return outcome
+
+
+def _setup_concurrent_downgrade_case(prefix: str):
+    """Provisions an isolated disposable DB at 0039 head with one seeded legacy NULL-Maker filing."""
+    db_name, admin_root, b9_admin_str, b9_app_str = _new_disposable_db(prefix)
     env = os.environ.copy()
     env["ENVIRONMENT"] = "test"
     env["DATABASE_ADMIN_URL"] = b9_admin_str
@@ -640,68 +877,91 @@ def test_concurrent_downgrade_evidence_check_blocks_race():
     env["ALLOW_DISPOSABLE_DATABASE_ROLLBACK"] = "true"
 
     backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    e_db = None
+    subprocess.run(["python", "-m", "alembic", "upgrade", "head"], cwd=backend_dir, env=env, check=True)
+    e_db = create_engine(b9_admin_str)
+
+    org_id = str(uuid.uuid4())
+    reg_id = str(uuid.uuid4())
+    maker_id = str(uuid.uuid4())
+    legacy_fid = str(uuid.uuid4())
+    with e_db.begin() as c:
+        c.execute(text("INSERT INTO public.organizations (id, legal_name, pan) VALUES (:id, 'B11 Conc', 'AABCB5678Z')"), {"id": org_id})
+        c.execute(text("INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, legal_name, registration_type, is_primary) VALUES (:rid, :oid, '27AABCB5678Z1Z5', '27', 'B11', 'REGULAR', true)"), {"rid": reg_id, "oid": org_id})
+        c.execute(text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:uid, :em, 'B11', true)"), {"uid": maker_id, "em": f"b11-{maker_id[:8]}@test.local"})
+        c.execute(text("INSERT INTO public.organization_memberships (id, org_id, user_id, role, status) VALUES (:mid, :oid, :uid, 'accountant', 'active')"), {"mid": str(uuid.uuid4()), "oid": org_id, "uid": maker_id})
+        c.execute(text("SET LOCAL session_replication_role = 'replica'"))
+        c.execute(
+            text(
+                """
+                INSERT INTO public.gstr3b_filings (
+                    id, org_id, registration_id, tax_period,
+                    table_3_1_data, table_4_data, offset_data,
+                    filing_status, maker_id, revision_number
+                ) VALUES (:fid, :oid, :rid, '112025', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 'DRAFT', NULL, 1)
+                """
+            ),
+            {"fid": legacy_fid, "oid": org_id, "rid": reg_id},
+        )
+    return {
+        "db_name": db_name,
+        "admin_root": admin_root,
+        "b9_admin_str": b9_admin_str,
+        "b9_app_str": b9_app_str,
+        "env": env,
+        "backend_dir": backend_dir,
+        "e_db": e_db,
+        "org_id": org_id,
+        "reg_id": reg_id,
+        "maker_id": maker_id,
+        "legacy_fid": legacy_fid,
+    }
+
+
+def _launch_downgrade_locked_session(ctx: dict, *, app_suffix: str, wrap_popen=None):
+    """Starts claim tx + blocked Alembic downgrade subprocess and waits for real LOCK TABLE contention."""
+    app_eng = create_engine(ctx["b9_app_str"])
+    nonce = uuid.uuid4().hex
+    sig = _sign_gstr3b_legacy_maker_claim(ctx["org_id"], ctx["legacy_fid"], ctx["maker_id"], "LEGACY_SUBMISSION_CLAIM", nonce)
+    alembic_app_name = f"myca_b11_{app_suffix}_{uuid.uuid4().hex[:8]}"
+    downgrade_env = ctx["env"].copy()
+    downgrade_env["PGAPPNAME"] = alembic_app_name
+    downgrade_result = {}
+    return app_eng, nonce, sig, alembic_app_name, downgrade_env, downgrade_result
+
+
+def test_concurrent_downgrade_evidence_check_blocks_race():
+    ctx = _setup_concurrent_downgrade_case("myca_b10_conc")
+    e_db = ctx["e_db"]
+    admin_root = ctx["admin_root"]
+    db_name = ctx["db_name"]
+    contaminated_db = False
     try:
-        subprocess.run(["python", "-m", "alembic", "upgrade", "head"], cwd=backend_dir, env=env, check=True)
-        e_db = create_engine(b9_admin_str)
-
-        org_id = str(uuid.uuid4())
-        reg_id = str(uuid.uuid4())
-        maker_id = str(uuid.uuid4())
-        legacy_fid = str(uuid.uuid4())
-        with e_db.begin() as c:
-            c.execute(text("INSERT INTO public.organizations (id, legal_name, pan) VALUES (:id, 'B10 Conc', 'AABCB5678Z')"), {"id": org_id})
-            c.execute(text("INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, legal_name, registration_type, is_primary) VALUES (:rid, :oid, '27AABCB5678Z1Z5', '27', 'B10', 'REGULAR', true)"), {"rid": reg_id, "oid": org_id})
-            c.execute(text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:uid, 'b10@test.local', 'B10', true)"), {"uid": maker_id})
-            c.execute(text("INSERT INTO public.organization_memberships (id, org_id, user_id, role, status) VALUES (:mid, :oid, :uid, 'accountant', 'active')"), {"mid": str(uuid.uuid4()), "oid": org_id, "uid": maker_id})
-            c.execute(text("SET LOCAL session_replication_role = 'replica'"))
-            c.execute(
-                text(
-                    """
-                    INSERT INTO public.gstr3b_filings (
-                        id, org_id, registration_id, tax_period,
-                        table_3_1_data, table_4_data, offset_data,
-                        filing_status, maker_id, revision_number
-                    ) VALUES (:fid, :oid, :rid, '112025', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 'DRAFT', NULL, 1)
-                    """
-                ),
-                {"fid": legacy_fid, "oid": org_id, "rid": reg_id},
-            )
-
-        # Hold an in-progress claim transaction open while downgrade starts
-        app_eng = create_engine(b9_app_str)
-        nonce = uuid.uuid4().hex
-        sig = _sign_gstr3b_legacy_maker_claim(org_id, legacy_fid, maker_id, "LEGACY_SUBMISSION_CLAIM", nonce)
-        downgrade_result = {}
-        alembic_app_name = f"myca_b11_downgrade_{uuid.uuid4().hex[:8]}"
-        downgrade_env = env.copy()
-        downgrade_env["PGAPPNAME"] = alembic_app_name
+        app_eng, nonce, sig, alembic_app_name, downgrade_env, downgrade_result = _launch_downgrade_locked_session(
+            ctx, app_suffix="ok"
+        )
         popen = None
         t = None
-
+        outcome_sink = {}
         try:
             with app_eng.connect() as claim_conn:
                 tx = claim_conn.begin()
+                claim_pid = claim_conn.execute(text("SELECT pg_backend_pid()")).scalar()
                 try:
-                    claim_pid = claim_conn.execute(text("SELECT pg_backend_pid()")).scalar()
-                    claim_conn.execute(text("SELECT set_config('app.current_org', :o, true)"), {"o": org_id})
+                    claim_conn.execute(text("SELECT set_config('app.current_org', :o, true)"), {"o": ctx["org_id"]})
                     claim_conn.execute(
                         text("SELECT public.claim_legacy_null_maker(CAST(:o AS uuid), CAST(:f AS uuid), CAST(:m AS uuid), 'LEGACY_SUBMISSION_CLAIM', :n, :s)"),
-                        {"o": org_id, "f": legacy_fid, "m": maker_id, "n": nonce, "s": sig},
+                        {"o": ctx["org_id"], "f": ctx["legacy_fid"], "m": ctx["maker_id"], "n": nonce, "s": sig},
                     )
-
-                    # Create Popen in the controlling thread before starting the worker thread
-                    # so teardown always has the process handle with zero registration race.
                     popen = subprocess.Popen(
                         ["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"],
-                        cwd=backend_dir,
+                        cwd=ctx["backend_dir"],
                         env=downgrade_env,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
                     )
 
-                    def _communicate_downgrade():
+                    def _communicate():
                         try:
                             stdout, stderr = popen.communicate()
                             downgrade_result["returncode"] = popen.returncode
@@ -710,45 +970,12 @@ def test_concurrent_downgrade_evidence_check_blocks_race():
                         except Exception as exc:
                             downgrade_result["error"] = exc
 
-                    t = threading.Thread(target=_communicate_downgrade)
+                    t = threading.Thread(target=_communicate)
                     t.start()
 
-                    # Deterministically poll pg_stat_activity until the Alembic backend is blocked
-                    # on LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE by claim_pid
-                    observed_lock_wait = False
-                    last_rows = []
-                    deadline = time.monotonic() + 20.0
-                    with e_db.connect().execution_options(isolation_level="AUTOCOMMIT") as obs_conn:
-                        while time.monotonic() < deadline:
-                            rows = obs_conn.execute(
-                                text(
-                                    """
-                                    SELECT pid, application_name, state, wait_event_type, wait_event, query,
-                                           pg_blocking_pids(pid) AS blockers
-                                    FROM pg_stat_activity
-                                    WHERE datname = :db
-                                      AND pid != pg_backend_pid()
-                                      AND pid != :claim_pid
-                                    """
-                                ),
-                                {"db": db_name, "claim_pid": claim_pid},
-                            ).mappings().all()
-                            last_rows = [dict(r) for r in rows]
-                            for row in rows:
-                                if (
-                                    row["application_name"] == alembic_app_name
-                                    and row["state"] == "active"
-                                    and row["wait_event_type"] == "Lock"
-                                    and claim_pid in (row["blockers"] or [])
-                                    and "LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE" in (row["query"] or "")
-                                    and "DROP TABLE" not in (row["query"] or "")
-                                ):
-                                    observed_lock_wait = True
-                                    break
-                            if observed_lock_wait or not t.is_alive():
-                                break
-                            time.sleep(0.05)
-
+                    observed_lock_wait, last_rows = _poll_alembic_lock_wait(
+                        e_db, db_name, alembic_app_name, claim_pid, t
+                    )
                     assert observed_lock_wait, (
                         "Did not observe Alembic waiting on LOCK TABLE public.gstr3b_legacy_maker_claims "
                         f"IN ACCESS EXCLUSIVE MODE blocked by claim_pid={claim_pid}; last_rows={last_rows}"
@@ -757,225 +984,267 @@ def test_concurrent_downgrade_evidence_check_blocks_race():
                     t.join(timeout=30)
                     assert not t.is_alive(), "Alembic downgrade worker thread did not terminate within 30s after claim commit"
                 finally:
-                    # 1. Terminate Alembic subprocess FIRST while claim transaction still holds its lock
-                    if popen is not None and popen.poll() is None:
-                        try:
-                            popen.terminate()
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            popen.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            try:
-                                popen.kill()
-                            except ProcessLookupError:
-                                pass
-                            popen.wait(timeout=5)
-                    assert popen is None or popen.poll() is not None, "Alembic subprocess failed to terminate before lock release"
-                    # 2. Only after subprocess is confirmed exited, roll back active claim transaction
-                    if tx.is_active:
-                        tx.rollback()
-                    # 3. Join communication worker thread and verify termination
-                    if t is not None and t.is_alive():
-                        t.join(timeout=5)
-                    assert t is None or not t.is_alive(), "Alembic downgrade worker thread failed to terminate during teardown"
+                    try:
+                        _teardown_downgrade_process_before_rollback(
+                            popen, tx, t, e_db=e_db, db_name=db_name, alembic_app_name=alembic_app_name, claim_pid=claim_pid, outcome_sink=outcome_sink
+                        )
+                    except DowngradeTeardownSafetyError:
+                        contaminated_db = outcome_sink.get("contaminated_db", True)
+                        raise
         finally:
             app_eng.dispose()
 
         assert "error" not in downgrade_result, f"Subprocess communication failed: {downgrade_result.get('error')}"
-        assert "returncode" in downgrade_result, "Subprocess did not produce a returncode"
-        assert downgrade_result["returncode"] != 0
+        assert downgrade_result.get("returncode") not in (None, 0)
         assert "Refusing to downgrade migration 0039" in (downgrade_result["stderr"] + downgrade_result["stdout"])
 
-        # Verify revision, table, and claim data remain intact after refused downgrade
         rev = subprocess.run(
             ["python", "-m", "alembic", "current"],
-            cwd=backend_dir,
-            env=env,
+            cwd=ctx["backend_dir"],
+            env=ctx["env"],
             capture_output=True,
             text=True,
             check=True,
         )
         assert "0039_gstr3b_legacy_claim_meta" in rev.stdout
         with e_db.connect() as c:
-            assert c.execute(text("SELECT count(*) FROM public.gstr3b_legacy_maker_claims WHERE filing_id = :f"), {"f": legacy_fid}).scalar() == 1
+            assert c.execute(text("SELECT count(*) FROM public.gstr3b_legacy_maker_claims WHERE filing_id = :f"), {"f": ctx["legacy_fid"]}).scalar() == 1
     finally:
-        if e_db is not None:
-            e_db.dispose()
-        if created_db:
+        e_db.dispose()
+        if not contaminated_db:
+            with admin_root.connect() as c:
+                c.execute(text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
+        admin_root.dispose()
+
+
+def _run_failure_path_teardown_case(prefix: str, *, popen_wrapper=None, override_e_db=None):
+    """Shared driver for failure-path teardown scenarios exercising _teardown_downgrade_process_before_rollback."""
+    ctx = _setup_concurrent_downgrade_case(prefix)
+    e_db = ctx["e_db"]
+    admin_root = ctx["admin_root"]
+    db_name = ctx["db_name"]
+    real_popen = None
+    wrapped_popen = None
+    t = None
+    downgrade_result = {}
+    outcome_sink = {}
+    db_dropped_by_teardown = False
+    contaminated_db = False
+
+    try:
+        app_eng, nonce, sig, alembic_app_name, downgrade_env, downgrade_result = _launch_downgrade_locked_session(
+            ctx, app_suffix="fail"
+        )
+        try:
+            with pytest.raises((RuntimeError, DowngradeTeardownSafetyError)):
+                try:
+                    with app_eng.connect() as claim_conn:
+                        tx = claim_conn.begin()
+                        claim_pid = claim_conn.execute(text("SELECT pg_backend_pid()")).scalar()
+                        try:
+                            claim_conn.execute(text("SELECT set_config('app.current_org', :o, true)"), {"o": ctx["org_id"]})
+                            claim_conn.execute(
+                                text("SELECT public.claim_legacy_null_maker(CAST(:o AS uuid), CAST(:f AS uuid), CAST(:m AS uuid), 'LEGACY_SUBMISSION_CLAIM', :n, :s)"),
+                                {"o": ctx["org_id"], "f": ctx["legacy_fid"], "m": ctx["maker_id"], "n": nonce, "s": sig},
+                            )
+                            real_popen = subprocess.Popen(
+                                ["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"],
+                                cwd=ctx["backend_dir"],
+                                env=downgrade_env,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                            )
+                            wrapped_popen = popen_wrapper(real_popen) if popen_wrapper else real_popen
+
+                            def _communicate():
+                                try:
+                                    stdout, stderr = real_popen.communicate()
+                                    downgrade_result["returncode"] = real_popen.returncode
+                                    downgrade_result["stdout"] = stdout
+                                    downgrade_result["stderr"] = stderr
+                                except Exception as exc:
+                                    downgrade_result["error"] = exc
+
+                            t = threading.Thread(target=_communicate)
+                            t.start()
+
+                            observed_lock_wait, _ = _poll_alembic_lock_wait(
+                                e_db, db_name, alembic_app_name, claim_pid, t
+                            )
+                            assert observed_lock_wait
+                            raise RuntimeError("Controlled failure before claim commit")
+                        finally:
+                            try:
+                                _teardown_downgrade_process_before_rollback(
+                                    wrapped_popen,
+                                    tx,
+                                    t,
+                                    e_db=override_e_db if override_e_db is not None else e_db,
+                                    db_name=db_name,
+                                    alembic_app_name=alembic_app_name,
+                                    claim_pid=claim_pid,
+                                    outcome_sink=outcome_sink,
+                                )
+                            except DowngradeTeardownSafetyError:
+                                contaminated_db = outcome_sink.get("contaminated_db", True)
+                                raise
+                finally:
+                    app_eng.dispose()
+
+            # Check DB state while contaminated guard is evaluated
+            if not contaminated_db:
+                with e_db.connect() as c:
+                    assert c.execute(text("SELECT to_regclass('public.gstr3b_legacy_maker_claims')")).scalar() is not None
+                    assert c.execute(text("SELECT count(*) FROM public.gstr3b_legacy_maker_claims WHERE filing_id = :f"), {"f": ctx["legacy_fid"]}).scalar() == 0
+                rev = subprocess.run(
+                    ["python", "-m", "alembic", "current"],
+                    cwd=ctx["backend_dir"],
+                    env=ctx["env"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                assert "0039_gstr3b_legacy_claim_meta" in rev.stdout
+                db_dropped_by_teardown = True
+        finally:
+            # Ensure real_popen and t are always reaped before final test-harness DB cleanup
+            if real_popen is not None and real_popen.poll() is None:
+                real_popen.wait(timeout=15)
+            if t is not None and t.is_alive():
+                t.join(timeout=15)
+            assert real_popen is None or real_popen.poll() is not None
+            assert t is None or not t.is_alive()
+
+        # Verify fail-safe database invariants AFTER real_popen exited
+        if contaminated_db:
+            with e_db.connect() as c:
+                assert c.execute(text("SELECT to_regclass('public.gstr3b_legacy_maker_claims')")).scalar() is not None
+                assert c.execute(text("SELECT count(*) FROM public.gstr3b_legacy_maker_claims WHERE filing_id = :f"), {"f": ctx["legacy_fid"]}).scalar() == 1
+            rev = subprocess.run(
+                ["python", "-m", "alembic", "current"],
+                cwd=ctx["backend_dir"],
+                env=ctx["env"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert "0039_gstr3b_legacy_claim_meta" in rev.stdout
+
+        return outcome_sink, downgrade_result, db_dropped_by_teardown
+    finally:
+        e_db.dispose()
+        if not contaminated_db or (real_popen is None or real_popen.poll() is not None):
             with admin_root.connect() as c:
                 c.execute(text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
         admin_root.dispose()
 
 
 def test_concurrent_downgrade_failure_path_terminates_before_rollback():
-    """
-    Proves that on a failure before claim commit, the blocked Alembic downgrade
-    subprocess is terminated and confirmed exited WHILE the claim transaction still
-    holds its lock, leaving 0039 and gstr3b_legacy_maker_claims intact after rollback.
-    """
-    db_name, admin_root, b9_admin_str, b9_app_str = _new_disposable_db("myca_b11_failpath")
-    created_db = True
+    outcome, _, db_dropped = _run_failure_path_teardown_case("myca_b11_normfail")
+    assert outcome["os_process_exited"] is True
+    assert outcome["kill_escalated"] is False
+    assert outcome["popen_exited_while_tx_active"] is True
+    assert outcome["emergency_committed"] is False
+    assert outcome["contaminated_db"] is False
+    assert db_dropped is True
 
-    env = os.environ.copy()
-    env["ENVIRONMENT"] = "test"
-    env["DATABASE_ADMIN_URL"] = b9_admin_str
-    env["DB_ADMIN_URL"] = b9_admin_str
-    env["TEST_DATABASE_URL"] = b9_admin_str
-    env["DATABASE_URL"] = b9_app_str
-    env["ALLOW_DISPOSABLE_DATABASE_ROLLBACK"] = "true"
 
-    backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    e_db = None
-    try:
-        subprocess.run(["python", "-m", "alembic", "upgrade", "head"], cwd=backend_dir, env=env, check=True)
-        e_db = create_engine(b9_admin_str)
+def test_teardown_terminate_timeout_escalates_to_kill():
+    class _TerminateTimeoutPopen:
+        def __init__(self, inner):
+            self._inner = inner
+            self._waits = 0
 
-        org_id = str(uuid.uuid4())
-        reg_id = str(uuid.uuid4())
-        maker_id = str(uuid.uuid4())
-        legacy_fid = str(uuid.uuid4())
-        with e_db.begin() as c:
-            c.execute(text("INSERT INTO public.organizations (id, legal_name, pan) VALUES (:id, 'B11 Fail', 'AABCB9012Z')"), {"id": org_id})
-            c.execute(text("INSERT INTO public.gst_registrations (id, org_id, gstin, state_code, legal_name, registration_type, is_primary) VALUES (:rid, :oid, '27AABCB9012Z1Z5', '27', 'B11', 'REGULAR', true)"), {"rid": reg_id, "oid": org_id})
-            c.execute(text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:uid, 'b11fail@test.local', 'B11', true)"), {"uid": maker_id})
-            c.execute(text("INSERT INTO public.organization_memberships (id, org_id, user_id, role, status) VALUES (:mid, :oid, :uid, 'accountant', 'active')"), {"mid": str(uuid.uuid4()), "oid": org_id, "uid": maker_id})
-            c.execute(text("SET LOCAL session_replication_role = 'replica'"))
-            c.execute(
-                text(
-                    """
-                    INSERT INTO public.gstr3b_filings (
-                        id, org_id, registration_id, tax_period,
-                        table_3_1_data, table_4_data, offset_data,
-                        filing_status, maker_id, revision_number
-                    ) VALUES (:fid, :oid, :rid, '122025', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 'DRAFT', NULL, 1)
-                    """
-                ),
-                {"fid": legacy_fid, "oid": org_id, "rid": reg_id},
-            )
+        def poll(self):
+            return self._inner.poll()
 
-        app_eng = create_engine(b9_app_str)
-        nonce = uuid.uuid4().hex
-        sig = _sign_gstr3b_legacy_maker_claim(org_id, legacy_fid, maker_id, "LEGACY_SUBMISSION_CLAIM", nonce)
-        alembic_app_name = f"myca_b11_fail_{uuid.uuid4().hex[:8]}"
-        downgrade_env = env.copy()
-        downgrade_env["PGAPPNAME"] = alembic_app_name
-        popen = None
-        t = None
-        downgrade_result = {}
-        popen_exited_while_tx_active = False
+        def terminate(self):
+            # Ignore graceful terminate to simulate hung child forcing kill() escalation
+            return None
 
-        with pytest.raises(RuntimeError, match="Controlled failure before claim commit"):
-            try:
-                with app_eng.connect() as claim_conn:
-                    tx = claim_conn.begin()
-                    try:
-                        claim_pid = claim_conn.execute(text("SELECT pg_backend_pid()")).scalar()
-                        claim_conn.execute(text("SELECT set_config('app.current_org', :o, true)"), {"o": org_id})
-                        claim_conn.execute(
-                            text("SELECT public.claim_legacy_null_maker(CAST(:o AS uuid), CAST(:f AS uuid), CAST(:m AS uuid), 'LEGACY_SUBMISSION_CLAIM', :n, :s)"),
-                            {"o": org_id, "f": legacy_fid, "m": maker_id, "n": nonce, "s": sig},
-                        )
+        def kill(self):
+            return self._inner.kill()
 
-                        popen = subprocess.Popen(
-                            ["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"],
-                            cwd=backend_dir,
-                            env=downgrade_env,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                        )
+        def wait(self, timeout=None):
+            self._waits += 1
+            if self._waits == 1:
+                raise subprocess.TimeoutExpired(cmd="alembic", timeout=timeout or 5)
+            return self._inner.wait(timeout=timeout)
 
-                        def _communicate_downgrade():
-                            try:
-                                stdout, stderr = popen.communicate()
-                                downgrade_result["returncode"] = popen.returncode
-                                downgrade_result["stdout"] = stdout
-                                downgrade_result["stderr"] = stderr
-                            except Exception as exc:
-                                downgrade_result["error"] = exc
+    outcome, _, db_dropped = _run_failure_path_teardown_case(
+        "myca_b11_kill", popen_wrapper=_TerminateTimeoutPopen
+    )
+    assert outcome["kill_escalated"] is True
+    assert outcome["os_process_exited"] is True
+    assert outcome["popen_exited_while_tx_active"] is True
+    assert outcome["emergency_committed"] is False
+    assert outcome["contaminated_db"] is False
+    assert db_dropped is True
 
-                        t = threading.Thread(target=_communicate_downgrade)
-                        t.start()
 
-                        observed_lock_wait = False
-                        deadline = time.monotonic() + 20.0
-                        with e_db.connect().execution_options(isolation_level="AUTOCOMMIT") as obs_conn:
-                            while time.monotonic() < deadline:
-                                rows = obs_conn.execute(
-                                    text(
-                                        """
-                                        SELECT pid, application_name, state, wait_event_type, query,
-                                               pg_blocking_pids(pid) AS blockers
-                                        FROM pg_stat_activity
-                                        WHERE datname = :db
-                                          AND pid != pg_backend_pid()
-                                          AND pid != :claim_pid
-                                        """
-                                    ),
-                                    {"db": db_name, "claim_pid": claim_pid},
-                                ).mappings().all()
-                                for row in rows:
-                                    if (
-                                        row["application_name"] == alembic_app_name
-                                        and row["state"] == "active"
-                                        and row["wait_event_type"] == "Lock"
-                                        and claim_pid in (row["blockers"] or [])
-                                        and "LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE" in (row["query"] or "")
-                                        and "DROP TABLE" not in (row["query"] or "")
-                                    ):
-                                        observed_lock_wait = True
-                                        break
-                                if observed_lock_wait or not t.is_alive():
-                                    break
-                                time.sleep(0.05)
+def test_teardown_os_failure_falls_back_to_db_backend_termination():
+    class _OsKillBlockedPopen:
+        def __init__(self, inner):
+            self._inner = inner
 
-                        assert observed_lock_wait
-                        raise RuntimeError("Controlled failure before claim commit")
-                    finally:
-                        if popen is not None and popen.poll() is None:
-                            try:
-                                popen.terminate()
-                            except ProcessLookupError:
-                                pass
-                            try:
-                                popen.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                try:
-                                    popen.kill()
-                                except ProcessLookupError:
-                                    pass
-                                popen.wait(timeout=5)
-                        assert popen is not None and popen.poll() is not None
-                        popen_exited_while_tx_active = popen.poll() is not None and tx.is_active
-                        if tx.is_active:
-                            tx.rollback()
-                        if t is not None and t.is_alive():
-                            t.join(timeout=5)
-                        assert t is not None and not t.is_alive()
-            finally:
-                app_eng.dispose()
+        def poll(self):
+            return self._inner.poll()
 
-        assert popen_exited_while_tx_active is True
-        assert popen.poll() is not None
-        assert not t.is_alive()
+        def terminate(self):
+            raise OSError("Simulated OS terminate blocked")
 
-        rev = subprocess.run(
-            ["python", "-m", "alembic", "current"],
-            cwd=backend_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        assert "0039_gstr3b_legacy_claim_meta" in rev.stdout
-        with e_db.connect() as c:
-            assert c.execute(text("SELECT to_regclass('public.gstr3b_legacy_maker_claims')")).scalar() is not None
-            assert c.execute(text("SELECT count(*) FROM public.gstr3b_legacy_maker_claims WHERE filing_id = :f"), {"f": legacy_fid}).scalar() == 0
-    finally:
-        if e_db is not None:
-            e_db.dispose()
-        if created_db:
-            with admin_root.connect() as c:
-                c.execute(text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
-        admin_root.dispose()
+        def kill(self):
+            raise OSError("Simulated OS kill blocked")
+
+        def wait(self, timeout=None):
+            return self._inner.wait(timeout=timeout)
+
+    outcome, _, db_dropped = _run_failure_path_teardown_case(
+        "myca_b11_dbfallback", popen_wrapper=_OsKillBlockedPopen
+    )
+    assert outcome["kill_escalated"] is True
+    assert outcome["db_backend_terminated"] is True
+    assert outcome["db_backend_absent"] is True
+    assert outcome["os_process_exited"] is True
+    assert outcome["popen_exited_while_tx_active"] is True
+    assert outcome["emergency_committed"] is False
+    assert outcome["contaminated_db"] is False
+    assert db_dropped is True
+
+
+def test_teardown_all_termination_failures_preserves_provenance_and_marks_contaminated():
+    class _UnkillablePopen:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise OSError("Simulated OS terminate blocked")
+
+        def kill(self):
+            raise OSError("Simulated OS kill blocked")
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="alembic", timeout=timeout or 5)
+
+    class _FailingAdminDb:
+        def connect(self):
+            raise RuntimeError("Simulated unauthorized DB admin connection")
+
+    outcome, downgrade_result, db_dropped = _run_failure_path_teardown_case(
+        "myca_b11_allfail",
+        popen_wrapper=_UnkillablePopen,
+        override_e_db=_FailingAdminDb(),
+    )
+    assert outcome["os_process_exited"] is False
+    assert outcome["db_backend_absent"] is False
+    assert outcome["popen_exited_while_tx_active"] is False
+    assert outcome["emergency_committed"] is True
+    assert outcome["contaminated_db"] is True
+    assert db_dropped is False
+    # Unblocked by emergency commit, the real migration observed 1 claim and refused downgrade!
+    assert downgrade_result["returncode"] != 0
+    assert "Refusing to downgrade migration 0039" in (downgrade_result["stderr"] + downgrade_result["stdout"])
