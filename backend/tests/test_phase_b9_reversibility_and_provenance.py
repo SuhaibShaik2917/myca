@@ -676,75 +676,99 @@ def test_concurrent_downgrade_evidence_check_blocks_race():
         alembic_app_name = f"myca_b11_downgrade_{uuid.uuid4().hex[:8]}"
         downgrade_env = env.copy()
         downgrade_env["PGAPPNAME"] = alembic_app_name
+        t = None
 
-        with app_eng.connect() as claim_conn:
-            tx = claim_conn.begin()
-            claim_pid = claim_conn.execute(text("SELECT pg_backend_pid()")).scalar()
-            claim_conn.execute(text("SELECT set_config('app.current_org', :o, true)"), {"o": org_id})
-            claim_conn.execute(
-                text("SELECT public.claim_legacy_null_maker(CAST(:o AS uuid), CAST(:f AS uuid), CAST(:m AS uuid), 'LEGACY_SUBMISSION_CLAIM', :n, :s)"),
-                {"o": org_id, "f": legacy_fid, "m": maker_id, "n": nonce, "s": sig},
-            )
+        try:
+            with app_eng.connect() as claim_conn:
+                tx = claim_conn.begin()
+                try:
+                    claim_pid = claim_conn.execute(text("SELECT pg_backend_pid()")).scalar()
+                    claim_conn.execute(text("SELECT set_config('app.current_org', :o, true)"), {"o": org_id})
+                    claim_conn.execute(
+                        text("SELECT public.claim_legacy_null_maker(CAST(:o AS uuid), CAST(:f AS uuid), CAST(:m AS uuid), 'LEGACY_SUBMISSION_CLAIM', :n, :s)"),
+                        {"o": org_id, "f": legacy_fid, "m": maker_id, "n": nonce, "s": sig},
+                    )
 
-            def _run_downgrade():
-                downgrade_result["proc"] = subprocess.run(
-                    ["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"],
-                    cwd=backend_dir,
-                    env=downgrade_env,
-                    capture_output=True,
-                    text=True,
-                )
+                    def _run_downgrade():
+                        p = subprocess.Popen(
+                            ["python", "-m", "alembic", "downgrade", "0038_gstr3b_attested_creation"],
+                            cwd=backend_dir,
+                            env=downgrade_env,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+                        downgrade_result["popen"] = p
+                        stdout, stderr = p.communicate()
+                        downgrade_result["returncode"] = p.returncode
+                        downgrade_result["stdout"] = stdout
+                        downgrade_result["stderr"] = stderr
 
-            t = threading.Thread(target=_run_downgrade)
-            t.start()
+                    t = threading.Thread(target=_run_downgrade)
+                    t.start()
 
-            # Deterministically poll pg_stat_activity until the Alembic backend is blocked
-            # on LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE by claim_pid
-            observed_lock_wait = False
-            last_rows = []
-            deadline = time.monotonic() + 20.0
-            with e_db.connect().execution_options(isolation_level="AUTOCOMMIT") as obs_conn:
-                while time.monotonic() < deadline:
-                    rows = obs_conn.execute(
-                        text(
-                            """
-                            SELECT pid, application_name, state, wait_event_type, wait_event, query,
-                                   pg_blocking_pids(pid) AS blockers
-                            FROM pg_stat_activity
-                            WHERE datname = :db
-                              AND pid != pg_backend_pid()
-                              AND pid != :claim_pid
-                            """
-                        ),
-                        {"db": db_name, "claim_pid": claim_pid},
-                    ).mappings().all()
-                    last_rows = [dict(r) for r in rows]
-                    for row in rows:
-                        if (
-                            row["application_name"] == alembic_app_name
-                            and row["state"] == "active"
-                            and row["wait_event_type"] == "Lock"
-                            and claim_pid in (row["blockers"] or [])
-                            and "LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE" in (row["query"] or "")
-                            and "DROP TABLE" not in (row["query"] or "")
-                        ):
-                            observed_lock_wait = True
-                            break
-                    if observed_lock_wait or not t.is_alive():
-                        break
-                    time.sleep(0.05)
+                    # Deterministically poll pg_stat_activity until the Alembic backend is blocked
+                    # on LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE by claim_pid
+                    observed_lock_wait = False
+                    last_rows = []
+                    deadline = time.monotonic() + 20.0
+                    with e_db.connect().execution_options(isolation_level="AUTOCOMMIT") as obs_conn:
+                        while time.monotonic() < deadline:
+                            rows = obs_conn.execute(
+                                text(
+                                    """
+                                    SELECT pid, application_name, state, wait_event_type, wait_event, query,
+                                           pg_blocking_pids(pid) AS blockers
+                                    FROM pg_stat_activity
+                                    WHERE datname = :db
+                                      AND pid != pg_backend_pid()
+                                      AND pid != :claim_pid
+                                    """
+                                ),
+                                {"db": db_name, "claim_pid": claim_pid},
+                            ).mappings().all()
+                            last_rows = [dict(r) for r in rows]
+                            for row in rows:
+                                if (
+                                    row["application_name"] == alembic_app_name
+                                    and row["state"] == "active"
+                                    and row["wait_event_type"] == "Lock"
+                                    and claim_pid in (row["blockers"] or [])
+                                    and "LOCK TABLE public.gstr3b_legacy_maker_claims IN ACCESS EXCLUSIVE MODE" in (row["query"] or "")
+                                    and "DROP TABLE" not in (row["query"] or "")
+                                ):
+                                    observed_lock_wait = True
+                                    break
+                            if observed_lock_wait or not t.is_alive():
+                                break
+                            time.sleep(0.05)
 
-            assert observed_lock_wait, (
-                "Did not observe Alembic waiting on LOCK TABLE public.gstr3b_legacy_maker_claims "
-                f"IN ACCESS EXCLUSIVE MODE blocked by claim_pid={claim_pid}; last_rows={last_rows}"
-            )
-            tx.commit()
-            t.join(timeout=30)
+                    assert observed_lock_wait, (
+                        "Did not observe Alembic waiting on LOCK TABLE public.gstr3b_legacy_maker_claims "
+                        f"IN ACCESS EXCLUSIVE MODE blocked by claim_pid={claim_pid}; last_rows={last_rows}"
+                    )
+                    tx.commit()
+                    t.join(timeout=30)
+                    assert not t.is_alive(), "Alembic downgrade worker thread did not terminate within 30s after claim commit"
+                finally:
+                    if tx.is_active:
+                        tx.rollback()
+                    if t is not None and t.is_alive():
+                        popen = downgrade_result.get("popen")
+                        if popen is not None and popen.poll() is None:
+                            popen.terminate()
+                            t.join(timeout=5)
+                            if popen.poll() is None:
+                                popen.kill()
+                                t.join(timeout=5)
+                        else:
+                            t.join(timeout=5)
+                        assert not t.is_alive(), "Alembic downgrade worker thread failed to terminate during teardown"
+        finally:
+            app_eng.dispose()
 
-        app_eng.dispose()
-        proc = downgrade_result["proc"]
-        assert proc.returncode != 0
-        assert "Refusing to downgrade migration 0039" in (proc.stderr + proc.stdout)
+        assert downgrade_result["returncode"] != 0
+        assert "Refusing to downgrade migration 0039" in (downgrade_result["stderr"] + downgrade_result["stdout"])
 
         # Verify revision, table, and claim data remain intact after refused downgrade
         rev = subprocess.run(
