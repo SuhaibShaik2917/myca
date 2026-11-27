@@ -15,9 +15,13 @@ from app.modules.scheme_navigator.schemes_catalog import SEED_SCHEMES
 from app.modules.scheme_navigator.eligibility_engine import evaluate_scheme
 
 def seed_schemes_catalog_if_needed(session: Session) -> None:
-    """Seeds the global government_schemes catalog if table is empty."""
+    """Checks global government_schemes catalog; seeds only under superuser/admin migration context if empty."""
     count = session.execute(text("SELECT COUNT(*) FROM public.government_schemes;")).scalar() or 0
     if count > 0:
+        return
+
+    db_role = session.execute(text("SELECT current_user;")).scalar()
+    if db_role == "app_service_user":
         return
 
     for s in SEED_SCHEMES:
@@ -30,7 +34,8 @@ def seed_schemes_catalog_if_needed(session: Session) -> None:
             ) VALUES (
                 :id, :code, :name, :min, CAST(:cat AS public.scheme_category),
                 :desc, :benefits, :max_sub, true
-            );
+            )
+            ON CONFLICT (scheme_code) DO NOTHING;
             """),
             {
                 "id": scheme_id,
@@ -67,7 +72,7 @@ def seed_schemes_catalog_if_needed(session: Session) -> None:
     session.commit()
 
 def list_government_schemes(session: Session, category: Optional[str] = None) -> List[GovernmentSchemeOut]:
-    """Retrieves all active government schemes with their eligibility rules."""
+    """Retrieves all active government schemes with their eligibility rules (batch-loaded, no N+1)."""
     seed_schemes_catalog_if_needed(session)
 
     query = """
@@ -83,28 +88,31 @@ def list_government_schemes(session: Session, category: Optional[str] = None) ->
     query += " ORDER BY name ASC;"
 
     rows = session.execute(text(query), params).fetchall()
-    schemes: List[GovernmentSchemeOut] = []
+    if not rows:
+        return []
 
-    for r in rows:
-        rule_rows = session.execute(
-            text("""
-            SELECT rule_key, operator, target_value, rule_description
-            FROM public.scheme_eligibility_rules
-            WHERE scheme_id = :sid;
-            """),
-            {"sid": str(r.id)}
-        ).fetchall()
-
-        rules = [
+    scheme_ids = [str(r.id) for r in rows]
+    rule_rows = session.execute(
+        text("""
+        SELECT scheme_id::text as scheme_id, rule_key, operator, target_value, rule_description
+        FROM public.scheme_eligibility_rules
+        WHERE scheme_id::text = ANY(:sids);
+        """),
+        {"sids": scheme_ids},
+    ).fetchall()
+    rules_by_scheme: Dict[str, List[SchemeRuleOut]] = {}
+    for rr in rule_rows:
+        rules_by_scheme.setdefault(rr.scheme_id, []).append(
             SchemeRuleOut(
                 rule_key=rr.rule_key,
                 operator=rr.operator,
                 target_value=rr.target_value,
-                rule_description=rr.rule_description
-            ) for rr in rule_rows
-        ]
+                rule_description=rr.rule_description,
+            )
+        )
 
-        schemes.append(GovernmentSchemeOut(
+    return [
+        GovernmentSchemeOut(
             id=str(r.id),
             scheme_code=r.scheme_code,
             name=r.name,
@@ -114,10 +122,10 @@ def list_government_schemes(session: Session, category: Optional[str] = None) ->
             benefits_summary=r.benefits_summary,
             max_subsidy_amount=r.max_subsidy_amount,
             is_active=r.is_active,
-            rules=rules
-        ))
-
-    return schemes
+            rules=rules_by_scheme.get(str(r.id), []),
+        )
+        for r in rows
+    ]
 
 def get_or_create_business_profile(
     session: Session,
@@ -130,9 +138,12 @@ def get_or_create_business_profile(
     row = session.execute(
         text("""
         SELECT id, org_id, business_type, industry_sector, turnover_bracket,
-               annual_turnover, credit_score, udyam_number, gstin
+               annual_turnover, credit_score, udyam_number, gstin,
+               vintage_years, social_category, has_udyam
         FROM public.business_profiles
-        WHERE org_id = :org;
+        WHERE org_id = :org
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT 1;
         """),
         {"org": org_id}
     ).fetchone()
@@ -147,7 +158,10 @@ def get_or_create_business_profile(
             annual_turnover=row.annual_turnover,
             credit_score=row.credit_score,
             udyam_number=row.udyam_number,
-            gstin=row.gstin
+            gstin=row.gstin,
+            vintage_years=row.vintage_years,
+            social_category=row.social_category,
+            has_udyam=row.has_udyam if row.has_udyam is not None else bool(row.udyam_number),
         )
 
     # If not exists, create a default profile
@@ -155,9 +169,11 @@ def get_or_create_business_profile(
     session.execute(
         text("""
         INSERT INTO public.business_profiles (
-            id, org_id, business_type, industry_sector, turnover_bracket, annual_turnover
+            id, org_id, business_type, industry_sector, turnover_bracket, annual_turnover,
+            vintage_years, social_category, has_udyam
         ) VALUES (
-            :id, :org, 'Proprietorship', 'Manufacturing', 'Micro (< 5 Cr)', 0.00
+            :id, :org, 'Proprietorship', 'Manufacturing', 'Micro (< 5 Cr)', 0.00,
+            NULL, 'General', false
         );
         """),
         {"id": new_id, "org": org_id}
@@ -170,7 +186,10 @@ def get_or_create_business_profile(
         business_type="Proprietorship",
         industry_sector="Manufacturing",
         turnover_bracket="Micro (< 5 Cr)",
-        annual_turnover=Decimal("0.00")
+        annual_turnover=Decimal("0.00"),
+        vintage_years=None,
+        social_category="General",
+        has_udyam=False,
     )
 
 def upsert_business_profile(
@@ -179,11 +198,17 @@ def upsert_business_profile(
     user_id: Optional[str],
     profile_in: BusinessProfileIn
 ) -> BusinessProfileOut:
-    """Updates or creates MSME profile."""
+    """Updates or creates MSME profile persisting vintage_years, social_category, and has_udyam."""
     set_tenant_context(session, org_id=org_id, user_id=user_id)
+    has_udyam_val = bool(profile_in.udyam_number) if profile_in.udyam_number else bool(profile_in.has_udyam)
 
     existing = session.execute(
-        text("SELECT id FROM public.business_profiles WHERE org_id = :org;"),
+        text("""
+        SELECT id FROM public.business_profiles
+        WHERE org_id = :org
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT 1;
+        """),
         {"org": org_id}
     ).fetchone()
 
@@ -196,15 +221,22 @@ def upsert_business_profile(
                 turnover_bracket = :bracket,
                 annual_turnover = :turnover,
                 udyam_number = :udyam,
+                vintage_years = :vintage,
+                social_category = :social,
+                has_udyam = :has_udyam,
                 updated_at = clock_timestamp()
-            WHERE org_id = :org;
+            WHERE id = :pid AND org_id = :org;
             """),
             {
+                "pid": existing.id,
                 "btype": profile_in.business_type,
                 "sector": profile_in.industry_sector,
                 "bracket": profile_in.turnover_bracket,
                 "turnover": profile_in.annual_turnover,
                 "udyam": profile_in.udyam_number,
+                "vintage": profile_in.vintage_years,
+                "social": profile_in.social_category,
+                "has_udyam": has_udyam_val,
                 "org": org_id
             }
         )
@@ -214,9 +246,10 @@ def upsert_business_profile(
             text("""
             INSERT INTO public.business_profiles (
                 id, org_id, business_type, industry_sector, turnover_bracket,
-                annual_turnover, udyam_number
+                annual_turnover, udyam_number, vintage_years, social_category, has_udyam
             ) VALUES (
-                :id, :org, :btype, :sector, :bracket, :turnover, :udyam
+                :id, :org, :btype, :sector, :bracket, :turnover, :udyam,
+                :vintage, :social, :has_udyam
             );
             """),
             {
@@ -226,7 +259,10 @@ def upsert_business_profile(
                 "sector": profile_in.industry_sector,
                 "bracket": profile_in.turnover_bracket,
                 "turnover": profile_in.annual_turnover,
-                "udyam": profile_in.udyam_number
+                "udyam": profile_in.udyam_number,
+                "vintage": profile_in.vintage_years,
+                "social": profile_in.social_category,
+                "has_udyam": has_udyam_val,
             }
         )
 
@@ -245,7 +281,7 @@ def evaluate_and_persist_matches(
     set_tenant_context(session, org_id=org_id, user_id=user_id)
     seed_schemes_catalog_if_needed(session)
 
-    # 1. Profile data resolution
+    # 1. Profile data resolution from persisted DB values (never overwritten with fake constants)
     if profile_override:
         profile_dict = profile_override.model_dump()
         upsert_business_profile(session, org_id, user_id, profile_override)
@@ -255,17 +291,17 @@ def evaluate_and_persist_matches(
             "business_type": existing_profile.business_type,
             "industry_sector": existing_profile.industry_sector,
             "turnover_bracket": existing_profile.turnover_bracket or "Micro (< 5 Cr)",
-            "annual_turnover": existing_profile.annual_turnover or Decimal("0.00"),
+            "annual_turnover": existing_profile.annual_turnover,
             "udyam_number": existing_profile.udyam_number,
-            "vintage_years": 3,
-            "social_category": "General",
-            "has_udyam": bool(existing_profile.udyam_number)
+            "vintage_years": existing_profile.vintage_years,
+            "social_category": existing_profile.social_category,
+            "has_udyam": existing_profile.has_udyam if existing_profile.has_udyam is not None else bool(existing_profile.udyam_number)
         }
 
     # Ensure has_udyam is evaluated accurately
     if profile_dict.get("udyam_number"):
         profile_dict["has_udyam"] = True
-    elif "has_udyam" not in profile_dict:
+    elif "has_udyam" not in profile_dict or profile_dict["has_udyam"] is None:
         profile_dict["has_udyam"] = False
 
     # 2. Get all schemes and rules
@@ -286,8 +322,6 @@ def evaluate_and_persist_matches(
 
         if score >= Decimal("75.00"):
             status = "recommended"
-        elif score >= Decimal("50.00"):
-            status = "applied"  # Partially matched / eligible with condition
         else:
             status = "ineligible"
 

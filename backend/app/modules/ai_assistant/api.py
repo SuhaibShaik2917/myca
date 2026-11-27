@@ -2,7 +2,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_tenant_db, validate_tenant_identity
+from app.core.dependencies import get_tenant_db, validate_tenant_identity, require_roles
 from app.modules.ai_assistant.schemas import (
     ChatConversationIn, ChatResponseOut, QuickInsightOut
 )
@@ -18,7 +18,7 @@ def chat_endpoint(
     conversation: ChatConversationIn,
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant", "viewer"))
 ):
     """
     Multi-turn AI Assistant grounded in tenant's real-time GST and financial records.
@@ -39,7 +39,7 @@ def chat_endpoint(
 def quick_insights_endpoint(
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant", "viewer"))
 ):
     """
     Returns proactive statutory compliance alerts and financial advisory insights.

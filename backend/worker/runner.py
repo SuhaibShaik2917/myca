@@ -2,191 +2,252 @@ import time
 import signal
 import threading
 import logging
+from typing import Optional
 import psycopg
 from app.config import settings
+from app.database import to_psycopg_conninfo
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("worker")
+
 
 class HeartbeatManager:
     """
     Manages active lease renewals in a background thread to prevent lease expiry
     during long-running OCR or financial reconciliation jobs.
+    Retries transient failures up to max_consecutive_failures before declaring lease lost.
     """
-    def __init__(self, conn_str: str, task_id: str, lease_token: str, interval_sec: float = 90.0):
-        self.conn_str = conn_str
+    def __init__(
+        self,
+        conn_str: str,
+        task_id: str,
+        lease_token: str,
+        interval_sec: float = 90.0,
+        max_consecutive_failures: int = 3,
+    ):
+        self.conn_str = to_psycopg_conninfo(conn_str)
         self.task_id = task_id
         self.lease_token = lease_token
         self.interval_sec = interval_sec
+        self.max_consecutive_failures = max(1, max_consecutive_failures)
         self.stop_event = threading.Event()
         self.lease_lost = False
-        self.thread = None
+        self.thread: Optional[threading.Thread] = None
 
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
-        logger.debug(f"Heartbeat started for task {self.task_id}")
+        logger.debug("Heartbeat started for task %s", self.task_id)
+        failures = 0
         while not self.stop_event.wait(self.interval_sec):
             try:
-                with psycopg.connect(self.conn_str, autocommit=True) as conn:
+                with psycopg.connect(self.conn_str, autocommit=True, connect_timeout=10) as conn:
                     with conn.cursor() as cur:
                         cur.execute(
                             "SELECT public.renew_task_lease(%s, %s, %s);",
-                            (self.task_id, self.lease_token, 5)
+                            (self.task_id, self.lease_token, 5),
                         )
-                        new_expiry = cur.fetchone()[0]
-                        logger.info(f"Lease renewed for task {self.task_id}, expires at {new_expiry}")
+                        row = cur.fetchone()
+                        new_expiry = row[0] if row else None
+                        failures = 0
+                        logger.info("Lease renewed for task %s, expires at %s", self.task_id, new_expiry)
             except Exception as e:
-                logger.error(f"Heartbeat failed to renew lease for task {self.task_id}: {e}")
-                self.lease_lost = True
-                break
+                failures += 1
+                logger.warning(
+                    "Heartbeat renewal attempt %d/%d failed for task %s: %s",
+                    failures,
+                    self.max_consecutive_failures,
+                    self.task_id,
+                    e,
+                )
+                if failures >= self.max_consecutive_failures:
+                    logger.error("Lease marked lost for task %s after %d consecutive failures.", self.task_id, failures)
+                    self.lease_lost = True
+                    break
 
     def stop(self):
         self.stop_event.set()
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=2.0)
-        logger.debug(f"Heartbeat stopped for task {self.task_id}")
+        logger.debug("Heartbeat stopped for task %s", self.task_id)
 
 
 class WorkerRunner:
-    def __init__(self, org_id: str, instance_label: str = "worker-default"):
-        self.org_id = org_id
+    def __init__(self, org_id: Optional[str] = None, instance_label: str = "worker-default"):
+        self.org_id = org_id or getattr(settings, "WORKER_ORG_ID", None)
         self.instance_label = instance_label
-        self.conn_str = settings.DATABASE_WORKER_URL
+        self.conn_str = to_psycopg_conninfo(settings.DATABASE_WORKER_URL)
         self.running = True
-        self.current_task_id = None
-        self.current_lease_token = None
+        self._shutdown_event = threading.Event()
+        self.current_task_id: Optional[str] = None
+        self.current_lease_token: Optional[str] = None
 
-        # Setup graceful shutdown handlers
-        signal.signal(signal.SIGINT, self._handle_shutdown)
-        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        # Signal handlers may only set async-safe termination flags (no blocking DB/logging calls)
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, self._handle_shutdown)
+            signal.signal(signal.SIGTERM, self._handle_shutdown)
 
     def _handle_shutdown(self, signum, frame):
-        logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
         self.running = False
+        self._shutdown_event.set()
+
+    def stop(self):
+        self.running = False
+        self._shutdown_event.set()
+
+    def _release_current_task_safely(self):
         if self.current_task_id and self.current_lease_token:
             try:
-                with psycopg.connect(self.conn_str, autocommit=True) as conn:
+                with psycopg.connect(self.conn_str, autocommit=True, connect_timeout=10) as conn:
                     self.release(conn, self.current_task_id, self.current_lease_token)
-                    logger.info(f"Released task {self.current_task_id} back to queue before shutdown.")
+                    logger.info("Released task %s back to queue before shutdown.", self.current_task_id)
             except Exception as e:
-                logger.warning(f"Could not release task during shutdown: {e}")
+                logger.warning("Could not release task during shutdown: %s", e)
+            finally:
+                self.current_task_id = None
+                self.current_lease_token = None
 
-    def run_loop(self, poll_interval_sec: float = 2.0):
-        logger.info(f"Starting hardened MyCA worker for Org: {self.org_id}, Instance: {self.instance_label}")
-        with psycopg.connect(self.conn_str, autocommit=True) as conn:
-            while self.running:
-                task_id, lease_token = self.claim(conn)
-                if task_id and lease_token:
-                    self.current_task_id = task_id
-                    self.current_lease_token = lease_token
-                    logger.info(f"Claimed Task {task_id} with secure lease token")
+    def run_once(self, conn) -> bool:
+        """Executes a single poll-and-process cycle. Returns True if a task was claimed."""
+        if not self.org_id:
+            raise RuntimeError("WORKER_CONFIGURATION_ERROR: org_id is required to claim tenant tasks safely.")
 
-                    # Start active heartbeat renewal
-                    heartbeat = HeartbeatManager(self.conn_str, task_id, lease_token, interval_sec=90.0)
-                    heartbeat.start()
+        task_id, lease_token = self.claim(conn)
+        if not (task_id and lease_token):
+            return False
 
-                    try:
-                        result = self.process_task(task_id, heartbeat)
-                        if heartbeat.lease_lost:
-                            raise TimeoutError(f"Task {task_id} processing aborted because lease renewal failed.")
+        self.current_task_id = task_id
+        self.current_lease_token = lease_token
+        logger.info("Claimed Task %s with secure lease token", task_id)
 
-                        heartbeat.stop()
-                        self.complete(conn, task_id, lease_token, result)
-                        logger.info(f"Task {task_id} successfully completed.")
-                    except Exception as e:
-                        heartbeat.stop()
-                        logger.error(f"Task {task_id} processing failed: {e}")
-                        try:
-                            self.fail(conn, task_id, lease_token, str(e))
-                            logger.info(f"Task {task_id} transitioned to failure state.")
-                        except Exception as fail_err:
-                            logger.error(f"Failed to record failure status for task {task_id} (lease likely expired): {fail_err}")
-                    finally:
-                        self.current_task_id = None
-                        self.current_lease_token = None
-                else:
-                    time.sleep(poll_interval_sec)
+        heartbeat = HeartbeatManager(self.conn_str, task_id, lease_token, interval_sec=90.0)
+        heartbeat.start()
 
-        logger.info("Worker runner stopped cleanly.")
+        try:
+            result = self.process_task(task_id, heartbeat)
+            if heartbeat.lease_lost:
+                raise TimeoutError(f"Task {task_id} processing aborted because lease renewal failed.")
+
+            heartbeat.stop()
+            self.complete(conn, task_id, lease_token, result)
+            logger.info("Task %s successfully completed.", task_id)
+        except Exception as e:
+            heartbeat.stop()
+            logger.error("Task %s processing failed: %s", task_id, e)
+            try:
+                self.fail(conn, task_id, lease_token, str(e))
+                logger.info("Task %s transitioned to failure state.", task_id)
+            except Exception as fail_err:
+                logger.error("Failed to record failure status for task %s (lease likely expired): %s", task_id, fail_err)
+        finally:
+            self.current_task_id = None
+            self.current_lease_token = None
+        return True
+
+    def run_loop(self, poll_interval_sec: float = 2.0, max_iterations: Optional[int] = None):
+        logger.info("Starting hardened MyCA worker for Org: %s, Instance: %s", self.org_id, self.instance_label)
+        backoff_sec = 2.0
+        iterations = 0
+
+        try:
+            while self.running and (max_iterations is None or iterations < max_iterations):
+                try:
+                    with psycopg.connect(self.conn_str, autocommit=True, connect_timeout=10) as conn:
+                        backoff_sec = 2.0
+                        while self.running and (max_iterations is None or iterations < max_iterations):
+                            iterations += 1
+                            claimed = self.run_once(conn)
+                            if not claimed and self.running:
+                                self._shutdown_event.wait(poll_interval_sec)
+                except Exception as conn_err:
+                    logger.error("Worker DB connection error (reconnecting in %.1fs): %s", backoff_sec, conn_err)
+                    if not self.running:
+                        break
+                    self._shutdown_event.wait(backoff_sec)
+                    backoff_sec = min(backoff_sec * 2.0, 30.0)
+        finally:
+            self._release_current_task_safely()
+            logger.info("Worker runner stopped cleanly.")
 
     def claim(self, conn):
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT o_task_id, o_lease_token FROM public.claim_task(%s, %s);",
-                    (self.org_id, self.instance_label)
-                )
-                row = cur.fetchone()
-                if row and row[0]:
-                    return str(row[0]), str(row[1])
-        except Exception as e:
-            logger.error(f"Error querying claim_task: {e}")
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT o_task_id, o_lease_token FROM public.claim_task(%s, %s);",
+                (self.org_id, self.instance_label),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                return str(row[0]), str(row[1])
         return None, None
 
     def complete(self, conn, task_id: str, lease_token: str, result: dict):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT public.complete_task(%s, %s, %s::jsonb);",
-                (task_id, lease_token, psycopg.types.json.Jsonb(result))
+                (task_id, lease_token, psycopg.types.json.Jsonb(result)),
             )
 
     def renew(self, conn, task_id: str, lease_token: str, minutes: int = 5):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT public.renew_task_lease(%s, %s, %s);",
-                (task_id, lease_token, minutes)
+                (task_id, lease_token, minutes),
             )
 
     def fail(self, conn, task_id: str, lease_token: str, error_message: str):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT public.fail_task(%s, %s, %s);",
-                (task_id, lease_token, error_message)
+                (task_id, lease_token, error_message),
             )
 
     def release(self, conn, task_id: str, lease_token: str):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT public.release_task(%s, %s);",
-                (task_id, lease_token)
+                (task_id, lease_token),
             )
 
     def process_task(self, task_id: str, heartbeat: HeartbeatManager) -> dict:
         """
-        Routes claimed task to the appropriate processing pipeline.
-        Invoice Brain: Executes OCR extraction and deterministic GST validation.
+        Routes claimed task to the appropriate processing pipeline inside a proper transaction.
+        Rolls back partial DB changes on failure before task retry/fail state transition.
         """
         from app.modules.invoice_brain.service import process_invoice_ocr_task
 
-        with psycopg.connect(self.conn_str, autocommit=True) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT set_config('app.current_org', %s, false);", (self.org_id,))
-                cur.execute("SELECT task_type, payload FROM public.worker_tasks WHERE id = %s;", (task_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise ValueError(f"Task {task_id} payload not found")
-                
-                task_type, payload = row[0], row[1]
-                logger.info(f"Processing task {task_id} of type '{task_type}'")
+        with psycopg.connect(self.conn_str, autocommit=False, connect_timeout=10) as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT set_config('app.current_org', %s, true);", (self.org_id,))
+                    cur.execute("SELECT task_type, payload FROM public.worker_tasks WHERE id = %s;", (task_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError(f"Task {task_id} payload not found")
 
-                if task_type == "invoice_ocr":
-                    invoice_id = payload.get("invoice_id")
-                    document_id = payload.get("document_id")
-                    file_path = payload.get("file_path")
-                    mime_type = payload.get("mime_type", "application/pdf")
-                    
-                    return process_invoice_ocr_task(
-                        db_conn=conn,
-                        task_id=task_id,
-                        invoice_id=invoice_id,
-                        document_id=document_id,
-                        org_id=self.org_id,
-                        file_path=file_path,
-                        mime_type=mime_type,
-                        lease_token=heartbeat.lease_token
-                    )
-                else:
-                    return {"status": "success", "task_type": task_type, "processed_task": task_id}
+                    task_type, payload = row[0], row[1]
+                    logger.info("Processing task %s of type '%s'", task_id, task_type)
+
+                    if heartbeat.lease_lost:
+                        raise TimeoutError(f"Task {task_id} lease lost before execution.")
+
+                    if task_type == "invoice_ocr":
+                        res = process_invoice_ocr_task(
+                            db_conn=conn,
+                            task_id=task_id,
+                            invoice_id=payload.get("invoice_id"),
+                            document_id=payload.get("document_id"),
+                            org_id=self.org_id,
+                            file_path=payload.get("file_path"),
+                            mime_type=payload.get("mime_type", "application/pdf"),
+                            lease_token=heartbeat.lease_token,
+                        )
+                    else:
+                        res = {"status": "success", "task_type": task_type, "processed_task": task_id}
+
+                conn.commit()
+                return res
+            except Exception:
+                conn.rollback()
+                raise

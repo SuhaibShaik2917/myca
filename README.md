@@ -15,68 +15,54 @@ It combines deterministic statutory tax engines (CGST Act & Rules 2017), an auto
 | **GSTR-3B & Offset Engine (M3)** | Table 3.1 & Table 4 auto-aggregation, Rule 88A electronic ledger offset (100% IGST exhaustion & zero CGST/SGST cross-offset), Maker-Checker workflow, and GSP Sandbox filing (ARN/CIN generation) | Sections 49/49A/49B, Rule 88A, Form GST PMT-06 | **Complete** |
 | **Credit Builder (M4)** | Multi-bank/UPI statement ingestion, automated 8-head expense categorization, cash-flow margin trends, MSME Financial Readiness Index (300–900), and structured Loan Dossier generator | RBI Priority Sector Lending Guidelines | **Complete** |
 | **Scheme Navigator (M5)** | Deterministic multi-operator matching engine for 6 central MSME schemes (PMMY MUDRA, CGTMSE, PMEGP, PM-SVANidhi, Stand-Up India, ZED) with documentation checklists and direct portal links | Ministry of MSME / DFS Schemes | **Complete** |
-| **AI Financial Advisor** | Multi-turn Copilot grounded in real-time tenant GSTIN, tax liabilities, and credit readiness scores. Supports Gemini 2.5 Flash with automatic fallback to built-in deterministic GST domain rule engine | CGST Act 2017 Domain Rules | **Complete** |
+| **AI Financial Advisor** | Multi-turn Copilot grounded in real-time tenant GSTIN, tax liabilities, and credit readiness scores. Uses Gemini (`gemini-3.8-flash` / fallback `gemini-3.5-flash-lite`) with automatic fallback to built-in deterministic GST domain rule engine | CGST Act 2017 Domain Rules | **Complete** |
 
 ---
 
 ## 🛡️ Security & Multi-Tenancy Architecture
 
-- **PostgreSQL 16 Forced Row Level Security (RLS):** Every multi-tenant table enforces kernel-level RLS policies against unprivileged application user `app_service_user`.
-- **JWT Cryptographic Authentication:** HS256 tokens encoding verified organization membership; decoded token claims strictly override user-supplied headers to prevent identity spoofing.
-- **Audit Trails & Immutability:** SHA-256 cryptographic snapshot hashing on inward supply statements and tamper-evident payload hashing on GSTR-3B filings.
+- **PostgreSQL 16 Forced Row Level Security (RLS):** Every multi-tenant table (`40/40`) enforces kernel-level RLS policies against unprivileged application user `app_service_user`.
+- **JWT Cryptographic Authentication & OIDC PKCE:** RS256/ES256 OIDC Authorization Code + PKCE (`auth/idp-code-exchange`), server-side `jti` token revocation (`auth/logout`), and verified membership context (`auth/me`).
+- **Audit Trails & Immutability:** SHA-256 cryptographic snapshot hashing on inward supply statements and HMAC-attested payload hashing on GSTR-3B filings.
 
 ---
 
-## 🧪 Quality Assurance & Test Verification
+## 🧪 Verification Commands
 
-```text
-======================= 253 passed in 36.85s =======================
-Pass Rate: 100% (253 / 253 Backend Tests Passing)
-Frontend Build: Zero TypeScript / Lint Errors (Vite production bundle: 420 kB)
+```bash
+# Backend (clean PostgreSQL 16 database)
+cd backend
+alembic upgrade head
+python scripts/diagnose_ci_database.py
+python -m pytest tests/ -v --tb=short
+python scripts/audit_rls_security_comprehensive.py
+
+# Frontend
+cd frontend
+npx tsc --noEmit && npm test && npm run build
 ```
-
-- **M1 Tests:** Invoice OCR, line-item validation, multi-tenant security closure (42 tests).
-- **M2 Tests:** GSTR-2B reconciliation, 10-queue exception management, Rule 37/37A separation, Section 16(2)(b) goods receipt gating (193 tests).
-- **M3 Tests:** Table 3.1 & 4 aggregation, Rule 88A credit offset priority, Maker-Checker gate, GSP Sandbox filing (5 tests).
-- **M4 Tests:** Statement CSV ingestion, auto-categorizer, DSCR proxy, Financial Readiness Index (5 tests).
-- **M5 Tests:** Catalog seeding, multi-operator rule evaluation, scheme matching, checklist generation (5 tests).
-- **AI Tests:** Tenant context grounding, proactive alerts, statutory distinction (3 tests).
-
----
-
-## ⚡ Concurrency & Performance Benchmarks
-
-Benchmark executed with `backend/tests/benchmark_load.py` under concurrent load:
-- **Health Check (`GET /health`):** 100 reqs, 0 errors, Min: 7.1 ms, P50: 26.8 ms
-- **Auth Token Issuance (`POST /auth/demo-token`):** 50 reqs, 0 errors, **168.7 RPS**, Avg: 57.1 ms
-- **GST Registrations (`GET /reconciliation/gst-registrations`):** 50 reqs, 0 errors, **142.1 RPS**, Avg: 67.7 ms
-- **ITC Ledger Summary (`GET /itc-ledger/summary`):** 50 reqs, 0 errors, **151.9 RPS**, Avg: 63.0 ms
-- **Scheme Navigator Catalog (`GET /scheme-navigator/schemes`):** 50 reqs, 0 errors, **85.7 RPS**, Avg: 113.7 ms
-- **Credit Builder Summary (`GET /credit-builder/summary`):** 50 reqs, 0 errors, **100.6 RPS**, Avg: 94.0 ms
-- **AI Quick Insights (`GET /ai/quick-insights`):** 50 reqs, 0 errors, **82.3 RPS**, Avg: 117.9 ms
 
 ---
 
 ## 📦 Docker Deployment Quickstart
 
-### Using Docker Compose
+See [MYCA_PRODUCTION_RUNBOOK.md](file:///C:/Users/notyo/.gemini/antigravity/scratch/myca/MYCA_PRODUCTION_RUNBOOK.md) and `docs/release/` for complete operational procedures.
+
 ```bash
-# 1. Clone repository
-git clone https://github.com/SuhaibShaik2917/myca.git
-cd myca
-
-# 2. Configure production environment
+# 1. Configure production environment
 cp .env.production.example .env.production
-# (Edit .env.production with your secrets)
+# (Fill POSTGRES_*, DATABASE_*, SECRET_KEY, GSTR3B_REVIEW_ATTESTATION_KEY, OIDC & GEMINI keys)
 
-# 3. Build and launch all services (PostgreSQL 16, Backend API, Frontend Nginx)
-docker compose --env-file .env.production up -d --build
+# 2. Initialize PostgreSQL & apply schema migrations
+docker compose --env-file .env.production up -d db
+docker compose --env-file .env.production run --rm backend alembic upgrade head
 
-# 4. Apply database migrations
-docker compose exec backend alembic upgrade head
+# 3. Launch all services (PostgreSQL 16, Backend API, Background Worker, Frontend Nginx)
+docker compose --env-file .env.production up -d --build backend worker frontend
 
-# 5. Verify service health
-curl http://localhost:8000/health
+# 4. Verify service health
+curl -f http://localhost:8000/health
+curl -f http://localhost:8000/ready
 ```
 
 ---
@@ -99,4 +85,4 @@ The full release documentation suite is available in `docs/release/`:
 
 ## ⚖️ Statutory & Regulatory Notice
 
-The MyCA MSME Financial Readiness Indicator is an internal, deterministic analytical metric calculated from cash-flow regularity, operating margins, and statutory GST compliance records. It is NOT an official credit bureau score (e.g., CIBIL, Equifax, Experian, CRIF High Mark) and does not constitute a loan guarantee. Final credit underwriting decisions rest exclusively with empaneled banks and financial institutions. Live GSTN filing operates through certified GST Suvidha Provider (GSP) sandbox channels.
+The MyCA MSME Financial Readiness Indicator is an internal, deterministic analytical metric calculated from cash-flow regularity, operating margins, and statutory GST compliance records. It is NOT an official credit bureau score (e.g., CIBIL, Equifax, Experian, CRIF High Mark) and does not constitute a loan guarantee. Final credit underwriting decisions rest exclusively with empaneled banks and financial institutions. GSTN filing in this repository operates in GSP sandbox mode (`GSP_MODE=sandbox`); `GSP_MODE=live` fails closed unless licensed GST Suvidha Provider (GSP) credentials and live transport integration are provisioned.

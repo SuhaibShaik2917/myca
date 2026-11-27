@@ -250,8 +250,10 @@ def test_p1_legacy_previous_snapshot_backfill_on_upgrade():
     env["DB_ADMIN_URL"] = disp_admin
     env["DATABASE_URL"] = disp_admin.replace("postgresql://", "postgresql+psycopg://", 1)
 
+    _backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
     try:
-        subprocess.run(["python", "-m", "alembic", "upgrade", "0033_gstr3b_history_and_trigger"], env=env, check=True)
+        subprocess.run(["python", "-m", "alembic", "upgrade", "0033_gstr3b_history_and_trigger"], env=env, cwd=_backend_dir, check=True)
 
         org_id = str(uuid.uuid4())
         maker_id = str(uuid.uuid4())
@@ -298,7 +300,7 @@ def test_p1_legacy_previous_snapshot_backfill_on_upgrade():
                 )
 
         # Upgrade to 0034 -> backfills Revision 1
-        subprocess.run(["python", "-m", "alembic", "upgrade", "0034_gstr3b_state_machine"], env=env, check=True)
+        subprocess.run(["python", "-m", "alembic", "upgrade", "0034_gstr3b_state_machine"], env=env, cwd=_backend_dir, check=True)
 
         with psycopg.connect(disp_admin, autocommit=True) as conn:
             with conn.cursor() as cur:

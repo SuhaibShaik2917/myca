@@ -1345,6 +1345,46 @@ def test_electronic_credit_reversal_and_reclaimed_statement_portal_reconciliatio
     headers = {"X-User-Id": ctx["user_id"], "X-Org-Id": ctx["org_id"]}
     rp = "2026-11"
 
+    # Seed genuine DB records for INV-B2B-05 (availed May 2026, reversed Nov 2026 -> 184 days = ₹1,633.32)
+    # and historical reversal/reclaim pair HIST-R37-01 (₹17,250)
+    with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            p_b2b5 = str(uuid.uuid4())
+            p_hist = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.purchase_documents (
+                    id, org_id, registration_id, document_type, document_number,
+                    document_date, financial_period, supplier_gstin, supplier_legal_name,
+                    recipient_gstin, place_of_supply, goods_services_type, receipt_status,
+                    status, total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_invoice_value,
+                    is_availed_in_3b, availed_period
+                ) VALUES
+                (%s, %s, %s, 'tax_invoice', 'INV-B2B-05', '2026-04-10', '2026-04',
+                 '27AAACT9999K1ZA', 'TechPack Solutions', %s, '27', 'goods', 'RECEIVED',
+                 'approved', 100000.00, 9000.00, 9000.00, 0.00, 118000.00, true, '2026-04'),
+                (%s, %s, %s, 'tax_invoice', 'HIST-R37-01', '2026-03-15', '2026-03',
+                 '27AAACH8888M1Z2', 'Historical Component Vendor', %s, '27', 'goods', 'RECEIVED',
+                 'approved', 95833.33, 8625.00, 8625.00, 0.00, 113083.33, true, '2026-03');
+            """, (p_b2b5, ctx["org_id"], ctx["reg_mh"], ctx["gstin_mh"],
+                  p_hist, ctx["org_id"], ctx["reg_mh"], ctx["gstin_mh"]))
+            hist_rev_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.itc_reversal_events (
+                    id, org_id, purchase_doc_id, rule_code, reversal_reason, reversal_period,
+                    reversed_taxable, reversed_cgst, reversed_sgst, reversed_igst, reversed_cess
+                ) VALUES
+                (%s, %s, %s, 'RULE_37_180_DAYS', 'Historical Rule 37 deferral', '2026-09', 0.00, 8625.00, 8625.00, 0.00, 0.00),
+                (gen_random_uuid(), %s, %s, 'RULE_37_180_DAYS', 'Rule 37(1) 180-day non-payment', '2026-11', 0.00, 9000.00, 9000.00, 0.00, 0.00);
+            """, (hist_rev_id, ctx["org_id"], p_hist, ctx["org_id"], p_b2b5))
+            cur.execute("""
+                INSERT INTO public.itc_reavailment_events (
+                    id, org_id, purchase_doc_id, reversal_event_id, reavailment_period,
+                    reavailed_cgst, reavailed_sgst, reavailed_igst, reavailed_cess, reavailment_reason
+                ) VALUES (
+                    gen_random_uuid(), %s, %s, %s, '2026-11', 8625.00, 8625.00, 0.00, 0.00, 'Paid historical vendor'
+                );
+            """, (ctx["org_id"], p_hist, hist_rev_id))
+
     resp = client.get(
         f"/api/v1/reconciliation/financial-reports/unified?registration_id={ctx['reg_mh']}&return_period={rp}",
         headers=headers

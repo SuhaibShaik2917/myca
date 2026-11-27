@@ -173,7 +173,7 @@ def test_complete_s3_storage_lifecycle_with_mock_boto3(monkeypatch, tmp_path):
     # 2. Retrieval & OCR stat work via S3 URI (without calling os.stat/open on s3://)
     assert read_document_bytes(uri, expected_org_id=org_a) == payload
     assert stat_document_size(uri, expected_org_id=org_a) == len(payload)
-    extracted = extract_invoice_mock(uri, mime)
+    extracted = extract_invoice_mock(uri, mime, expected_org_id=org_a)
     assert extracted.invoice_number.startswith("INV-2026-")
 
     # 3. Tenant isolation enforcement blocks cross-org read/delete

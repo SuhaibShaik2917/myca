@@ -2,7 +2,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_tenant_db, validate_tenant_identity
+from app.core.dependencies import get_tenant_db, validate_tenant_identity, require_roles
 from app.modules.scheme_navigator.schemas import (
     GovernmentSchemeOut, BusinessProfileIn, BusinessProfileOut,
     SchemeMatchOut, SchemeChecklistOut
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/scheme-navigator", tags=["Milestone 5: Scheme Naviga
 @router.get("/schemes", response_model=List[GovernmentSchemeOut])
 def list_schemes_endpoint(
     category: Optional[str] = Query(None, description="Filter by scheme_category"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant", "viewer"))
 ):
     """Lists all active Indian government MSME schemes and eligibility criteria."""
     try:
@@ -31,7 +31,7 @@ def evaluate_eligibility_endpoint(
     profile_data: Optional[BusinessProfileIn] = None,
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant"))
 ):
     """
     Evaluates enterprise profile against all government schemes deterministically.
@@ -61,7 +61,7 @@ def get_checklist_endpoint(scheme_code: str):
 def get_profile_endpoint(
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant", "viewer"))
 ):
     """Fetches the current MSME profile for scheme evaluation."""
     effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)
@@ -75,7 +75,7 @@ def update_profile_endpoint(
     profile_in: BusinessProfileIn,
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant"))
 ):
     """Updates business profile (turnover, sector, Udyam registration)."""
     effective_org, effective_user = validate_tenant_identity(db, x_org_id, x_user_id)

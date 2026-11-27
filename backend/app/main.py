@@ -1,4 +1,7 @@
 import asyncio
+import json
+import logging
+import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -11,6 +14,7 @@ if vendor_dir.exists() and str(vendor_dir) not in sys.path:
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from app.config import settings
 from app.modules.auth.api import router as auth_router
@@ -22,13 +26,16 @@ from app.modules.credit_builder.api import router as credit_builder_router
 from app.modules.scheme_navigator.api import router as scheme_navigator_router
 from app.modules.ai_assistant.api import router as ai_assistant_router
 
+logger = logging.getLogger("myca.api")
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Application lifespan context manager.
-    Initializes and manages background rate-limit cleanup scheduling, and
-    verifies GSTR-3B trust anchor alignment on startup in production/staging.
+    Verifies GSTR-3B trust anchor alignment on startup in production/staging and
+    manages periodic background rate-limit cleanup.
     """
     env_norm = (settings.ENVIRONMENT or "").strip().lower()
     if env_norm in ("production", "staging"):
@@ -72,23 +79,56 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS restricted to configured frontend origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept", "X-User-Id", "X-Org-Id"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-User-Id", "X-Org-Id", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
 )
 
 
 @app.middleware("http")
-async def attach_request_id(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+async def attach_request_id_and_security_headers(request: Request, call_next):
+    raw_req_id = request.headers.get("X-Request-ID", "").strip()
+    request_id = raw_req_id if _REQUEST_ID_PATTERN.match(raw_req_id) else str(uuid.uuid4())
     request.state.request_id = request_id
+
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if request.url.path.startswith(f"{settings.API_V1_STR}/auth"):
+        response.headers["Cache-Control"] = "no-store"
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "http_request",
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+            }
+        )
+    )
     return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    req_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
+    logger.error("Unhandled internal error [request_id=%s]: %s", req_id, exc, exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "detail": "INTERNAL_SERVER_ERROR: An unexpected error occurred. Reference the request ID for support.",
+            "request_id": req_id,
+        },
+        headers={"X-Request-ID": req_id},
+    )
 
 
 # Mount Routers
@@ -100,13 +140,13 @@ app.include_router(credit_builder_router, prefix=settings.API_V1_STR)
 app.include_router(scheme_navigator_router, prefix=settings.API_V1_STR)
 app.include_router(ai_assistant_router, prefix=settings.API_V1_STR)
 
+
 @app.get("/health")
 def health_check():
     return {
-        "status": "ok", 
-        "project": settings.PROJECT_NAME, 
+        "status": "ok",
+        "project": settings.PROJECT_NAME,
         "version": settings.VERSION,
-        "environment": settings.ENVIRONMENT
     }
 
 
@@ -117,7 +157,7 @@ def readiness_check():
     db = SessionLocal()
     try:
         db.execute(text("SELECT 1;")).scalar()
-        alembic_rev = db.execute(text("SELECT version_num FROM alembic_version LIMIT 1;")).scalar()
+        alembic_rev = db.execute(text("SELECT version_num FROM public.alembic_version LIMIT 1;")).scalar()
         if not alembic_rev:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -125,18 +165,19 @@ def readiness_check():
             )
         return {
             "status": "ready",
-            "environment": settings.ENVIRONMENT,
             "alembic_revision": str(alembic_rev),
         }
     except HTTPException:
         raise
     except Exception as exc:
+        logger.error("Readiness check failed: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"DEPENDENCY_UNREADY: PostgreSQL readiness check failed: {exc}",
+            detail="DEPENDENCY_UNREADY: PostgreSQL readiness check failed.",
         ) from exc
     finally:
         db.close()
+
 
 @app.get("/")
 def root():

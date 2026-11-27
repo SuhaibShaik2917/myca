@@ -27,6 +27,28 @@ CREDIT_DISCLAIMER = (
 def quant(d: Decimal) -> Decimal:
     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+MAX_STATEMENT_ROWS = 50000
+
+
+def _sanitize_csv_text_cell(val: Optional[str]) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    while s and s[0] in ("=", "+", "@", "\t", "\r"):
+        s = s[1:].lstrip()
+    return s
+
+
+def _parse_iso_or_common_date(raw: str) -> Optional[str]:
+    raw_clean = str(raw).strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(raw_clean[:10], fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
 def ingest_statement_csv(
     session: Session,
     org_id: str,
@@ -34,7 +56,7 @@ def ingest_statement_csv(
     csv_content: str
 ) -> StatementUploadResponse:
     """
-    Parses standard CSV bank/UPI statements and persists categorized records.
+    Parses standard CSV bank/UPI statements and batch-persists categorized records.
     Expected CSV columns: Date, Description, Type (credit/debit), Amount, [Reference]
     """
     set_tenant_context(session, org_id=org_id, user_id=user_id)
@@ -43,59 +65,62 @@ def ingest_statement_csv(
     total_cr = Decimal("0.00")
     total_dr = Decimal("0.00")
     dates: List[str] = []
+    batch_rows: List[Dict[str, Any]] = []
 
     for row in reader:
-        # Standardize headers (case-insensitive)
-        clean_row = {k.strip().lower(): v.strip() for k, v in row.items() if k and v}
-        tx_date = clean_row.get("date") or clean_row.get("transaction_date") or clean_row.get("value date")
-        desc = clean_row.get("description") or clean_row.get("narration") or clean_row.get("particulars") or ""
+        if len(batch_rows) >= MAX_STATEMENT_ROWS:
+            raise ValueError(f"CSV row limit exceeded ({MAX_STATEMENT_ROWS} max transactions per upload).")
+        clean_row = {k.strip().lower(): v.strip() for k, v in row.items() if k and v is not None}
+        raw_date = clean_row.get("date") or clean_row.get("transaction_date") or clean_row.get("value date")
+        desc = _sanitize_csv_text_cell(clean_row.get("description") or clean_row.get("narration") or clean_row.get("particulars") or "") or ""
         tx_type = clean_row.get("type") or clean_row.get("transaction_type") or clean_row.get("cr/dr")
-        amt_str = clean_row.get("amount") or clean_row.get("withdrawal") or clean_row.get("deposit") or "0"
-        ref = clean_row.get("reference") or clean_row.get("ref_no") or clean_row.get("cheque_no")
+        dep_val = clean_row.get("deposit")
+        wd_val = clean_row.get("withdrawal")
+        amt_str = clean_row.get("amount")
+        if amt_str is None or amt_str == "":
+            amt_str = wd_val if (wd_val is not None and wd_val not in ("", "0", "0.00")) else dep_val
+        ref = _sanitize_csv_text_cell(clean_row.get("reference") or clean_row.get("ref_no") or clean_row.get("cheque_no"))
 
-        if not tx_date or not amt_str:
+        if not raw_date or amt_str is None or amt_str == "":
+            continue
+        tx_date = _parse_iso_or_common_date(raw_date)
+        if not tx_date:
             continue
 
-        # Clean amount
+        # Clean amount (strict Decimal validation)
         amt_clean = amt_str.replace(",", "").replace("₹", "").replace("INR", "").strip()
         try:
             amt = Decimal(amt_clean)
+            if not amt.is_finite():
+                continue
         except Exception:
             continue
 
         # Infer type if deposit/withdrawal columns were used
         if not tx_type:
-            if clean_row.get("deposit"):
+            if dep_val not in (None, "", "0", "0.00") and (wd_val in (None, "", "0", "0.00")):
                 tx_type = "credit"
-            elif clean_row.get("withdrawal"):
+            elif wd_val not in (None, "", "0", "0.00"):
                 tx_type = "debit"
             else:
                 tx_type = "credit" if amt > 0 else "debit"
 
         tx_type_clean = "credit" if "cr" in tx_type.lower() else "debit"
         amt = abs(amt)
+        if amt <= Decimal("0.00"):
+            continue
 
-        category = clean_row.get("category") or categorize_transaction(desc, tx_type_clean)
-
-        tx_id = str(uuid.uuid4())
-        session.execute(
-            text("""
-            INSERT INTO public.financial_transactions (
-                id, org_id, transaction_date, amount, transaction_type,
-                category, counterparty, reference_number, created_at
-            ) VALUES (
-                :id, :org, :tdate, :amt, :ttype, :cat, :cparty, :ref, clock_timestamp()
-            );
-            """),
+        category = _sanitize_csv_text_cell(clean_row.get("category")) or categorize_transaction(desc, tx_type_clean)
+        batch_rows.append(
             {
-                "id": tx_id,
+                "id": str(uuid.uuid4()),
                 "org": org_id,
                 "tdate": tx_date,
                 "amt": amt,
                 "ttype": tx_type_clean,
-                "cat": category,
+                "cat": category[:64] if category else "General Operations",
                 "cparty": desc[:128],
-                "ref": ref
+                "ref": ref[:64] if ref else None,
             }
         )
 
@@ -105,6 +130,19 @@ def ingest_statement_csv(
             total_cr += amt
         else:
             total_dr += amt
+
+    if batch_rows:
+        session.execute(
+            text("""
+            INSERT INTO public.financial_transactions (
+                id, org_id, transaction_date, amount, transaction_type,
+                category, counterparty, reference_number, created_at
+            ) VALUES (
+                :id, :org, :tdate, :amt, :ttype, :cat, :cparty, :ref, clock_timestamp()
+            );
+            """),
+            batch_rows,
+        )
 
     session.commit()
 
@@ -284,10 +322,10 @@ def compute_financial_readiness_score(
             dscr_rating = "STRESSED"
             dscr_desc = f"DSCR proxy of {dscr}x indicates tight debt coverage."
     else:
-        dscr = Decimal("3.50")  # Zero existing debt indicates clean balance sheet
+        dscr = Decimal("0.00")
         dscr_score = 140
-        dscr_rating = "EXCELLENT"
-        dscr_desc = "Zero existing bank borrowing observed; full debt capacity available."
+        dscr_rating = "UNLEVERAGED_NO_DEBT"
+        dscr_desc = "No active debt servicing EMI obligations detected in uploaded statements (DSCR N/A)."
 
     factors.append(ReadinessFactor(
         name="Debt Service Coverage (DSCR)",
@@ -319,9 +357,13 @@ def compute_financial_readiness_score(
         description=margin_desc
     ))
 
-    # 4. Statutory GST Compliance Track Record (Max 200)
+    # 4. Statutory GST Compliance Track Record (Max 200) — exclude SANDBOX filings
     gst_filings_count = session.execute(
-        text("SELECT COUNT(*) FROM public.gst_records WHERE org_id = :org AND filing_status = 'filed';"),
+        text("""
+        SELECT COUNT(*) FROM public.gst_records
+        WHERE org_id = :org AND filing_status = 'filed'
+          AND (filing_mode = 'LIVE_PORTAL' OR is_live_portal_filing = true);
+        """),
         {"org": org_id}
     ).scalar() or 0
 
@@ -337,7 +379,7 @@ def compute_financial_readiness_score(
     else:
         gst_score = 120
         gst_rating = "PARTIAL"
-        gst_desc = "GST registration active; recommended to complete quarterly reconciliations."
+        gst_desc = "GST registration active; recommended to complete reconciliations and live portal filings."
 
     factors.append(ReadinessFactor(
         name="GST Compliance & Provenance",
@@ -358,17 +400,6 @@ def compute_financial_readiness_score(
         overall_rating = "FAIR"
     else:
         overall_rating = "NEEDS_ATTENTION"
-
-    # Save to business_profiles credit_score
-    session.execute(
-        text("""
-        UPDATE public.business_profiles
-        SET credit_score = :cs, updated_at = clock_timestamp()
-        WHERE org_id = :org;
-        """),
-        {"cs": total_score, "org": org_id}
-    )
-    session.commit()
 
     return FinancialReadinessScore(
         score=total_score,

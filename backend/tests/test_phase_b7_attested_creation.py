@@ -382,14 +382,16 @@ def test_p1_dedicated_attestation_key_upgrade_from_0035_to_0038():
     env["DB_ADMIN_URL"] = disp_admin
     env["DATABASE_URL"] = disp_admin.replace("postgresql://", "postgresql+psycopg://", 1)
 
+    _backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
     try:
         # Step 1: Migrate to 0035 WITHOUT dedicated key (seeds SECRET_KEY fallback)
         env.pop("GSTR3B_REVIEW_ATTESTATION_KEY", None)
-        subprocess.run(["python", "-m", "alembic", "upgrade", "0035_gstr3b_reviewer_binding"], env=env, check=True)
+        subprocess.run(["python", "-m", "alembic", "upgrade", "0035_gstr3b_reviewer_binding"], env=env, cwd=_backend_dir, check=True)
 
         # Step 2: Enable dedicated key and upgrade to 0038
         env["GSTR3B_REVIEW_ATTESTATION_KEY"] = dedicated_key
-        subprocess.run(["python", "-m", "alembic", "upgrade", "0038_gstr3b_attested_creation"], env=env, check=True)
+        subprocess.run(["python", "-m", "alembic", "upgrade", "0038_gstr3b_attested_creation"], env=env, cwd=_backend_dir, check=True)
 
         with psycopg.connect(disp_admin, autocommit=True) as conn:
             with conn.cursor() as cur:

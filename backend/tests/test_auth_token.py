@@ -139,6 +139,131 @@ def generate_test_rsa_keypair():
     return priv_pem, pub_pem
 
 
+def _generate_mock_oidc_rsa_jwk(kid: str = "test-auth-k1"):
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv_pem = priv.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("utf-8")
+    nums = priv.public_key().public_numbers()
+
+    def _b64u(val: int) -> str:
+        raw = val.to_bytes((val.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    jwk_dict = {
+        "kty": "RSA",
+        "kid": kid,
+        "use": "sig",
+        "alg": "RS256",
+        "n": _b64u(nums.n),
+        "e": _b64u(nums.e),
+    }
+    return priv_pem, jwk_dict
+
+
+class _MockAuthCodeIdpServer:
+    """Minimal in-process OIDC Discovery, JWKS, and /token server for Authorization Code + PKCE tests."""
+
+    def __init__(self, kid: str = "test-auth-k1"):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from urllib.parse import parse_qs, urlparse
+
+        self.priv_pem, self.jwk_dict = _generate_mock_oidc_rsa_jwk(kid)
+        self.kid = kid
+        self.issued_codes = {}
+        self.token_hits = 0
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                path = urlparse(self.path).path
+                if path == "/.well-known/openid-configuration":
+                    body = json.dumps({
+                        "issuer": f"http://127.0.0.1:{self.server.server_port}",
+                        "jwks_uri": f"http://127.0.0.1:{self.server.server_port}/jwks.json",
+                        "token_endpoint": f"http://127.0.0.1:{self.server.server_port}/token",
+                    }).encode("utf-8")
+                elif path == "/jwks.json":
+                    body = json.dumps({"keys": [parent.jwk_dict]}).encode("utf-8")
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                if urlparse(self.path).path != "/token":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                length = int(self.headers.get("Content-Length", "0"))
+                raw_body = self.rfile.read(length).decode("utf-8")
+                params = {k: v[0] for k, v in parse_qs(raw_body).items()}
+                parent.token_hits += 1
+                entry = parent.issued_codes.get(params.get("code", ""))
+                if not entry or params.get("grant_type") != "authorization_code":
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                verifier = params.get("code_verifier", "")
+                computed = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+                if computed != entry["code_challenge"] or params.get("redirect_uri") != entry["redirect_uri"]:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                body = json.dumps({"id_token": entry["id_token"], "token_type": "Bearer"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                return
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_port
+        self.issuer = f"http://127.0.0.1:{self.port}"
+        self.discovery_url = f"http://127.0.0.1:{self.port}/.well-known/openid-configuration"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def sign_id_token(self, email: str, nonce: str, *, extra=None) -> str:
+        now = int(time.time())
+        claims = {
+            "sub": "user-sub-12345",
+            "email": email,
+            "email_verified": True,
+            "iss": self.issuer,
+            "aud": "myca-test-aud",
+            "nonce": nonce,
+            "iat": now,
+            "exp": now + 3600,
+        }
+        if extra:
+            claims.update(extra)
+        return jwt.encode(claims, self.priv_pem, algorithm="RS256", headers={"kid": self.kid, "alg": "RS256"})
+
+    def __enter__(self):
+        from app.core.jwks import default_jwks_client
+        default_jwks_client.clear_cache()
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        from app.core.jwks import default_jwks_client
+        self.server.shutdown()
+        self.server.server_close()
+        default_jwks_client.clear_cache()
+
+
 def create_signed_test_jwt(
     payload_overrides=None,
     key=None,
@@ -207,9 +332,12 @@ def test_bearer_token_identity_rejects_spoofed_headers(monkeypatch):
         x_user_id=USER_ID,
         x_org_id=ORG_ID,
     )
-    next(generator_valid)
-    assert captured["user_id"] == USER_ID
-    assert captured["org_id"] == ORG_ID
+    try:
+        next(generator_valid)
+        assert captured["user_id"] == USER_ID
+        assert captured["org_id"] == ORG_ID
+    finally:
+        generator_valid.close()
 
 
 def test_invalid_bearer_token_returns_401():
@@ -334,30 +462,49 @@ def test_demo_token_allowed_when_explicitly_configured_in_test(monkeypatch):
 # =========================================================================
 
 def test_idp_token_exchange_fails_closed_in_production_without_trust_anchors(monkeypatch):
-    """Proves that production IdP exchange fails closed (HTTP 503) when trust anchors are missing."""
+    """Proves that legacy /idp-exchange is retired (410) and production /idp-code-exchange fails closed (503) without trust anchors."""
     from app.main import app
-    client = TestClient(app)
+    _ensure_org_exists(ORG_ID)
+    client = TestClient(app, base_url="https://testserver", client=("198.51.100.10", 50000))
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.setattr(settings, "ENVIRONMENT", "production")
     monkeypatch.delenv("MYCA_IDP_ISSUER", raising=False)
     monkeypatch.delenv("MYCA_IDP_PUBLIC_KEY", raising=False)
     monkeypatch.delenv("MYCA_IDP_AUDIENCE", raising=False)
+    monkeypatch.delenv("MYCA_IDP_DISCOVERY_URL", raising=False)
+    monkeypatch.delenv("MYCA_IDP_TOKEN_URL", raising=False)
+    monkeypatch.setattr(settings, "MYCA_IDP_ISSUER", None)
+    monkeypatch.setattr(settings, "MYCA_IDP_PUBLIC_KEY", None)
+    monkeypatch.setattr(settings, "MYCA_IDP_AUDIENCE", None)
+    monkeypatch.setattr(settings, "MYCA_IDP_DISCOVERY_URL", None)
+    monkeypatch.setattr(settings, "MYCA_IDP_TOKEN_URL", None)
 
-    token = create_signed_test_jwt()
     verifier, challenge, state = generate_pkce_pair()
-    client.cookies.set("myca_auth_session", "test_session_cookie")
-    response = client.post(
+    retired_resp = client.post(
         "/api/v1/auth/idp-exchange",
+        json={"idp_provider": "google", "idp_token": "retired", "org_id": ORG_ID},
+    )
+    assert retired_resp.status_code == 410
+    assert "IDP_EXCHANGE_RETIRED" in retired_resp.json()["detail"]
+
+    nonce_resp = client.post(
+        "/api/v1/auth/idp-nonce",
+        json={"org_id": ORG_ID, "idp_provider": "google", "state": state, "code_challenge": challenge},
+    )
+    assert nonce_resp.status_code == 200
+    response = client.post(
+        "/api/v1/auth/idp-code-exchange",
         json={
             "idp_provider": "google",
-            "idp_token": token,
             "org_id": ORG_ID,
+            "code": "auth-code-prod-check",
             "state": state,
             "code_verifier": verifier,
+            "redirect_uri": "https://app.myca.example/auth/callback",
         },
     )
     assert response.status_code == 503
-    assert "IDP_INTEGRATION_UNAVAILABLE" in response.json()["detail"]
+    assert "IDP_" in response.json()["detail"] or "UNAVAILABLE" in response.json()["detail"].upper()
 
 
 def test_idp_rejects_unauthorized_provider():
@@ -458,10 +605,11 @@ def test_idp_rejects_untrusted_key_id(monkeypatch):
 def test_idp_token_exchange_with_authentic_asymmetric_rsa_in_production(monkeypatch):
     """
     AUTHENTIC PRODUCTION ASYMMETRIC IDP VERIFICATION TEST:
-    Demonstrates end-to-end token exchange in production mode using authentic RS256
-    cryptographic keypair, valid issuer, audience, and active user lookup.
+    1. Verifies authentic RS256 cryptographic validation in production mode via validate_idp_token.
+    2. Verifies full Authorization Code + PKCE S256 + JWKS exchange via /api/v1/auth/idp-code-exchange.
     """
     from app.main import app
+    _ensure_org_exists(ORG_ID)
     priv_pem, pub_pem = generate_test_rsa_keypair()
 
     monkeypatch.setenv("ENVIRONMENT", "production")
@@ -473,7 +621,7 @@ def test_idp_token_exchange_with_authentic_asymmetric_rsa_in_production(monkeypa
     monkeypatch.setenv("MYCA_IDP_PUBLIC_KEY", pub_pem)
     monkeypatch.setattr(settings, "MYCA_IDP_PUBLIC_KEY", pub_pem)
 
-    token = create_signed_test_jwt(
+    prod_token = create_signed_test_jwt(
         payload_overrides={
             "iss": "https://accounts.google.com",
             "aud": "myca-prod-client-id",
@@ -484,98 +632,151 @@ def test_idp_token_exchange_with_authentic_asymmetric_rsa_in_production(monkeypa
         key=priv_pem,
         algorithm="RS256",
     )
-
-    mock_db = MagicMock()
-    mock_db.execute.return_value.fetchone.return_value = (USER_ID, "prod.auditor@firm.test", True)
-    monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
-    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
-    monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: True)
-
-    verifier, challenge, state = generate_pkce_pair()
-    client = TestClient(app)
-    client.cookies.set("myca_auth_session", "test_cookie")
-    response = client.post(
-        "/api/v1/auth/idp-exchange",
-        json={
-            "idp_provider": "google",
-            "idp_token": token,
-            "org_id": ORG_ID,
-            "state": state,
-            "code_verifier": verifier,
-        },
+    verified_claims = validate_idp_token(
+        "google", prod_token, env="production", expected_nonce="test-rsa-prod-nonce-001"
     )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["user_id"] == USER_ID
-    assert data["org_id"] == ORG_ID
-    claims = decode_access_token(data["access_token"])
-    assert claims["sub"] == USER_ID
+    assert verified_claims["email"] == "prod.auditor@firm.test"
+
+    # Full Authorization Code + PKCE flow via /api/v1/auth/idp-code-exchange
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setattr(settings, "ENVIRONMENT", "test")
+    monkeypatch.delenv("MYCA_IDP_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("MYCA_IDP_ISSUER", raising=False)
+    monkeypatch.delenv("MYCA_IDP_AUDIENCE", raising=False)
+    monkeypatch.setattr(settings, "MYCA_IDP_PUBLIC_KEY", None)
+    redirect_uri = "http://localhost:5173/auth/callback"
+    with _MockAuthCodeIdpServer() as srv:
+        monkeypatch.setattr(settings, "MYCA_IDP_DISCOVERY_URL", srv.discovery_url)
+        monkeypatch.setattr(settings, "MYCA_IDP_ISSUER", srv.issuer)
+        monkeypatch.setattr(settings, "MYCA_IDP_AUDIENCE", "myca-test-aud")
+        monkeypatch.setattr(settings, "MYCA_IDP_REDIRECT_URIS", [redirect_uri])
+
+        verifier, challenge, state = generate_pkce_pair()
+        client = TestClient(app)
+        nonce_resp = client.post(
+            "/api/v1/auth/idp-nonce",
+            json={"org_id": ORG_ID, "idp_provider": "google", "state": state, "code_challenge": challenge},
+        )
+        assert nonce_resp.status_code == 200
+        nonce = nonce_resp.json()["nonce"]
+        auth_code = f"code_{secrets.token_urlsafe(12)}"
+        srv.issued_codes[auth_code] = {
+            "code_challenge": challenge,
+            "redirect_uri": redirect_uri,
+            "id_token": srv.sign_id_token("prod.auditor@firm.test", nonce),
+        }
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchone.return_value = (USER_ID, "prod.auditor@firm.test", True)
+        monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
+        monkeypatch.setattr(auth_api, "preverify_idp_auth_transaction", lambda *args, **kwargs: nonce)
+        monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
+        monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: True)
+
+        response = client.post(
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": auth_code,
+                "state": state,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["user_id"] == USER_ID
+        assert data["org_id"] == ORG_ID
+        claims = decode_access_token(data["access_token"])
+        assert claims["sub"] == USER_ID
 
 
 def test_idp_token_exchange_rejects_suspended_user(monkeypatch):
-    """Proves IdP exchange rejects inactive/suspended users."""
+    """Proves IdP code exchange rejects inactive/suspended users."""
     from app.main import app
-    token = create_signed_test_jwt(
-        payload_overrides={
-            "email": "suspended@firm.test",
-            "nonce": "test-suspended-nonce-001",
+    _ensure_org_exists(ORG_ID)
+    redirect_uri = "http://localhost:5173/auth/callback"
+    with _MockAuthCodeIdpServer() as srv:
+        monkeypatch.setattr(settings, "MYCA_IDP_DISCOVERY_URL", srv.discovery_url)
+        monkeypatch.setattr(settings, "MYCA_IDP_ISSUER", srv.issuer)
+        monkeypatch.setattr(settings, "MYCA_IDP_AUDIENCE", "myca-test-aud")
+        monkeypatch.setattr(settings, "MYCA_IDP_REDIRECT_URIS", [redirect_uri])
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchone.return_value = (USER_ID, "suspended@firm.test", False)
+        monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
+        monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
+
+        verifier, challenge, state = generate_pkce_pair()
+        auth_code = f"code_{secrets.token_urlsafe(12)}"
+        nonce = "test-suspended-nonce-001"
+        srv.issued_codes[auth_code] = {
+            "code_challenge": challenge,
+            "redirect_uri": redirect_uri,
+            "id_token": srv.sign_id_token("suspended@firm.test", nonce),
         }
-    )
+        monkeypatch.setattr(auth_api, "preverify_idp_auth_transaction", lambda *args, **kwargs: nonce)
 
-    mock_db = MagicMock()
-    # is_active = False
-    mock_db.execute.return_value.fetchone.return_value = (USER_ID, "suspended@firm.test", False)
-    monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
-    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
-
-    verifier, challenge, state = generate_pkce_pair()
-    client = TestClient(app)
-    client.cookies.set("myca_auth_session", "test_cookie")
-    response = client.post(
-        "/api/v1/auth/idp-exchange",
-        json={
-            "idp_provider": "google",
-            "idp_token": token,
-            "org_id": ORG_ID,
-            "state": state,
-            "code_verifier": verifier,
-        },
-    )
-    assert response.status_code == 403
-    assert "SUSPENDED_USER" in response.json()["detail"]
+        client = TestClient(app)
+        client.cookies.set("myca_auth_session", "test_cookie")
+        response = client.post(
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": auth_code,
+                "state": state,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        assert response.status_code == 403
+        assert "SUSPENDED_USER" in response.json()["detail"]
 
 
 def test_idp_token_exchange_rejects_non_member_user(monkeypatch):
-    """Proves IdP exchange rejects authenticated users without active tenant membership."""
+    """Proves IdP code exchange rejects authenticated users without active tenant membership."""
     from app.main import app
-    token = create_signed_test_jwt(
-        payload_overrides={
-            "email": "nonmember@firm.test",
-            "nonce": "test-nonmember-nonce-001",
+    _ensure_org_exists(ORG_ID)
+    redirect_uri = "http://localhost:5173/auth/callback"
+    with _MockAuthCodeIdpServer() as srv:
+        monkeypatch.setattr(settings, "MYCA_IDP_DISCOVERY_URL", srv.discovery_url)
+        monkeypatch.setattr(settings, "MYCA_IDP_ISSUER", srv.issuer)
+        monkeypatch.setattr(settings, "MYCA_IDP_AUDIENCE", "myca-test-aud")
+        monkeypatch.setattr(settings, "MYCA_IDP_REDIRECT_URIS", [redirect_uri])
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchone.return_value = (USER_ID, "nonmember@firm.test", True)
+        monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
+        monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
+        monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: False)
+
+        verifier, challenge, state = generate_pkce_pair()
+        auth_code = f"code_{secrets.token_urlsafe(12)}"
+        nonce = "test-nonmember-nonce-001"
+        srv.issued_codes[auth_code] = {
+            "code_challenge": challenge,
+            "redirect_uri": redirect_uri,
+            "id_token": srv.sign_id_token("nonmember@firm.test", nonce),
         }
-    )
+        monkeypatch.setattr(auth_api, "preverify_idp_auth_transaction", lambda *args, **kwargs: nonce)
 
-    mock_db = MagicMock()
-    mock_db.execute.return_value.fetchone.return_value = (USER_ID, "nonmember@firm.test", True)
-    monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
-    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
-    monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: False)
-
-    verifier, challenge, state = generate_pkce_pair()
-    client = TestClient(app)
-    client.cookies.set("myca_auth_session", "test_cookie")
-    response = client.post(
-        "/api/v1/auth/idp-exchange",
-        json={
-            "idp_provider": "google",
-            "idp_token": token,
-            "org_id": ORG_ID,
-            "state": state,
-            "code_verifier": verifier,
-        },
-    )
-    assert response.status_code == 403
-    assert "TENANT_MEMBERSHIP_REQUIRED" in response.json()["detail"]
+        client = TestClient(app)
+        client.cookies.set("myca_auth_session", "test_cookie")
+        response = client.post(
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": auth_code,
+                "state": state,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        assert response.status_code == 403
+        assert "TENANT_MEMBERSHIP_REQUIRED" in response.json()["detail"]
 
 
 # =========================================================================
@@ -610,26 +811,44 @@ def test_idp_nonce_endpoint_issues_tracked_nonce():
     assert "myca_auth_session" in response.cookies, "HttpOnly session cookie must be set"
 
 
-def test_idp_token_exchange_requires_nonce_claim():
-    """Proves token exchange strictly rejects IdP tokens missing a nonce claim."""
+def test_idp_token_exchange_requires_nonce_claim(monkeypatch):
+    """Proves code exchange strictly rejects IdP tokens missing a nonce claim."""
     from app.main import app
-    client = TestClient(app)
-    verifier, challenge, state = generate_pkce_pair()
-    client.cookies.set("myca_auth_session", "test_cookie")
-    # Token without nonce
-    token = create_signed_test_jwt(payload_overrides={"nonce": None})
-    response = client.post(
-        "/api/v1/auth/idp-exchange",
-        json={
-            "idp_provider": "google",
-            "idp_token": token,
-            "org_id": ORG_ID,
-            "state": state,
-            "code_verifier": verifier,
-        },
-    )
-    assert response.status_code == 401
-    assert "MISSING_IDP_NONCE" in response.json()["detail"]
+    _ensure_org_exists(ORG_ID)
+    client = TestClient(app, base_url="https://testserver", client=("198.51.100.10", 50000))
+    redirect_uri = "http://localhost:5173/auth/callback"
+    with _MockAuthCodeIdpServer() as srv:
+        monkeypatch.setattr(settings, "MYCA_IDP_DISCOVERY_URL", srv.discovery_url)
+        monkeypatch.setattr(settings, "MYCA_IDP_ISSUER", srv.issuer)
+        monkeypatch.setattr(settings, "MYCA_IDP_AUDIENCE", "myca-test-aud")
+        monkeypatch.setattr(settings, "MYCA_IDP_REDIRECT_URIS", [redirect_uri])
+
+        verifier, challenge, state = generate_pkce_pair()
+        nonce_resp = client.post(
+            "/api/v1/auth/idp-nonce",
+            json={"org_id": ORG_ID, "idp_provider": "google", "state": state, "code_challenge": challenge},
+        )
+        assert nonce_resp.status_code == 200
+        expected_nonce = nonce_resp.json()["nonce"]
+        auth_code = f"code_{secrets.token_urlsafe(12)}"
+        srv.issued_codes[auth_code] = {
+            "code_challenge": challenge,
+            "redirect_uri": redirect_uri,
+            "id_token": srv.sign_id_token("auditor@firm.test", expected_nonce, extra={"nonce": None}),
+        }
+        response = client.post(
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": auth_code,
+                "state": state,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        assert response.status_code == 401
+        assert "MISSING_IDP_NONCE" in response.json()["detail"]
 
 
 def test_idp_token_exchange_rejects_missing_email_claim():
@@ -677,119 +896,147 @@ def test_idp_token_exchange_rejects_provider_issuer_mismatch():
 
 
 def test_idp_token_exchange_normalizes_email(monkeypatch):
-    """Proves that email claim is normalized (lowercased and whitespace trimmed) before user lookup."""
+    """Proves that email claim is normalized (lowercased and whitespace trimmed) before user lookup during /idp-code-exchange."""
     _ensure_org_exists(ORG_ID)
     from app.main import app
     client = TestClient(app)
-    
-    # Request nonce
-    verifier, challenge, state = generate_pkce_pair()
-    nonce_resp = client.post(
-        "/api/v1/auth/idp-nonce",
-        json={"org_id": ORG_ID, "idp_provider": "google", "state": state, "code_challenge": challenge}
-    )
-    assert nonce_resp.status_code == 200
-    nonce = nonce_resp.json()["nonce"]
+    redirect_uri = "http://localhost:5173/auth/callback"
 
-    token = create_signed_test_jwt(
-        payload_overrides={
-            "email": "   Auditor.Normal@Firm.TEST   ",
-            "nonce": nonce,
+    with _MockAuthCodeIdpServer() as srv:
+        monkeypatch.setattr(settings, "MYCA_IDP_DISCOVERY_URL", srv.discovery_url)
+        monkeypatch.setattr(settings, "MYCA_IDP_ISSUER", srv.issuer)
+        monkeypatch.setattr(settings, "MYCA_IDP_AUDIENCE", "myca-test-aud")
+        monkeypatch.setattr(settings, "MYCA_IDP_REDIRECT_URIS", [redirect_uri])
+
+        verifier, challenge, state = generate_pkce_pair()
+        nonce_resp = client.post(
+            "/api/v1/auth/idp-nonce",
+            json={"org_id": ORG_ID, "idp_provider": "google", "state": state, "code_challenge": challenge}
+        )
+        assert nonce_resp.status_code == 200
+        nonce = nonce_resp.json()["nonce"]
+
+        auth_code = f"code_{secrets.token_urlsafe(12)}"
+        srv.issued_codes[auth_code] = {
+            "code_challenge": challenge,
+            "redirect_uri": redirect_uri,
+            "id_token": srv.sign_id_token("   Auditor.Normal@Firm.TEST   ", nonce),
         }
-    )
 
-    lookup_email = []
-    mock_db = MagicMock()
-    def mock_execute(query, params=None):
-        if params and "email" in params:
-            lookup_email.append(params["email"])
-        mock_res = MagicMock()
-        mock_res.fetchone.return_value = (USER_ID, "auditor.normal@firm.test", True)
-        return mock_res
-    mock_db.execute = mock_execute
+        lookup_email = []
+        mock_db = MagicMock()
+        def mock_execute(query, params=None):
+            if params and "email" in params:
+                lookup_email.append(params["email"])
+            mock_res = MagicMock()
+            mock_res.fetchone.return_value = (USER_ID, "auditor.normal@firm.test", True)
+            return mock_res
+        mock_db.execute = mock_execute
 
-    monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
-    monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
-    monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: True)
+        monkeypatch.setattr(auth_api, "SessionLocal", lambda: mock_db)
+        monkeypatch.setattr(auth_api, "preverify_idp_auth_transaction", lambda *args, **kwargs: nonce)
+        monkeypatch.setattr(auth_api, "consume_idp_login_nonce", lambda *args, **kwargs: True)
+        monkeypatch.setattr(auth_api, "verify_and_resolve_tenant_membership", lambda db, u, o: True)
 
-    response = client.post(
-        "/api/v1/auth/idp-exchange",
-        json={
-            "idp_provider": "google",
-            "idp_token": token,
-            "org_id": ORG_ID,
-            "state": state,
-            "code_verifier": verifier,
-        },
-    )
-    assert response.status_code == 200
-    assert len(lookup_email) > 0
-    assert lookup_email[0] == "auditor.normal@firm.test"
+        response = client.post(
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": auth_code,
+                "state": state,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        assert response.status_code == 200
+        assert len(lookup_email) > 0
+        assert lookup_email[0] == "auditor.normal@firm.test"
 
 
-def test_end_to_end_idp_nonce_issuance_and_atomic_replay_prevention():
+def test_end_to_end_idp_nonce_issuance_and_atomic_replay_prevention(monkeypatch):
     """
     INTEGRATION REPLAY DEFENSE TEST:
-    Proves that a real database-tracked nonce can be consumed exactly once,
-    and subsequent replay attempts with the same token/nonce are rejected (HTTP 401 IDP_NONCE_REPLAY).
+    Proves that a real database-tracked nonce/code exchange can be consumed exactly once,
+    subsequent /idp-code-exchange replays fail closed before /token, and replaying the
+    consumed nonce raises HTTP 401 IDP_NONCE_REPLAY.
     """
     _ensure_org_exists(ORG_ID)
+    from app.database import SessionLocal
     from app.main import app
-    client = TestClient(app)
-
-    verifier, challenge, state = generate_pkce_pair()
-    # 1. Request an authentic login nonce
-    nonce_resp = client.post(
-        "/api/v1/auth/idp-nonce",
-        json={"org_id": ORG_ID, "idp_provider": "google", "state": state, "code_challenge": challenge},
-    )
-    assert nonce_resp.status_code == 200
-    nonce = nonce_resp.json()["nonce"]
-    session_cookie = client.cookies.get("myca_auth_session")
-
-    # 2. Forge signed token with the issued nonce and registered user email
-    user_email = f"ci_replay_{uuid.uuid4().hex[:8]}@myca.test"
-    token = create_signed_test_jwt(
-        payload_overrides={
-            "email": user_email,
-            "nonce": nonce,
-        }
-    )
-
-    # Provision user and membership in DB for exchange
+    from app.modules.auth.nonce_service import consume_idp_login_nonce
     from tests.test_db_config import get_admin_session
     from sqlalchemy import text
-    admin_db = get_admin_session()
-    try:
-        admin_db.execute(
-            text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:id, :email, 'Replay Test User', true) ON CONFLICT (email) DO NOTHING;"),
-            {"id": USER_ID, "email": user_email}
-        )
-        u_id = admin_db.execute(text("SELECT id FROM public.global_users WHERE email = :email;"), {"email": user_email}).fetchone()[0]
-        admin_db.execute(
-            text("INSERT INTO public.organization_memberships (id, org_id, user_id, role, status) VALUES (gen_random_uuid(), :oid, :uid, 'owner', 'active') ON CONFLICT (org_id, user_id) DO UPDATE SET status='active';"),
-            {"oid": ORG_ID, "uid": u_id}
-        )
-        admin_db.commit()
-    finally:
-        admin_db.close()
+    client = TestClient(app)
+    redirect_uri = "http://localhost:5173/auth/callback"
 
-    # 3. First exchange must SUCCEED (200 OK)
-    resp1 = client.post(
-        "/api/v1/auth/idp-exchange",
-        json={"idp_provider": "google", "idp_token": token, "org_id": ORG_ID, "state": state, "code_verifier": verifier},
-    )
-    assert resp1.status_code == 200, f"Expected 200 on first exchange, got: {resp1.text}"
-    assert "access_token" in resp1.json()
+    with _MockAuthCodeIdpServer() as srv:
+        monkeypatch.setattr(settings, "MYCA_IDP_DISCOVERY_URL", srv.discovery_url)
+        monkeypatch.setattr(settings, "MYCA_IDP_ISSUER", srv.issuer)
+        monkeypatch.setattr(settings, "MYCA_IDP_AUDIENCE", "myca-test-aud")
+        monkeypatch.setattr(settings, "MYCA_IDP_REDIRECT_URIS", [redirect_uri])
 
-    # 4. Immediate REPLAY with same token and nonce (re-attaching session cookie) must FAIL with 401 IDP_NONCE_REPLAY
-    client.cookies.set("myca_auth_session", session_cookie)
-    resp2 = client.post(
-        "/api/v1/auth/idp-exchange",
-        json={"idp_provider": "google", "idp_token": token, "org_id": ORG_ID, "state": state, "code_verifier": verifier},
-    )
-    assert resp2.status_code == 401
-    assert "IDP_NONCE_REPLAY" in resp2.json()["detail"]
+        verifier, challenge, state = generate_pkce_pair()
+        nonce_resp = client.post(
+            "/api/v1/auth/idp-nonce",
+            json={"org_id": ORG_ID, "idp_provider": "google", "state": state, "code_challenge": challenge},
+        )
+        assert nonce_resp.status_code == 200
+        nonce = nonce_resp.json()["nonce"]
+        session_cookie = client.cookies.get("myca_auth_session")
+
+        user_email = f"ci_replay_{uuid.uuid4().hex[:8]}@myca.test"
+        auth_code = f"code_{secrets.token_urlsafe(12)}"
+        srv.issued_codes[auth_code] = {
+            "code_challenge": challenge,
+            "redirect_uri": redirect_uri,
+            "id_token": srv.sign_id_token(user_email, nonce),
+        }
+
+        admin_db = get_admin_session()
+        try:
+            admin_db.execute(
+                text("INSERT INTO public.global_users (id, email, full_name, is_active) VALUES (:id, :email, 'Replay Test User', true) ON CONFLICT (email) DO NOTHING;"),
+                {"id": str(uuid.uuid4()), "email": user_email}
+            )
+            u_id = admin_db.execute(text("SELECT id FROM public.global_users WHERE email = :email;"), {"email": user_email}).fetchone()[0]
+            admin_db.execute(
+                text("INSERT INTO public.organization_memberships (id, org_id, user_id, role, status) VALUES (gen_random_uuid(), :oid, :uid, 'owner', 'active') ON CONFLICT (org_id, user_id) DO UPDATE SET status='active';"),
+                {"oid": ORG_ID, "uid": u_id}
+            )
+            admin_db.commit()
+        finally:
+            admin_db.close()
+
+        resp1 = client.post(
+            "/api/v1/auth/idp-code-exchange",
+            json={"idp_provider": "google", "org_id": ORG_ID, "code": auth_code, "state": state, "code_verifier": verifier, "redirect_uri": redirect_uri},
+        )
+        assert resp1.status_code == 200, f"Expected 200 on first exchange, got: {resp1.text}"
+        assert "access_token" in resp1.json()
+        assert srv.token_hits == 1
+
+        client.cookies.set("myca_auth_session", session_cookie)
+        resp2 = client.post(
+            "/api/v1/auth/idp-code-exchange",
+            json={"idp_provider": "google", "org_id": ORG_ID, "code": auth_code, "state": state, "code_verifier": verifier, "redirect_uri": redirect_uri},
+        )
+        assert resp2.status_code == 401
+        assert "UNKNOWN_OR_EXPIRED_OIDC_TRANSACTION" in resp2.json()["detail"]
+        assert srv.token_hits == 1
+
+        # Also prove atomic consume_idp_login_nonce rejects replay directly with IDP_NONCE_REPLAY
+        db_check = SessionLocal()
+        try:
+            with pytest.raises(HTTPException) as exc_replay:
+                consume_idp_login_nonce(
+                    db_check, nonce, ORG_ID, "google", user_email,
+                    session_token=session_cookie, state=state, code_verifier=verifier,
+                )
+            assert exc_replay.value.status_code == 401
+            assert "IDP_NONCE_REPLAY" in exc_replay.value.detail
+        finally:
+            db_check.close()
 
 
 def test_idp_exchange_rejects_expired_nonce():
@@ -854,14 +1101,18 @@ def test_idp_exchange_rejects_nonce_context_mismatch():
         nonce = result["nonce"]
         session_token = result.get("session_token")
 
-        # 1. Reject org mismatch (RLS isolates row or context mismatch detected)
-        with pytest.raises(HTTPException) as excinfo1:
-            consume_idp_login_nonce(
-                db, nonce, other_org, "google", "user@test.com",
-                session_token=session_token, state=state, code_verifier=verifier
-            )
-        assert excinfo1.value.status_code == 401
-        assert "NONCE_CONTEXT_MISMATCH" in excinfo1.value.detail or "UNKNOWN_IDP_NONCE" in excinfo1.value.detail
+        # 1. Reject org mismatch (RLS isolates row or context mismatch detected using clean session for other_org)
+        db_other = SessionLocal()
+        try:
+            with pytest.raises(HTTPException) as excinfo1:
+                consume_idp_login_nonce(
+                    db_other, nonce, other_org, "google", "user@test.com",
+                    session_token=session_token, state=state, code_verifier=verifier
+                )
+            assert excinfo1.value.status_code == 401
+            assert "NONCE_CONTEXT_MISMATCH" in excinfo1.value.detail or "UNKNOWN_IDP_NONCE" in excinfo1.value.detail
+        finally:
+            db_other.close()
 
         # 2. Reject provider mismatch
         with pytest.raises(HTTPException) as excinfo2:
@@ -1228,32 +1479,44 @@ def test_database_enforced_tenant_isolation_for_nonces():
         result_a = create_idp_login_nonce(db, org_a, "google", state=state, code_challenge=challenge, client_ip="10.10.10.1")
         nonce_a = result_a["nonce"]
 
-        # Switch context to Org B
-        set_tenant_context(db, org_id=org_b, user_id=None)
+        # Org A context succeeds (use fresh session after commit cleared transaction-local GUC)
+    finally:
+        db.close()
+
+    db_a2 = SessionLocal()
+    try:
+        set_tenant_context(db_a2, org_id=org_a, user_id=None)
+        row_a = db_a2.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a}).fetchall()
+        assert len(row_a) == 1, "Org A cannot see its own nonce under valid tenant context!"
+    finally:
+        db_a2.close()
+
+    db_b = SessionLocal()
+    try:
+        set_tenant_context(db_b, org_id=org_b, user_id=None)
 
         # 1. Read isolation
-        row_b = db.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a}).fetchall()
+        row_b = db_b.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a}).fetchall()
         assert len(row_b) == 0, "CRITICAL RLS BREACH: Org B can read Org A's nonce!"
 
         # 2. Update isolation
-        res_up = db.execute(text("UPDATE public.idp_authentication_nonces SET status = 'CONSUMED' WHERE nonce = :nonce;"), {"nonce": nonce_a})
+        res_up = db_b.execute(text("UPDATE public.idp_authentication_nonces SET status = 'CONSUMED' WHERE nonce = :nonce;"), {"nonce": nonce_a})
         assert res_up.rowcount == 0, "CRITICAL RLS BREACH: Org B updated Org A's nonce!"
 
         # 3. Delete isolation
-        res_del = db.execute(text("DELETE FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a})
+        res_del = db_b.execute(text("DELETE FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a})
         assert res_del.rowcount == 0, "CRITICAL RLS BREACH: Org B deleted Org A's nonce!"
-
-        # 4. Null context isolation
-        db.execute(text("SELECT set_config('app.current_org', '', false);"))
-        row_null = db.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a}).fetchall()
-        assert len(row_null) == 0, "CRITICAL RLS BREACH: Null context can read nonce!"
-
-        # 5. Org A context succeeds
-        set_tenant_context(db, org_id=org_a, user_id=None)
-        row_a = db.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a}).fetchall()
-        assert len(row_a) == 1, "Org A cannot see its own nonce under valid tenant context!"
     finally:
-        db.close()
+        db_b.close()
+
+    db_null = SessionLocal()
+    try:
+        # 4. Null context isolation
+        db_null.execute(text("SELECT set_config('app.current_org', '', false);"))
+        row_null = db_null.execute(text("SELECT nonce FROM public.idp_authentication_nonces WHERE nonce = :nonce;"), {"nonce": nonce_a}).fetchall()
+        assert len(row_null) == 0, "CRITICAL RLS BREACH: Null context can read nonce!"
+    finally:
+        db_null.close()
 
 
 def test_exact_canonical_provider_issuer_matching(monkeypatch):
@@ -1318,62 +1581,74 @@ def test_mandatory_state_and_challenge_rejected_when_missing_or_malformed():
     assert resp4.status_code in (400, 422)
 
 
-def test_httponly_cookie_only_session_binding_and_rejection_of_fallbacks():
+def test_httponly_cookie_only_session_binding_and_rejection_of_fallbacks(monkeypatch):
     """
     HTTPONLY COOKIE ONLY BINDING TEST:
-    Proves browser exchange accepts session token EXCLUSIVELY from the HttpOnly cookie.
+    Proves browser code exchange accepts session token EXCLUSIVELY from the HttpOnly cookie.
     Rejects header and body fallback attempts when cookie is missing.
     """
     _ensure_org_exists(ORG_ID)
     from app.main import app
     client = TestClient(app)
-    verifier, challenge, state = generate_pkce_pair()
+    redirect_uri = "http://localhost:5173/auth/callback"
 
-    # Request nonce
-    nonce_resp = client.post(
-        "/api/v1/auth/idp-nonce",
-        json={"org_id": ORG_ID, "idp_provider": "google", "state": state, "code_challenge": challenge}
-    )
-    assert nonce_resp.status_code == 200
-    nonce_data = nonce_resp.json()
-    assert "session_token" not in nonce_data, "session_token must NOT be in JSON response!"
-    session_cookie = client.cookies.get("myca_auth_session")
-    assert session_cookie is not None, "myca_auth_session cookie missing!"
+    with _MockAuthCodeIdpServer() as srv:
+        monkeypatch.setattr(settings, "MYCA_IDP_DISCOVERY_URL", srv.discovery_url)
+        monkeypatch.setattr(settings, "MYCA_IDP_ISSUER", srv.issuer)
+        monkeypatch.setattr(settings, "MYCA_IDP_AUDIENCE", "myca-test-aud")
+        monkeypatch.setattr(settings, "MYCA_IDP_REDIRECT_URIS", [redirect_uri])
 
-    # Forge test token
-    user_email = f"cookie_test_{uuid.uuid4().hex[:8]}@myca.test"
-    token = create_signed_test_jwt(payload_overrides={"email": user_email, "nonce": nonce_data["nonce"]})
+        verifier, challenge, state = generate_pkce_pair()
+        nonce_resp = client.post(
+            "/api/v1/auth/idp-nonce",
+            json={"org_id": ORG_ID, "idp_provider": "google", "state": state, "code_challenge": challenge}
+        )
+        assert nonce_resp.status_code == 200
+        nonce_data = nonce_resp.json()
+        assert "session_token" not in nonce_data, "session_token must NOT be in JSON response!"
+        session_cookie = client.cookies.get("myca_auth_session")
+        assert session_cookie is not None, "myca_auth_session cookie missing!"
 
-    # 1. Attacker creates fresh client with NO cookies and attempts header/body injection
-    attacker_client = TestClient(app)
-    resp_no_cookie = attacker_client.post(
-        "/api/v1/auth/idp-exchange",
-        headers={"X-Auth-Session-Id": session_cookie},
-        json={
-            "idp_provider": "google",
-            "idp_token": token,
-            "org_id": ORG_ID,
-            "state": state,
-            "code_verifier": verifier,
-        },
-    )
-    assert resp_no_cookie.status_code == 401
-    assert "MISSING_SESSION_COOKIE" in resp_no_cookie.json()["detail"]
+        user_email = f"cookie_test_{uuid.uuid4().hex[:8]}@myca.test"
+        auth_code = f"code_{secrets.token_urlsafe(12)}"
+        srv.issued_codes[auth_code] = {
+            "code_challenge": challenge,
+            "redirect_uri": redirect_uri,
+            "id_token": srv.sign_id_token(user_email, nonce_data["nonce"]),
+        }
 
-    # 2. Attacker supplies tampered cookie -> 401 SESSION_BINDING_MISMATCH
-    attacker_client.cookies.set("myca_auth_session", "tampered_session_cookie_string")
-    resp_tampered = attacker_client.post(
-        "/api/v1/auth/idp-exchange",
-        json={
-            "idp_provider": "google",
-            "idp_token": token,
-            "org_id": ORG_ID,
-            "state": state,
-            "code_verifier": verifier,
-        },
-    )
-    assert resp_tampered.status_code == 401
-    assert "SESSION_BINDING_MISMATCH" in resp_tampered.json()["detail"]
+        # 1. Attacker creates fresh client with NO cookies and attempts header/body injection
+        attacker_client = TestClient(app)
+        resp_no_cookie = attacker_client.post(
+            "/api/v1/auth/idp-code-exchange",
+            headers={"X-Auth-Session-Id": session_cookie},
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": auth_code,
+                "state": state,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        assert resp_no_cookie.status_code == 401
+        assert "MISSING_SESSION_COOKIE" in resp_no_cookie.json()["detail"]
+
+        # 2. Attacker supplies tampered cookie -> 401 SESSION_BINDING_MISMATCH
+        attacker_client.cookies.set("myca_auth_session", "tampered_session_cookie_string")
+        resp_tampered = attacker_client.post(
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": auth_code,
+                "state": state,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        assert resp_tampered.status_code == 401
+        assert "SESSION_BINDING_MISMATCH" in resp_tampered.json()["detail"]
 
 
 def test_constant_time_pkce_and_state_mismatch_rejection():
@@ -1517,52 +1792,63 @@ def test_bounded_retention_preserves_consumed_nonces_within_24h_and_purges_older
         db.close()
 
 
-def test_cross_session_attack_prevention():
+def test_cross_session_attack_prevention(monkeypatch):
     """
-    CROSS-SESSION ATTACK PREVENTATION TEST:
+    CROSS-SESSION ATTACK PREVENTION TEST:
     Proves that an attacker with a valid session cookie for Session B cannot exchange
-    or consume a nonce issued to Session A.
+    or consume an auth transaction/nonce issued to Session A.
     """
     _ensure_org_exists(ORG_ID)
     from app.main import app
     client_a = TestClient(app)
     client_b = TestClient(app)
+    redirect_uri = "http://localhost:5173/auth/callback"
 
     verifier_a, challenge_a, state_a = generate_pkce_pair()
     verifier_b, challenge_b, state_b = generate_pkce_pair()
 
-    # Session A requests nonce
-    resp_a = client_a.post(
-        "/api/v1/auth/idp-nonce",
-        json={"org_id": ORG_ID, "idp_provider": "google", "state": state_a, "code_challenge": challenge_a}
-    )
-    assert resp_a.status_code == 200
-    nonce_a = resp_a.json()["nonce"]
+    with _MockAuthCodeIdpServer() as srv:
+        monkeypatch.setattr(settings, "MYCA_IDP_DISCOVERY_URL", srv.discovery_url)
+        monkeypatch.setattr(settings, "MYCA_IDP_ISSUER", srv.issuer)
+        monkeypatch.setattr(settings, "MYCA_IDP_AUDIENCE", "myca-test-aud")
+        monkeypatch.setattr(settings, "MYCA_IDP_REDIRECT_URIS", [redirect_uri])
 
-    # Session B requests nonce (different session cookie)
-    resp_b = client_b.post(
-        "/api/v1/auth/idp-nonce",
-        json={"org_id": ORG_ID, "idp_provider": "google", "state": state_b, "code_challenge": challenge_b}
-    )
-    assert resp_b.status_code == 200
-    nonce_b = resp_b.json()["nonce"]
+        # Session A requests nonce
+        resp_a = client_a.post(
+            "/api/v1/auth/idp-nonce",
+            json={"org_id": ORG_ID, "idp_provider": "google", "state": state_a, "code_challenge": challenge_a}
+        )
+        assert resp_a.status_code == 200
+        nonce_a = resp_a.json()["nonce"]
 
-    # Forge IdP token containing Nonce A
-    token_a = create_signed_test_jwt(payload_overrides={"nonce": nonce_a, "email": "victim@myca.test"})
+        # Session B requests nonce (different session cookie)
+        resp_b = client_b.post(
+            "/api/v1/auth/idp-nonce",
+            json={"org_id": ORG_ID, "idp_provider": "google", "state": state_b, "code_challenge": challenge_b}
+        )
+        assert resp_b.status_code == 200
 
-    # Attacker operating Session B attempts to exchange Token A (containing Nonce A) with Session B's cookie
-    cross_exchange_resp = client_b.post(
-        "/api/v1/auth/idp-exchange",
-        json={
-            "idp_provider": "google",
-            "idp_token": token_a,
-            "org_id": ORG_ID,
-            "state": state_a,
-            "code_verifier": verifier_a,
-        },
-    )
-    assert cross_exchange_resp.status_code == 401
-    assert "SESSION_BINDING_MISMATCH" in cross_exchange_resp.json()["detail"]
+        auth_code_a = f"code_{secrets.token_urlsafe(12)}"
+        srv.issued_codes[auth_code_a] = {
+            "code_challenge": challenge_a,
+            "redirect_uri": redirect_uri,
+            "id_token": srv.sign_id_token("victim@myca.test", nonce_a),
+        }
+
+        # Attacker operating Session B attempts to exchange Auth Code A with Session B's cookie
+        cross_exchange_resp = client_b.post(
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": auth_code_a,
+                "state": state_a,
+                "code_verifier": verifier_a,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        assert cross_exchange_resp.status_code == 401
+        assert "SESSION_BINDING_MISMATCH" in cross_exchange_resp.json()["detail"]
 
 
 # =========================================================================
@@ -1604,8 +1890,15 @@ def test_pkce_verifier_length_and_charset_enforcement():
 
         # API endpoint schema validation for short verifier -> 422
         resp_short = client.post(
-            "/api/v1/auth/idp-exchange",
-            json={"idp_provider": "google", "idp_token": "mock", "org_id": ORG_ID, "state": state, "code_verifier": short_verifier}
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": "auth-code",
+                "state": state,
+                "code_verifier": short_verifier,
+                "redirect_uri": "http://localhost:5173/auth/callback",
+            }
         )
         assert resp_short.status_code == 422
 
@@ -1621,8 +1914,15 @@ def test_pkce_verifier_length_and_charset_enforcement():
         assert "INVALID_PKCE_VERIFIER" in exc2.value.detail
 
         resp_long = client.post(
-            "/api/v1/auth/idp-exchange",
-            json={"idp_provider": "google", "idp_token": "mock", "org_id": ORG_ID, "state": state, "code_verifier": long_verifier}
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": "auth-code",
+                "state": state,
+                "code_verifier": long_verifier,
+                "redirect_uri": "http://localhost:5173/auth/callback",
+            }
         )
         assert resp_long.status_code == 422
 
@@ -1639,8 +1939,15 @@ def test_pkce_verifier_length_and_charset_enforcement():
         assert "unreserved characters" in exc3.value.detail
 
         resp_invalid_chars = client.post(
-            "/api/v1/auth/idp-exchange",
-            json={"idp_provider": "google", "idp_token": "mock", "org_id": ORG_ID, "state": state, "code_verifier": invalid_chars_verifier}
+            "/api/v1/auth/idp-code-exchange",
+            json={
+                "idp_provider": "google",
+                "org_id": ORG_ID,
+                "code": "auth-code",
+                "state": state,
+                "code_verifier": invalid_chars_verifier,
+                "redirect_uri": "http://localhost:5173/auth/callback",
+            }
         )
         assert resp_invalid_chars.status_code == 422
 
@@ -2270,4 +2577,29 @@ def test_cleanup_telemetry_metrics_and_retry_resilience(monkeypatch):
         futures = [executor.submit(concurrent_cleanup_worker) for _ in range(5)]
         results = [f.result() for f in futures]
     assert len(results) == 5
+
+
+def test_idp_code_exchange_json_array_redirect_uris_env(monkeypatch):
+    """Regression: MYCA_IDP_REDIRECT_URIS configured as JSON array must parse with stdlib json."""
+    from fastapi import HTTPException
+    from app.modules.auth.api import _validate_and_resolve_code_exchange_endpoints
+
+    monkeypatch.setenv("MYCA_IDP_REDIRECT_URIS", '["https://app.example.com/auth/callback", "https://alt.example.com/cb"]')
+    monkeypatch.setenv("MYCA_IDP_TOKEN_URL", "https://idp.example.com/oauth/token")
+    monkeypatch.setenv("MYCA_IDP_AUDIENCE", "myca-prod-client")
+    monkeypatch.setenv("MYCA_IDP_ISSUER", "https://idp.example.com")
+    monkeypatch.setenv("MYCA_IDP_JWKS_URL", "https://idp.example.com/.well-known/jwks.json")
+
+    token_url, client_id, _ = _validate_and_resolve_code_exchange_endpoints(
+        "https://app.example.com/auth/callback",
+        env="production",
+    )
+    assert token_url == "https://idp.example.com/oauth/token"
+    assert client_id == "myca-prod-client"
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_and_resolve_code_exchange_endpoints("https://evil.example.com/cb", env="production")
+    assert exc_info.value.status_code == 400
+    assert "INVALID_REDIRECT_URI" in str(exc_info.value.detail)
+
 

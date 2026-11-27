@@ -52,6 +52,7 @@ def get_consolidated_exceptions(
         FROM public.gstr2b_source_documents d
         JOIN public.gstr2b_snapshots s ON d.snapshot_id = s.id
         WHERE d.org_id = :org
+          AND s.is_active = true
           AND d.itc_availability = 'available'
           AND NOT EXISTS (
               SELECT 1 FROM public.reconciliation_matches m
@@ -323,7 +324,7 @@ def get_consolidated_exceptions(
                 inv_val = Decimal(str(r.total_invoice_value or 1))
                 tot_tax = (Decimal(str(r.cgst_amount or 0)) + Decimal(str(r.sgst_amount or 0)) +
                            Decimal(str(r.igst_amount or 0)) + Decimal(str(r.cess_amount or 0)))
-                reversal_prop = (unpaid / inv_val) * tot_tax
+                reversal_prop = ((unpaid / inv_val) * tot_tax).quantize(Decimal("0.01"))
                 exceptions.append({
                     "exception_id": f"EXC-R37-{r.id}",
                     "category": "RULE_37_OVERDUE",
@@ -337,7 +338,10 @@ def get_consolidated_exceptions(
                     "igst_amount": Decimal(str(r.igst_amount or 0)),
                     "cess_amount": Decimal(str(r.cess_amount or 0)),
                     "total_tax": tot_tax,
-                    "actionable_explanation": f"Vendor unpaid for {r.days_elapsed} days (> 180 days). Unpaid consideration: ₹{unpaid:.2f}.",
+                    "actionable_explanation": (
+                        f"Vendor unpaid for {r.days_elapsed} days (> 180 days). "
+                        f"Unpaid consideration: ₹{unpaid:.2f}; proportionate Rule 37 reversal: ₹{reversal_prop:.2f}."
+                    ),
                     "statutory_citation": "Section 16(2) 2nd Proviso read with Rule 37: Proportionate reversal of ITC required.",
                     "suggested_action": "Discharge payment to vendor or reverse under Table 4(B)(2). Reclaimable upon subsequent payment.",
                     "statutory_deadline": "Immediately upon crossing 180 days",
@@ -356,10 +360,19 @@ def get_consolidated_exceptions(
                SUM(COALESCE(p.cgst_amount, 0) + COALESCE(p.sgst_amount, 0) + COALESCE(p.igst_amount, 0)) as tax_sum
         FROM public.purchase_documents p
         WHERE p.org_id = :org
+        """
+        params_dup: Dict[str, Any] = {"org": org_id}
+        if registration_id:
+            sql_dup += " AND p.registration_id = :reg"
+            params_dup["reg"] = registration_id
+        if return_period:
+            sql_dup += " AND p.financial_period = :period"
+            params_dup["period"] = return_period
+        sql_dup += """
         GROUP BY p.document_number, p.supplier_gstin, p.supplier_legal_name
         HAVING COUNT(*) > 1;
         """
-        rows_dup = session.execute(text(sql_dup), {"org": org_id}).fetchall()
+        rows_dup = session.execute(text(sql_dup), params_dup).fetchall()
         for r in rows_dup:
             exceptions.append({
                 "exception_id": f"EXC-DUP-{r.document_number}",
@@ -393,15 +406,23 @@ def get_consolidated_exceptions(
                p.igst_amount as book_igst, g.central_tax as portal_cgst, g.state_ut_tax as portal_sgst,
                g.integrated_tax as portal_igst
         FROM public.reconciliation_matches m
-        JOIN public.purchase_documents p ON m.purchase_doc_id = p.id
-        JOIN public.gstr2b_source_documents g ON m.gstr2b_doc_id = g.id
+        JOIN public.purchase_documents p ON m.purchase_doc_id = p.id AND p.org_id = m.org_id
+        JOIN public.gstr2b_source_documents g ON m.gstr2b_doc_id = g.id AND g.org_id = m.org_id
         WHERE m.org_id = :org
           AND (
               (COALESCE(p.cgst_amount, 0) + COALESCE(p.sgst_amount, 0) > 0 AND COALESCE(g.integrated_tax, 0) > 0)
               OR (COALESCE(p.igst_amount, 0) > 0 AND COALESCE(g.central_tax, 0) + COALESCE(g.state_ut_tax, 0) > 0)
           )
         """
-        rows_thm = session.execute(text(sql_thm), {"org": org_id}).fetchall()
+        params_thm: Dict[str, Any] = {"org": org_id}
+        if registration_id:
+            sql_thm += " AND p.registration_id = :reg"
+            params_thm["reg"] = registration_id
+        if return_period:
+            sql_thm += " AND p.financial_period = :period"
+            params_thm["period"] = return_period
+
+        rows_thm = session.execute(text(sql_thm), params_thm).fetchall()
         for r in rows_thm:
             exceptions.append({
                 "exception_id": f"EXC-THM-{r.id}",
@@ -436,12 +457,22 @@ def get_consolidated_exceptions(
                COALESCE(d.integrated_tax, 0) as igst, COALESCE(d.cess_amount, 0) as cess,
                a.current_action
         FROM public.gstr2b_source_documents d
+        JOIN public.gstr2b_snapshots s ON d.snapshot_id = s.id AND d.org_id = s.org_id
         LEFT JOIN public.ims_document_actions a ON a.gstr2b_doc_id = d.id AND a.org_id = d.org_id
         WHERE d.org_id = :org
-          AND (d.document_type ILIKE '%credit%' OR d.section_name ILIKE '%cdnr%')
+          AND s.is_active = true
+          AND (d.document_type ILIKE '%credit%' OR UPPER(COALESCE(d.document_type, '')) = 'CRN' OR d.section_name ILIKE '%cdnr%')
           AND (a.current_action IS NULL OR a.current_action = 'PENDING')
         """
-        rows_cnd = session.execute(text(sql_cnd), {"org": org_id}).fetchall()
+        params_cnd: Dict[str, Any] = {"org": org_id}
+        if registration_id:
+            sql_cnd += " AND s.registration_id = :reg"
+            params_cnd["reg"] = registration_id
+        if return_period:
+            sql_cnd += " AND s.return_period = :period"
+            params_cnd["period"] = return_period
+
+        rows_cnd = session.execute(text(sql_cnd), params_cnd).fetchall()
         for r in rows_cnd:
             tot_tax = Decimal(str(r.cgst)) + Decimal(str(r.sgst)) + Decimal(str(r.igst)) + Decimal(str(r.cess))
             exceptions.append({
@@ -477,10 +508,18 @@ def get_consolidated_exceptions(
                COALESCE(p.cgst_amount, 0) as cgst, COALESCE(p.sgst_amount, 0) as sgst,
                COALESCE(p.igst_amount, 0) as igst, COALESCE(p.cess_amount, 0) as cess
         FROM public.receipt_remediation_audit a
-        JOIN public.purchase_documents p ON a.purchase_doc_id = p.id
+        JOIN public.purchase_documents p ON a.purchase_doc_id = p.id AND p.org_id = a.org_id
         WHERE a.org_id = :org
         """
-        rows_mse = session.execute(text(sql_mse), {"org": org_id}).fetchall()
+        params_mse: Dict[str, Any] = {"org": org_id}
+        if registration_id:
+            sql_mse += " AND p.registration_id = :reg"
+            params_mse["reg"] = registration_id
+        if return_period:
+            sql_mse += " AND p.financial_period = :period"
+            params_mse["period"] = return_period
+
+        rows_mse = session.execute(text(sql_mse), params_mse).fetchall()
         for r in rows_mse:
             tot_tax = Decimal(str(r.cgst)) + Decimal(str(r.sgst)) + Decimal(str(r.igst)) + Decimal(str(r.cess))
             exceptions.append({

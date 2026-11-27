@@ -151,16 +151,17 @@ def test_multi_tenant_financial_isolation(m4_tenant):
     csv_a = "Date,Description,Type,Amount\n2025-08-01,Huge Org A Revenue,credit,10000000\n"
     csv_b = "Date,Description,Type,Amount\n2025-08-01,Small Org B Revenue,credit,50000\n"
 
-    with SessionLocal() as session:
-        ingest_statement_csv(session, org_a, user_a, csv_a)
-        ingest_statement_csv(session, org_b, user_b, csv_b)
+    with SessionLocal() as session_a:
+        ingest_statement_csv(session_a, org_a, user_a, csv_a)
+        summary_a = get_financial_summary(session_a, org_a, user_a)
 
-        summary_a = get_financial_summary(session, org_a, user_a)
-        summary_b = get_financial_summary(session, org_b, user_b)
+    with SessionLocal() as session_b:
+        ingest_statement_csv(session_b, org_b, user_b, csv_b)
+        summary_b = get_financial_summary(session_b, org_b, user_b)
 
-        # Assert Org B never sees Org A's 10,000,000 revenue
-        assert summary_a.total_revenue == Decimal("10000000.00")
-        assert summary_b.total_revenue == Decimal("50000.00")
+    # Assert Org B never sees Org A's 10,000,000 revenue
+    assert summary_a.total_revenue == Decimal("10000000.00")
+    assert summary_b.total_revenue == Decimal("50000.00")
 
 def test_credit_builder_api_endpoints(m4_tenant):
     org_id = m4_tenant["org_id"]

@@ -1,519 +1,638 @@
-import React, { useState } from "react";
-import { GitCompare, CheckCircle2, AlertCircle, ArrowRightLeft, ShieldAlert, Sparkles, Filter, ExternalLink } from "lucide-react";
-import { getStoredSession, runReconciliation, saveSession, type ReconciliationSummary } from "../api";
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  GitCompare,
+  AlertTriangle,
+  CheckCircle2,
+  XCircle,
+  Play,
+  FileSearch,
+  AlertCircle,
+  BookPlus,
+} from "lucide-react";
+import {
+  loadSession,
+  saveSession,
+  runReconciliation,
+  resolveVariance,
+  listPurchaseDocuments,
+  listGstr2bDocuments,
+  listUnbookedCandidates,
+  bookUnbookedCandidate,
+  sumGstr2bDocTax,
+  PurchaseDocumentApi,
+  Gstr2bDocumentOut,
+  UnbookedCandidateOut,
+  ReconciliationSummaryOut,
+  GstRegistration,
+} from "../api";
 
-export const ReconciliationWorkbench: React.FC = () => {
-  const [selectedFilter, setSelectedFilter] = useState<string>("ALL");
-  const [isReconciling, setIsReconciling] = useState(false);
-  const [showResolveModal, setShowResolveModal] = useState<any | null>(null);
+interface ReconRow {
+  key: string;
+  purchaseDocId?: string;
+  gstr2bDocId?: string;
+  bookDocNo: string;
+  bookSupplierGstin: string;
+  bookTaxable: number;
+  bookTax: number;
+  portalDocNo: string;
+  portalSupplierGstin: string;
+  portalTaxable: number;
+  portalTax: number;
+  category: string;
+  matchPass: number;
+  matchScore: number;
+  taxDiff: number;
+  isExact: boolean;
+}
+
+interface Props {
+  registrations?: GstRegistration[];
+}
+
+export const ReconciliationWorkbench: React.FC<Props> = ({ registrations = [] }) => {
+  const session = loadSession();
+  const [registrationId, setRegistrationId] = useState(
+    session.registrationId || registrations[0]?.id || ""
+  );
+  const [snapshotId, setSnapshotId] = useState(session.snapshotId || "");
+  const [returnPeriod, setReturnPeriod] = useState(session.returnPeriod || "2026-11");
+  const [activeTab, setActiveTab] = useState<
+    "ALL" | "MATCHED" | "VARIANCES" | "UNBOOKED_PORTAL"
+  >("ALL");
+  const [selectedMatchForModal, setSelectedMatchForModal] = useState<ReconRow | null>(null);
   const [resolutionAction, setResolutionAction] = useState("FORCE_MATCH");
   const [resolutionNotes, setResolutionNotes] = useState("");
+  const [isRunning, setIsRunning] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [runSummaryMsg, setRunSummaryMsg] = useState<string | null>(null);
 
-  const [toleranceTaxable, setToleranceTaxable] = useState("1.00");
-  const [toleranceTax, setToleranceTax] = useState("1.00");
-  const [toleranceTotal, setToleranceTotal] = useState("2.00");
-  const stored = getStoredSession();
-  const [registrationId, setRegistrationId] = useState(stored.registrationId);
-  const [returnPeriod, setReturnPeriod] = useState(stored.returnPeriod);
-  const [snapshotId, setSnapshotId] = useState(stored.snapshotId);
-  const [liveSummary, setLiveSummary] = useState<ReconciliationSummary | null>(null);
-  const [liveError, setLiveError] = useState<string | null>(null);
-  const [toleranceCgst, setToleranceCgst] = useState("1.00");
-  const [toleranceSgst, setToleranceSgst] = useState("1.00");
-  const [toleranceIgst, setToleranceIgst] = useState("1.00");
+  const [rows, setRows] = useState<ReconRow[]>([]);
+  const [unbookedCandidates, setUnbookedCandidates] = useState<UnbookedCandidateOut[]>([]);
+  const [auditTrail, setAuditTrail] = useState<
+    Array<{ id: string; document: string; action: string; actor: string; timestamp: string; notes: string }>
+  >([]);
 
-  const [matches, setMatches] = useState([
-    {
-      id: "m-001",
-      pass: 1,
-      passName: "Pass 1: Exact Identity",
-      score: "1.00",
-      isExact: true,
-      books: {
-        docNo: "INV-2026-101",
-        date: "2026-11-04",
-        gstin: "27AAGCB1234F1ZQ",
-        taxable: "1,00,000.00",
-        tax: "18,000.00"
-      },
-      portal: {
-        docNo: "INV-2026-101",
-        date: "2026-11-04",
-        gstin: "27AAGCB1234F1ZQ",
-        taxable: "1,00,000.00",
-        tax: "18,000.00"
-      },
-      difference: "0.00",
-      status: "MATCHED"
-    },
-    {
-      id: "m-002",
-      pass: 2,
-      passName: "Pass 2: Amendment-Aware",
-      score: "0.98",
-      isExact: false,
-      books: {
-        docNo: "AMD/9912",
-        date: "2026-11-06",
-        gstin: "27BBBEE5566K1Z1",
-        taxable: "80,000.00",
-        tax: "14,400.00"
-      },
-      portal: {
-        docNo: "AMD/9912",
-        date: "2026-11-06",
-        gstin: "27BBBEE5566K1Z1",
-        taxable: "80,000.00",
-        tax: "14,400.00",
-        originalDoc: "AMD/9910"
-      },
-      difference: "0.00",
-      status: "AMENDED_BY_SUPPLIER"
-    },
-    {
-      id: "m-003",
-      pass: 3,
-      passName: "Pass 3: Rounding Tolerance",
-      score: "0.95",
-      isExact: false,
-      books: {
-        docNo: "DEL-881",
-        date: "2026-11-10",
-        gstin: "07AAAAA0000A1Z5",
-        taxable: "45,210.50",
-        tax: "8,137.89"
-      },
-      portal: {
-        docNo: "DEL-881",
-        date: "2026-11-10",
-        gstin: "07AAAAA0000A1Z5",
-        taxable: "45,210.00",
-        tax: "8,138.00"
-      },
-      difference: "0.11",
-      status: "TAX_MISMATCH"
-    },
-    {
-      id: "m-004",
-      pass: 0,
-      passName: "Unmatched Variance",
-      score: "0.00",
-      isExact: false,
-      books: {
-        docNo: "PUR-1049",
-        date: "2026-11-14",
-        gstin: "27CCCDD1122C1Z4",
-        taxable: "92,000.00",
-        tax: "16,560.00"
-      },
-      portal: null,
-      difference: "16,560.00",
-      status: "MISSING_IN_GSTR2B"
-    }
-  ]);
+  const hydrateFromBackend = useCallback(
+    async (regId: string, snapId: string, period: string, runOut?: ReconciliationSummaryOut) => {
+      if (!regId) return;
+      try {
+        const [purchaseDocs, portalDocs, unbooked] = await Promise.all([
+          listPurchaseDocuments(regId, period),
+          snapId ? listGstr2bDocuments(snapId) : Promise.resolve<Gstr2bDocumentOut[]>([]),
+          snapId ? listUnbookedCandidates(snapId) : Promise.resolve<UnbookedCandidateOut[]>([]),
+        ]);
 
-  const categories = [
-    { code: "ALL", label: "All Items", count: 4 },
-    { code: "MATCHED", label: "Exact Matched", count: 1 },
-    { code: "AMENDED_BY_SUPPLIER", label: "Supplier Amended", count: 1 },
-    { code: "TAX_MISMATCH", label: "Tax Discrepancy", count: 1 },
-    { code: "MISSING_IN_GSTR2B", label: "Missing in 2B", count: 1 },
-    { code: "MISSING_IN_BOOKS", label: "Missing in Books", count: 0 },
-    { code: "DATE_MISMATCH", label: "Date Mismatch", count: 0 },
-    { code: "COUNTERPARTY_MISMATCH", label: "GSTIN Mismatch", count: 0 },
-    { code: "RCM_MISMATCH", label: "RCM Conflict", count: 0 },
-    { code: "IMPORT_OR_ISD_MISMATCH", label: "Import/ISD", count: 0 }
-  ];
+        setUnbookedCandidates(unbooked);
+        const pMap = new Map(purchaseDocs.map((p: PurchaseDocumentApi) => [p.id, p]));
+        const gMap = new Map(portalDocs.map((g: Gstr2bDocumentOut) => [g.id, g]));
 
-  const handleRunRecon = async () => {
-    setIsReconciling(true);
-    setLiveError(null);
-    try {
-      if (!registrationId.trim() || !snapshotId.trim()) {
-        throw new Error("Set Registration ID and Snapshot ID (upload a GSTR-2B file first) to run live reconciliation.");
+        if (runOut) {
+          const built: ReconRow[] = [];
+          for (const m of runOut.matches) {
+            const p = pMap.get(m.purchase_doc_id);
+            const g = gMap.get(m.gstr2b_doc_id);
+            const pTax =
+              Number(p?.cgst_amount || 0) +
+              Number(p?.sgst_amount || 0) +
+              Number(p?.igst_amount || 0) +
+              Number(p?.cess_amount || 0);
+            const gTax = sumGstr2bDocTax(g);
+            built.push({
+              key: `match-${m.purchase_doc_id}-${m.gstr2b_doc_id}`,
+              purchaseDocId: m.purchase_doc_id,
+              gstr2bDocId: m.gstr2b_doc_id,
+              bookDocNo: p?.document_number || m.purchase_doc_id.slice(0, 8),
+              bookSupplierGstin: p?.supplier_gstin || "-",
+              bookTaxable: Number(p?.total_taxable_amount || 0),
+              bookTax: pTax,
+              portalDocNo: g?.document_number || m.gstr2b_doc_id.slice(0, 8),
+              portalSupplierGstin: g?.supplier_gstin || "-",
+              portalTaxable: Number(g?.taxable_value || 0),
+              portalTax: gTax,
+              category: m.is_exact ? "MATCHED" : "TOLERANCE_MATCH",
+              matchPass: m.match_pass,
+              matchScore: Number(m.match_score || 0),
+              taxDiff: Number(m.tax_difference || 0),
+              isExact: m.is_exact,
+            });
+          }
+          for (const v of runOut.variances) {
+            const p = v.purchase_doc_id ? pMap.get(v.purchase_doc_id) : undefined;
+            const g = v.gstr2b_doc_id ? gMap.get(v.gstr2b_doc_id) : undefined;
+            const pTax =
+              Number(p?.cgst_amount || 0) +
+              Number(p?.sgst_amount || 0) +
+              Number(p?.igst_amount || 0) +
+              Number(p?.cess_amount || 0);
+            const gTax = sumGstr2bDocTax(g);
+            built.push({
+              key: `var-${v.variance_category}-${v.purchase_doc_id || "none"}-${v.gstr2b_doc_id || "none"}`,
+              purchaseDocId: v.purchase_doc_id || undefined,
+              gstr2bDocId: v.gstr2b_doc_id || undefined,
+              bookDocNo: p?.document_number || "MISSING",
+              bookSupplierGstin: p?.supplier_gstin || "-",
+              bookTaxable: Number(p?.total_taxable_amount || 0),
+              bookTax: pTax,
+              portalDocNo: g?.document_number || "MISSING",
+              portalSupplierGstin: g?.supplier_gstin || "-",
+              portalTaxable: Number(g?.taxable_value || 0),
+              portalTax: gTax,
+              category: v.variance_category,
+              matchPass: 0,
+              matchScore: 0,
+              taxDiff: pTax - gTax,
+              isExact: false,
+            });
+          }
+          setRows(built);
+        } else {
+          // Preview loaded books if reconciliation has not been triggered yet this session
+          const preview: ReconRow[] = purchaseDocs.map((p) => ({
+            key: `book-${p.id}`,
+            purchaseDocId: p.id,
+            bookDocNo: p.document_number,
+            bookSupplierGstin: p.supplier_gstin || "-",
+            bookTaxable: Number(p.total_taxable_amount || 0),
+            bookTax:
+              Number(p.cgst_amount || 0) +
+              Number(p.sgst_amount || 0) +
+              Number(p.igst_amount || 0) +
+              Number(p.cess_amount || 0),
+            portalDocNo: "Run Reconciliation",
+            portalSupplierGstin: "-",
+            portalTaxable: 0,
+            portalTax: 0,
+            category: "PENDING_RUN",
+            matchPass: 0,
+            matchScore: 0,
+            taxDiff: 0,
+            isExact: false,
+          }));
+          setRows(preview);
+        }
+      } catch (err: any) {
+        setRunError(err?.message || "Failed to load reconciliation state.");
       }
-      saveSession({ registrationId: registrationId.trim(), returnPeriod: returnPeriod.trim(), snapshotId: snapshotId.trim() });
-      const summary = await runReconciliation({
-        registration_id: registrationId.trim(),
-        return_period: returnPeriod.trim(),
-        snapshot_id: snapshotId.trim(),
-        taxable_tolerance: toleranceTaxable,
-        tax_tolerance: toleranceTax,
-        total_tolerance: toleranceTotal,
+    },
+    []
+  );
+
+  useEffect(() => {
+    const sess = loadSession();
+    const targetReg = registrationId || sess.registrationId || registrations[0]?.id || "";
+    const targetSnap = snapshotId || sess.snapshotId || "";
+    if (targetReg && targetReg !== registrationId) setRegistrationId(targetReg);
+    if (targetSnap && targetSnap !== snapshotId) setSnapshotId(targetSnap);
+    if (targetReg) {
+      hydrateFromBackend(targetReg, targetSnap, returnPeriod);
+    }
+  }, [registrationId, snapshotId, returnPeriod, registrations, hydrateFromBackend]);
+
+  const handleRunLiveReconciliation = async () => {
+    setIsRunning(true);
+    setRunError(null);
+    setRunSummaryMsg(null);
+    try {
+      if (!registrationId || !snapshotId) {
+        throw new Error(
+          "Set Registration ID and Snapshot ID (upload a GSTR-2B file first) to run live 4-Pass reconciliation."
+        );
+      }
+      saveSession({ registrationId, snapshotId, returnPeriod });
+      const res = await runReconciliation({
+        registration_id: registrationId,
+        return_period: returnPeriod,
+        snapshot_id: snapshotId,
       });
-      setLiveSummary(summary);
+      await hydrateFromBackend(registrationId, snapshotId, returnPeriod, res);
+      setRunSummaryMsg(
+        `4-Pass Run ${res.run_id.slice(0, 8)} complete: ${res.matched_count} matched, ${res.variance_count} variances, ${res.missing_in_gstr2b_count} missing in 2B, ${res.missing_in_books_count} missing in books.`
+      );
     } catch (err: any) {
-      setLiveSummary(null);
-      setLiveError(err?.message || "Live reconciliation failed. The sample table below remains visible for demo purposes.");
+      setRunError(err?.message || "Reconciliation run failed.");
     } finally {
-      setIsReconciling(false);
+      setIsRunning(false);
     }
   };
 
-  const handleSaveResolution = (e: React.FormEvent) => {
+  const handleSaveResolution = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!showResolveModal) return;
-    setMatches(prev => prev.map(m => m.id === showResolveModal.id ? { ...m, status: "MATCHED", passName: "Human Approved" } : m));
-    setShowResolveModal(null);
-    setResolutionNotes("");
+    if (!selectedMatchForModal || !resolutionNotes.trim()) return;
+    setRunError(null);
+    try {
+      const res = await resolveVariance({
+        purchase_doc_id: selectedMatchForModal.purchaseDocId,
+        gstr2b_doc_id: selectedMatchForModal.gstr2bDocId,
+        resolution_action: resolutionAction,
+        resolution_notes: resolutionNotes.trim(),
+      });
+      setRows((prev) =>
+        prev.map((r) =>
+          r.key === selectedMatchForModal.key ? { ...r, category: resolutionAction } : r
+        )
+      );
+      setAuditTrail((prev) => [
+        {
+          id: res.id,
+          document:
+            selectedMatchForModal.bookDocNo !== "MISSING"
+              ? selectedMatchForModal.bookDocNo
+              : selectedMatchForModal.portalDocNo,
+          action: resolutionAction,
+          actor: res.resolved_by,
+          timestamp: res.created_at,
+          notes: resolutionNotes.trim(),
+        },
+        ...prev,
+      ]);
+      setSelectedMatchForModal(null);
+      setResolutionNotes("");
+      setRunSummaryMsg(`Human resolution (${resolutionAction}) persisted to backend audit log.`);
+    } catch (err: any) {
+      setRunError(err?.message || "Failed to persist resolution decision.");
+    }
   };
 
-  const filteredMatches = selectedFilter === "ALL" 
-    ? matches 
-    : matches.filter(m => m.status === selectedFilter);
+  const handleBookCandidate = async (candidateId: string) => {
+    if (!registrationId) return;
+    setRunError(null);
+    try {
+      await bookUnbookedCandidate(candidateId, {
+        registration_id: registrationId,
+        financial_period: returnPeriod,
+        notes: "Booked directly from Reconciliation Workbench",
+      });
+      setRunSummaryMsg("Unbooked GSTR-2B candidate promoted to Purchase Register draft.");
+      await hydrateFromBackend(registrationId, snapshotId, returnPeriod);
+    } catch (err: any) {
+      setRunError(err?.message || "Failed to book GSTR-2B candidate.");
+    }
+  };
+
+  const getStatusBadge = (cat: string) => {
+    switch (cat) {
+      case "MATCHED":
+      case "EXACT_MATCH":
+      case "FORCE_MATCH":
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 text-[10px] font-semibold">
+            <CheckCircle2 className="w-3 h-3" /> {cat.replace(/_/g, " ")}
+          </span>
+        );
+      case "TOLERANCE_MATCH":
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-teal-100 text-teal-800 text-[10px] font-semibold">
+            Tolerance Match
+          </span>
+        );
+      case "TAX_MISMATCH":
+      case "DATE_MISMATCH":
+      case "COUNTERPARTY_MISMATCH":
+      case "AMENDED_BY_SUPPLIER":
+      case "POSSIBLE_MATCH_REQUIRES_REVIEW":
+      case "IMPORT_OR_ISD_MISMATCH":
+      case "RCM_MISMATCH":
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-semibold">
+            <AlertTriangle className="w-3 h-3" /> {cat.replace(/_/g, " ")}
+          </span>
+        );
+      case "MISSING_IN_GSTR2B":
+      case "MISSING_IN_BOOKS":
+      case "DUPLICATE_DOCUMENT":
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-100 text-rose-800 text-[10px] font-semibold">
+            <XCircle className="w-3 h-3" /> {cat.replace(/_/g, " ")}
+          </span>
+        );
+      default:
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px] font-semibold">
+            {cat.replace(/_/g, " ")}
+          </span>
+        );
+    }
+  };
+
+  const filteredRows = rows.filter((r) => {
+    if (activeTab === "MATCHED") {
+      return r.category === "MATCHED" || r.category === "EXACT_MATCH" || r.category === "TOLERANCE_MATCH" || r.category === "FORCE_MATCH";
+    }
+    if (activeTab === "VARIANCES") {
+      return (
+        r.category === "TAX_MISMATCH" ||
+        r.category === "DATE_MISMATCH" ||
+        r.category === "COUNTERPARTY_MISMATCH" ||
+        r.category === "AMENDED_BY_SUPPLIER" ||
+        r.category === "DUPLICATE_DOCUMENT" ||
+        r.category === "POSSIBLE_MATCH_REQUIRES_REVIEW" ||
+        r.category === "IMPORT_OR_ISD_MISMATCH" ||
+        r.category === "RCM_MISMATCH" ||
+        r.category === "MISSING_IN_GSTR2B" ||
+        r.category === "MISSING_IN_BOOKS"
+      );
+    }
+    return true;
+  });
 
   return (
     <div className="space-y-6">
-      {/* Top Header & Controls */}
-      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-4">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-100">
-          <div>
-            <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-              <GitCompare className="w-5 h-5 text-indigo-600" />
-              Deterministic 4-Pass Purchase Reconciliation Workbench
-            </h2>
-            <p className="text-xs text-slate-500 mt-1">
-              Multi-pass matching engine comparing Purchase Register vs GSTR-2B Statement across 11 statutory variance categories.
-            </p>
-          </div>
+      {/* Header Banner */}
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+            <GitCompare className="w-5 h-5 text-indigo-600" />
+            GSTR-2B vs Purchase Books — Reconciliation Workbench
+          </h2>
+          <p className="text-xs text-slate-500 mt-1">
+            4-Pass Statutory Matching Engine with side-by-side comparison, unbooked candidate booking, and persisted CA human resolutions.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {registrations.length > 0 && (
+            <select
+              value={registrationId}
+              onChange={(e) => {
+                setRegistrationId(e.target.value);
+                saveSession({ registrationId: e.target.value });
+              }}
+              className="px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono bg-white"
+            >
+              {registrations.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.gstin} ({r.state_code})
+                </option>
+              ))}
+            </select>
+          )}
+          <input
+            type="text"
+            placeholder="GSTR-2B Snapshot ID"
+            value={snapshotId}
+            onChange={(e) => {
+              setSnapshotId(e.target.value);
+              saveSession({ snapshotId: e.target.value });
+            }}
+            className="px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono w-44"
+          />
+          <input
+            type="month"
+            value={returnPeriod}
+            onChange={(e) => {
+              setReturnPeriod(e.target.value);
+              saveSession({ returnPeriod: e.target.value });
+            }}
+            className="px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono"
+          />
           <button
-            onClick={handleRunRecon}
-            disabled={isReconciling}
-            className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-medium tracking-wide shadow-sm flex items-center gap-2 transition-colors self-start md:self-auto"
+            onClick={handleRunLiveReconciliation}
+            disabled={isRunning}
+            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-medium tracking-wide shadow-sm flex items-center gap-2 transition-colors"
           >
-            <Sparkles className="w-4 h-4" />
-            {isReconciling ? "Executing 4 Passes..." : "Execute 4-Pass Reconciliation"}
+            <Play className="w-4 h-4 fill-current" />
+            {isRunning ? "Running Engine..." : "Run 4-Pass Engine"}
           </button>
         </div>
-
-        {/* Configurable Tolerances Bar */}
-        <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 flex flex-wrap items-center gap-5 text-xs">
-          <span className="font-semibold text-slate-700 flex items-center gap-1.5">
-            <Filter className="w-3.5 h-3.5 text-slate-500" /> Tolerances:
-          </span>
-          <div className="flex items-center gap-1.5">
-            <label className="text-slate-600">Taxable:</label>
-            <input
-              type="text"
-              value={toleranceTaxable}
-              onChange={e => setToleranceTaxable(e.target.value)}
-              className="w-14 px-2 py-0.5 border border-slate-300 rounded font-mono text-center"
-            />
-            <span className="text-slate-400">₹</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <label className="text-slate-600">Total Tax:</label>
-            <input
-              type="text"
-              value={toleranceTax}
-              onChange={e => setToleranceTax(e.target.value)}
-              className="w-14 px-2 py-0.5 border border-slate-300 rounded font-mono text-center"
-            />
-            <span className="text-slate-400">₹</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <label className="text-slate-600">CGST/SGST/IGST:</label>
-            <input
-              type="text"
-              value={toleranceCgst}
-              onChange={e => {
-                setToleranceCgst(e.target.value);
-                setToleranceSgst(e.target.value);
-                setToleranceIgst(e.target.value);
-              }}
-              className="w-14 px-2 py-0.5 border border-slate-300 rounded font-mono text-center"
-            />
-            <span className="text-slate-400">₹</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <label className="text-slate-600">Total Value:</label>
-            <input
-              type="text"
-              value={toleranceTotal}
-              onChange={e => setToleranceTotal(e.target.value)}
-              className="w-14 px-2 py-0.5 border border-slate-300 rounded font-mono text-center"
-            />
-            <span className="text-slate-400">₹</span>
-          </div>
-          <span className="text-[11px] text-slate-500 italic ml-auto">
-            Pass 1 (Exact) → Pass 2 (Amendments) → Pass 3 (Tolerances) → Pass 4 (Controlled Near-Match)
-          </span>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
-          <label className="text-slate-600 font-semibold">Registration ID
-            <input value={registrationId} onChange={(e) => setRegistrationId(e.target.value)} className="mt-1 w-full px-2.5 py-1.5 border border-slate-300 rounded-lg font-mono" placeholder="GST registration UUID" />
-          </label>
-          <label className="text-slate-600 font-semibold">Return Period
-            <input value={returnPeriod} onChange={(e) => setReturnPeriod(e.target.value)} className="mt-1 w-full px-2.5 py-1.5 border border-slate-300 rounded-lg font-mono" placeholder="YYYY-MM" />
-          </label>
-          <label className="text-slate-600 font-semibold">Snapshot ID
-            <input value={snapshotId} onChange={(e) => setSnapshotId(e.target.value)} className="mt-1 w-full px-2.5 py-1.5 border border-slate-300 rounded-lg font-mono" placeholder="GSTR-2B snapshot UUID" />
-          </label>
-        </div>
-
-        {liveError && (
-          <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0" />
-            <span>{liveError}</span>
-          </div>
-        )}
-
-        {liveSummary && (
-          <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-900">
-            <div className="font-bold">Live reconciliation completed</div>
-            <div className="mt-1 font-mono">Run {liveSummary.run_id} • Period {liveSummary.return_period}</div>
-            <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2">
-              <span>Matched: <strong>{liveSummary.matched_count}</strong></span>
-              <span>Variances: <strong>{liveSummary.variance_count}</strong></span>
-              <span>Missing in 2B: <strong>{liveSummary.missing_in_gstr2b_count}</strong></span>
-              <span>Missing in books: <strong>{liveSummary.missing_in_books_count}</strong></span>
-            </div>
-          </div>
-        )}
-
-        {/* Category Pills */}
-        <div className="flex flex-wrap gap-2 pt-2">
-          {categories.map(cat => (
-            <button
-              key={cat.code}
-              onClick={() => setSelectedFilter(cat.code)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5 ${
-                selectedFilter === cat.code
-                  ? "bg-indigo-600 text-white shadow-sm"
-                  : "bg-slate-100 hover:bg-slate-200 text-slate-700"
-              }`}
-            >
-              <span>{cat.label}</span>
-              <span className={`text-[10px] px-1.5 py-0.2 rounded-full ${
-                selectedFilter === cat.code ? "bg-indigo-700 text-white" : "bg-slate-200 text-slate-800"
-              }`}>
-                {cat.count}
-              </span>
-            </button>
-          ))}
-        </div>
       </div>
 
-      {/* Side-by-Side Comparison Grid */}
-      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-        <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
-          <h3 className="text-sm font-bold text-slate-800">
-            Reconciliation Comparison Rows ({filteredMatches.length})
-          </h3>
-          <span className="text-xs text-slate-500">
-            Viewing: <strong className="text-slate-800">{selectedFilter}</strong>
-          </span>
+      {runError && (
+        <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 text-xs text-rose-800 flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0" />
+          <span>{runError}</span>
         </div>
-
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
-              <tr>
-                <th className="px-4 py-3">Match Pass & Category</th>
-                <th className="px-4 py-3">Buyer Books (Purchase Register)</th>
-                <th className="px-4 py-3 text-center">
-                  <ArrowRightLeft className="w-4 h-4 mx-auto text-slate-400" />
-                </th>
-                <th className="px-4 py-3">Supplier Filing (GSTR-2B Statement)</th>
-                <th className="px-4 py-3 text-right">Tax Diff (₹)</th>
-                <th className="px-4 py-3 text-center">Auditor Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {filteredMatches.map(m => (
-                <tr key={m.id} className="hover:bg-slate-50 transition-colors">
-                  <td className="px-4 py-3 align-top">
-                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 mb-1">
-                      {m.passName}
-                    </span>
-                    <div className="text-[11px] font-mono text-slate-600 font-medium">
-                      Category: {m.status}
-                    </div>
-                  </td>
-
-                  {/* Books Column */}
-                  <td className="px-4 py-3 align-top font-mono">
-                    {m.books ? (
-                      <div>
-                        <div className="font-bold text-slate-900">{m.books.docNo}</div>
-                        <div className="text-[11px] text-slate-500">{m.books.date} | GSTIN: {m.books.gstin}</div>
-                        <div className="text-[11px] text-slate-700 mt-1">
-                          Taxable: ₹{m.books.taxable} | Tax: ₹{m.books.tax}
-                        </div>
-                      </div>
-                    ) : (
-                      <span className="text-rose-600 font-sans italic text-xs">Not recorded in books</span>
-                    )}
-                  </td>
-
-                  {/* Icon Separator */}
-                  <td className="px-4 py-3 align-top text-center">
-                    {m.status === "MATCHED" ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 mx-auto" />
-                    ) : (
-                      <AlertCircle className="w-4 h-4 text-amber-500 mx-auto" />
-                    )}
-                  </td>
-
-                  {/* Portal Column */}
-                  <td className="px-4 py-3 align-top font-mono">
-                    {m.portal ? (
-                      <div>
-                        <div className="font-bold text-slate-900">{m.portal.docNo}</div>
-                        <div className="text-[11px] text-slate-500">{m.portal.date} | GSTIN: {m.portal.gstin}</div>
-                        <div className="text-[11px] text-slate-700 mt-1">
-                          Taxable: ₹{m.portal.taxable} | Tax: ₹{m.portal.tax}
-                        </div>
-                        {m.portal.originalDoc && (
-                          <div className="text-[10px] text-indigo-600 mt-0.5">
-                            Amends: {m.portal.originalDoc}
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <span className="text-amber-600 font-sans italic text-xs">Missing in GSTR-2B</span>
-                    )}
-                  </td>
-
-                  {/* Diff Column */}
-                  <td className="px-4 py-3 align-top text-right font-mono font-bold text-slate-800">
-                    ₹{m.difference}
-                  </td>
-
-                  {/* Resolution Action */}
-                  <td className="px-4 py-3 align-top text-center">
-                    <button
-                      onClick={() => setShowResolveModal(m)}
-                      className="px-2.5 py-1 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 text-slate-700 border border-slate-300 rounded text-[11px] font-medium transition-colors"
-                    >
-                      Resolve Variance
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      )}
+      {runSummaryMsg && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-xs text-emerald-800 flex items-center gap-2">
+          <CheckCircle2 className="w-4 h-4 shrink-0" />
+          <span>{runSummaryMsg}</span>
         </div>
+      )}
+
+      {/* Filter Tabs */}
+      <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-3">
+        {[
+          { key: "ALL", label: `All Records (${rows.length})` },
+          { key: "MATCHED", label: "Matched" },
+          { key: "VARIANCES", label: "Variances" },
+          { key: "UNBOOKED_PORTAL", label: `Unbooked GSTR-2B (${unbookedCandidates.length})` },
+        ].map((tab) => (
+          <button
+            key={tab.key}
+            onClick={() => setActiveTab(tab.key as any)}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+              activeTab === tab.key
+                ? "bg-slate-900 text-white"
+                : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
 
-      {/* Audit Trail & Reviewer Comments */}
-      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-4">
-        <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-          <div>
-            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-              <ShieldAlert className="w-4 h-4 text-emerald-600" />
-              Statutory Resolution Audit Trail & Reviewer Governance
+      {/* Main Content */}
+      {activeTab === "UNBOOKED_PORTAL" ? (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+          <div className="p-4 border-b border-slate-100">
+            <h3 className="text-sm font-bold text-slate-800">
+              Unbooked GSTR-2B Candidates Missing in Purchase Register
             </h3>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Immutable log of auditor decisions, justification comments, and manual reconciliation overrides.
-            </p>
           </div>
-          <span className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full font-medium">
-            3 Audited Actions
-          </span>
-        </div>
-
-        <div className="divide-y divide-slate-100 text-xs">
-          <div className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-slate-900 font-mono">INV-2026-101</span>
-                <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded text-[10px] font-semibold">
-                  FORCE_MATCH
-                </span>
-                <span className="text-slate-400">•</span>
-                <span className="text-slate-600 font-medium">CA Rahul Sharma</span>
-              </div>
-              <p className="text-slate-600 text-[11px] mt-1 font-sans">
-                "Prefix format variance verified with supplier confirmation email dated 2026-11-05. Physical delivery challan matched."
-              </p>
-            </div>
-            <span className="text-slate-400 font-mono text-[10px] shrink-0">2026-11-15 14:22 UTC</span>
-          </div>
-
-          <div className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-slate-900 font-mono">AMD/9912</span>
-                <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded text-[10px] font-semibold">
-                  ACCEPT_PORTAL_FIGURE
-                </span>
-                <span className="text-slate-400">•</span>
-                <span className="text-slate-600 font-medium">Priya Patel (Tax Lead)</span>
-              </div>
-              <p className="text-slate-600 text-[11px] mt-1 font-sans">
-                "Supplier filed GSTR-1 amendment in Nov 2026 matching updated PO #4412. Inward register updated accordingly."
-              </p>
-            </div>
-            <span className="text-slate-400 font-mono text-[10px] shrink-0">2026-11-15 15:40 UTC</span>
-          </div>
-
-          <div className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-slate-900 font-mono">DEL-881</span>
-                <span className="px-2 py-0.5 bg-cyan-50 text-cyan-700 border border-cyan-200 rounded text-[10px] font-semibold">
-                  ACCEPT_BOOK_FIGURE
-                </span>
-                <span className="text-slate-400">•</span>
-                <span className="text-slate-600 font-medium">Priya Patel (Tax Lead)</span>
-              </div>
-              <p className="text-slate-600 text-[11px] mt-1 font-sans">
-                "Rounding variance of ₹0.11 within statutory tolerance threshold of ₹1.00. Approved under Pass 3."
-              </p>
-            </div>
-            <span className="text-slate-400 font-mono text-[10px] shrink-0">2026-11-16 09:12 UTC</span>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
+                  <th className="px-4 py-3">Document</th>
+                  <th className="px-4 py-3">Supplier GSTIN</th>
+                  <th className="px-4 py-3 text-right">Taxable (₹)</th>
+                  <th className="px-4 py-3 text-right">Total Tax (₹)</th>
+                  <th className="px-4 py-3 text-center">Receipt State</th>
+                  <th className="px-4 py-3 text-center">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 font-mono">
+                {unbookedCandidates.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-8 text-center font-sans text-slate-500">
+                      No unbooked GSTR-2B candidates in the active snapshot.
+                    </td>
+                  </tr>
+                ) : (
+                  unbookedCandidates.map((cand) => (
+                    <tr key={cand.id} className="hover:bg-slate-50">
+                      <td className="px-4 py-3">
+                        <div className="font-bold text-slate-900">{cand.document_number}</div>
+                        <div className="text-[11px] font-sans text-slate-500">{cand.document_date}</div>
+                      </td>
+                      <td className="px-4 py-3">{cand.supplier_gstin}</td>
+                      <td className="px-4 py-3 text-right">
+                        {Number(cand.taxable_value || 0).toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                      </td>
+                      <td className="px-4 py-3 text-right font-bold">
+                        {Number(cand.total_tax || 0).toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                      </td>
+                      <td className="px-4 py-3 text-center font-sans">{cand.receipt_status}</td>
+                      <td className="px-4 py-3 text-center font-sans">
+                        {cand.linked_purchase_doc_id ? (
+                          <span className="text-emerald-700 font-semibold">Booked</span>
+                        ) : (
+                          <button
+                            onClick={() => handleBookCandidate(cand.id)}
+                            className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-semibold inline-flex items-center gap-1"
+                          >
+                            <BookPlus className="w-3 h-3" /> Book to Purchase Register
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
-      </div>
+      ) : (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
+                  <th className="px-4 py-3 bg-slate-100/50">Book Doc No (Purchase)</th>
+                  <th className="px-4 py-3 bg-slate-100/50 text-right">Book Tax (₹)</th>
+                  <th className="px-4 py-3 bg-indigo-50/30">Portal Doc No (GSTR-2B)</th>
+                  <th className="px-4 py-3 bg-indigo-50/30 text-right">Portal Tax (₹)</th>
+                  <th className="px-4 py-3 text-center">Match Category</th>
+                  <th className="px-4 py-3 text-center">Pass</th>
+                  <th className="px-4 py-3 text-right">Variance (₹)</th>
+                  <th className="px-4 py-3 text-center">CA Review</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 font-mono">
+                {filteredRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} className="px-4 py-10 text-center font-sans text-slate-500">
+                      No reconciliation rows loaded. Select your GSTIN &amp; GSTR-2B Snapshot ID, then click &ldquo;Run 4-Pass Engine&rdquo;.
+                    </td>
+                  </tr>
+                ) : (
+                  filteredRows.map((row) => (
+                    <tr key={row.key} className="hover:bg-slate-50/80 transition-colors">
+                      <td className="px-4 py-3 bg-slate-50/40">
+                        <div className="font-bold text-slate-900">{row.bookDocNo}</div>
+                        <div className="text-[10px] text-slate-500">{row.bookSupplierGstin}</div>
+                      </td>
+                      <td className="px-4 py-3 bg-slate-50/40 text-right font-semibold">
+                        {row.bookTax.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                      </td>
+                      <td className="px-4 py-3 bg-indigo-50/10">
+                        <div className="font-bold text-slate-900">{row.portalDocNo}</div>
+                        <div className="text-[10px] text-slate-500">{row.portalSupplierGstin}</div>
+                      </td>
+                      <td className="px-4 py-3 bg-indigo-50/10 text-right font-semibold text-indigo-700">
+                        {row.portalTax.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                      </td>
+                      <td className="px-4 py-3 text-center font-sans">{getStatusBadge(row.category)}</td>
+                      <td className="px-4 py-3 text-center">
+                        <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px] font-semibold">
+                          {row.matchPass > 0 ? `Pass ${row.matchPass}` : "Unmatched"}
+                        </span>
+                      </td>
+                      <td
+                        className={`px-4 py-3 text-right font-bold ${
+                          Math.abs(row.taxDiff) > 0.01 ? "text-rose-600" : "text-slate-400"
+                        }`}
+                      >
+                        {row.taxDiff.toFixed(2)}
+                      </td>
+                      <td className="px-4 py-3 text-center font-sans">
+                        <button
+                          onClick={() => setSelectedMatchForModal(row)}
+                          className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded text-[10px] font-semibold"
+                        >
+                          Resolve
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
-      {/* Human Resolution Modal */}
-      {showResolveModal && (
+      {/* Session Audit Log */}
+      {auditTrail.length > 0 && (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+          <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2 mb-3">
+            <FileSearch className="w-4 h-4 text-slate-600" />
+            Persisted CA Resolutions This Session
+          </h3>
+          <div className="space-y-2 text-xs">
+            {auditTrail.map((entry) => (
+              <div
+                key={entry.id}
+                className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 rounded-lg border border-slate-100"
+              >
+                <div className="flex items-center gap-3">
+                  <span className="font-mono font-bold text-slate-900">{entry.document}</span>
+                  <span className="px-2 py-0.5 bg-indigo-100 text-indigo-800 rounded text-[10px] font-semibold font-mono">
+                    {entry.action}
+                  </span>
+                  <span className="text-slate-600">{entry.notes}</span>
+                </div>
+                <div className="text-[11px] text-slate-400 font-mono mt-1 sm:mt-0">
+                  {entry.actor.slice(0, 8)} • {entry.timestamp}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Resolution Modal */}
+      {selectedMatchForModal && (
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-xl shadow-xl border border-slate-200 max-w-lg w-full p-6 space-y-4">
-            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-              <ShieldAlert className="w-4 h-4 text-indigo-600" />
-              Auditor / CA Statutory Resolution Workbench
+          <div className="bg-white rounded-xl shadow-xl border border-slate-200 max-w-md w-full p-6 space-y-4">
+            <h3 className="text-sm font-bold text-slate-900">
+              Human CA Override &amp; Resolution ({selectedMatchForModal.bookDocNo})
             </h3>
             <p className="text-xs text-slate-500">
-              Apply a legally auditable human resolution for document: <strong>{showResolveModal.books?.docNo || showResolveModal.portal?.docNo}</strong>.
+              Your decision and audit rationale will be recorded immutably in the backend compliance ledger.
             </p>
-
             <form onSubmit={handleSaveResolution} className="space-y-3 text-xs">
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Resolution Action</label>
                 <select
                   value={resolutionAction}
-                  onChange={e => setResolutionAction(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded text-slate-800 font-medium"
+                  onChange={(e) => setResolutionAction(e.target.value)}
+                  className="w-full px-3 py-2 border border-slate-300 rounded font-medium"
                 >
-                  <option value="FORCE_MATCH">FORCE MATCH (Document Number Format Variant)</option>
-                  <option value="ACCEPT_BOOK_FIGURE">ACCEPT BOOK FIGURE (Buyer Verified Delivery)</option>
-                  <option value="ACCEPT_PORTAL_FIGURE">ACCEPT PORTAL FIGURE (Supplier Verified)</option>
-                  <option value="MARK_BLOCKED_CREDIT">MARK BLOCKED CREDIT (Section 17(5))</option>
-                  <option value="DEFER_TO_NEXT_PERIOD">DEFER TO NEXT PERIOD (Goods in Transit)</option>
-                  <option value="REQUEST_SUPPLIER_AMENDMENT">REQUEST SUPPLIER AMENDMENT (Form GSTR-1A)</option>
-                  <option value="FORCE_UNLINK">FORCE UNLINK (Spurious Match)</option>
+                  <option value="FORCE_MATCH">FORCE_MATCH (Accept Fuzzy Match)</option>
+                  <option value="FORCE_UNLINK">FORCE_UNLINK (Break Incorrect Match)</option>
+                  <option value="ACCEPT_BOOK_FIGURE">ACCEPT_BOOK_FIGURE</option>
+                  <option value="ACCEPT_PORTAL_FIGURE">ACCEPT_PORTAL_FIGURE</option>
+                  <option value="MARK_BLOCKED_CREDIT">MARK_BLOCKED_CREDIT (Sec 17(5) Permanent)</option>
+                  <option value="DEFER_TO_NEXT_PERIOD">DEFER_TO_NEXT_PERIOD (Reclaimable)</option>
+                  <option value="REQUEST_SUPPLIER_AMENDMENT">REQUEST_SUPPLIER_AMENDMENT</option>
                 </select>
               </div>
-
               <div>
-                <label className="block font-semibold text-slate-700 mb-1">Auditor Justification & Notes</label>
+                <label className="block font-semibold text-slate-700 mb-1">Audit Trail Notes &amp; Justification</label>
                 <textarea
                   rows={3}
                   value={resolutionNotes}
-                  onChange={e => setResolutionNotes(e.target.value)}
-                  placeholder="Record statutory basis and cross-reference supporting GRN or supplier debit note..."
-                  className="w-full px-3 py-2 border border-slate-300 rounded text-slate-800 font-sans"
+                  onChange={(e) => setResolutionNotes(e.target.value)}
+                  placeholder="Provide statutory justification or reference..."
+                  className="w-full px-3 py-2 border border-slate-300 rounded focus:ring-2 focus:ring-indigo-500"
                   required
                 />
               </div>
-
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setShowResolveModal(null)}
+                  onClick={() => setSelectedMatchForModal(null)}
                   className="px-3 py-1.5 border border-slate-300 rounded text-slate-700 text-xs"
                 >
                   Cancel
@@ -522,7 +641,7 @@ export const ReconciliationWorkbench: React.FC = () => {
                   type="submit"
                   className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium"
                 >
-                  Record Statutory Resolution
+                  Persist Decision &amp; Log Audit
                 </button>
               </div>
             </form>
@@ -532,3 +651,5 @@ export const ReconciliationWorkbench: React.FC = () => {
     </div>
   );
 };
+
+export default ReconciliationWorkbench;

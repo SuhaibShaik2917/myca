@@ -379,13 +379,13 @@ def main():
     run_cmd(["alembic", "upgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 1b: Fresh Historical Upgrade 0022", "LEGACY_SEEDS_PRESENT_IN_HISTORICAL_0022")
 
-    print("\n=== Step 2: Upgrade to Head (0030_auth_rate_limits_rolling) ===")
+    print("\n=== Step 2: Upgrade to Head (0040_master_hardening) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2: Head 0030", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2: Head 0040", "AUDITORS_VERIFIED_CLEAN")
     state_head = capture_database_state(conn)
-    print(f"  Head State (0039): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
-    assert len(state_head["grants"]) == 123, f"Expected 123 grants at 0039, got {len(state_head['grants'])}"
-    assert len(state_head["policies"]) == 100, f"Expected 100 policies at 0039, got {len(state_head['policies'])}"
+    print(f"  Head State (0040): {len(state_head['grants'])} grants, {len(state_head['policies'])} policies.")
+    assert len(state_head["grants"]) == 133, f"Expected 133 grants at 0040, got {len(state_head['grants'])}"
+    assert len(state_head["policies"]) == 102, f"Expected 102 policies at 0040, got {len(state_head['policies'])}"
 
     # Verify nonce index, nonce registry table, idp_authentication_nonces table, and auth_rate_limits table exist at 0030
     with conn.cursor() as cur:
@@ -776,12 +776,12 @@ def main():
     run_cmd(["alembic", "downgrade", "0022_statutory_auditors_replay"])
     classify_and_verify_auditor_state(conn, "Step 2c: Clean Downgrade 0022", "AUDITORS_VERIFIED_CLEAN")
 
-    print("\n=== Step 2d: Re-upgrade to Head (0030_auth_rate_limits_rolling) ===")
+    print("\n=== Step 2d: Re-upgrade to Head (0040_master_hardening) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head 0030", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 2d: Re-upgrade Head", "AUDITORS_VERIFIED_CLEAN")
     state_re_head = capture_database_state(conn)
-    assert len(state_re_head["grants"]) == 123, f"Expected 123 grants at 0039, got {len(state_re_head['grants'])}"
-    assert len(state_re_head["policies"]) == 100, f"Expected 100 policies at 0039, got {len(state_re_head['policies'])}"
+    assert state_re_head["grants"] == state_head["grants"], f"Expected head grants match, got {len(state_re_head['grants'])} vs {len(state_head['grants'])}"
+    assert state_re_head["policies"] == state_head["policies"], f"Expected head policies match, got {len(state_re_head['policies'])} vs {len(state_head['policies'])}"
     print("PASS: Downgrade rollback and re-upgrade cycles verified with zero fake auditor identities.")
 
     print("\n=== Step 3: Downgrade to 0020_m4_m5_grants_and_policies ===")
@@ -833,16 +833,23 @@ def main():
     assert rolled_back_state["rls_flags"] == trusted_ref["rls_flags"], "Rollback RLS flags mismatch with independent reference snapshot!"
     print("  PASS: Exact match on all table RLS and FORCE RLS flags against independent reference.")
 
-    print("\n=== Step 5: Re-Upgrade to Head (0030_auth_rate_limits_rolling) ===")
+    print("\n=== Step 5: Re-Upgrade to Head (0040_master_hardening) ===")
     run_cmd(["alembic", "upgrade", "head"])
-    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade 0030", "AUDITORS_VERIFIED_CLEAN")
+    classify_and_verify_auditor_state(conn, "Step 5: Final Re-upgrade Head", "AUDITORS_VERIFIED_CLEAN")
     final_head_state = capture_database_state(conn)
     assert final_head_state["grants"] == state_head["grants"]
     assert final_head_state["policies"] == state_head["policies"]
     assert final_head_state["rls_flags"] == state_head["rls_flags"]
-    assert len(final_head_state["grants"]) == 123
-    assert len(final_head_state["policies"]) == 100
-    print("  PASS: Re-upgrade to head completely restored production security state (123 grants, 100 policies).")
+    print(f"  PASS: Re-upgrade to head completely restored production security state ({len(final_head_state['grants'])} grants, {len(final_head_state['policies'])} policies).")
+
+    print("\n=== Step 6: Verify 0040 <-> 0039 Single-Revision Reversibility ===")
+    run_cmd(["alembic", "downgrade", "0039_gstr3b_legacy_claim_meta"])
+    run_cmd(["alembic", "upgrade", "head"])
+    post_0040_state = capture_database_state(conn)
+    assert post_0040_state["grants"] == state_head["grants"]
+    assert post_0040_state["policies"] == state_head["policies"]
+    assert post_0040_state["rls_flags"] == state_head["rls_flags"]
+    print("  PASS: Single-revision 0040 <-> 0039 rollback & re-upgrade verified.")
 
     conn.close()
     print("\nALL MIGRATION ROLLBACK & INDEPENDENT BASELINE REFERENCE INVARIANTS 100% VERIFIED!")

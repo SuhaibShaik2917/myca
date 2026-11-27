@@ -152,6 +152,7 @@ class PurchaseDocumentCreate(BaseModel):
     delivery_challan_ref: Optional[str] = None
     service_completion_date: Optional[str] = None
     deemed_receipt_reason: Optional[str] = None
+    deemed_receipt_category: Optional[str] = None
     goods_receipt_date: Optional[str] = None
     goods_receipt_note_ref: Optional[str] = None
     service_acceptance_cert_ref: Optional[str] = None

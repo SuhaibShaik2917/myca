@@ -34,9 +34,9 @@ class BusinessProfileIn(BaseModel):
     turnover_bracket: Optional[str] = Field("Micro (< 5 Cr)", description="Micro (< 5 Cr), Small (5-50 Cr), Medium (50-250 Cr)")
     annual_turnover: Decimal = Field(default=Decimal("0.00"), description="Annual turnover in INR")
     udyam_number: Optional[str] = Field(None, description="e.g. UDYAM-MH-12-0012345")
-    vintage_years: Optional[int] = Field(3, description="Operational years in business")
+    vintage_years: Optional[int] = Field(None, description="Operational years in business")
     social_category: Optional[str] = Field("General", description="General, SC, ST, OBC, Women, Minority")
-    has_udyam: Optional[bool] = Field(True, description="Whether enterprise has valid Udyam registration")
+    has_udyam: Optional[bool] = Field(False, description="Whether enterprise has valid Udyam registration")
 
 class BusinessProfileOut(BaseModel):
     id: str
@@ -48,6 +48,9 @@ class BusinessProfileOut(BaseModel):
     credit_score: Optional[int] = None
     udyam_number: Optional[str] = None
     gstin: Optional[str] = None
+    vintage_years: Optional[int] = None
+    social_category: Optional[str] = None
+    has_udyam: Optional[bool] = None
 
 class EvaluatedCriterion(BaseModel):
     rule_key: str

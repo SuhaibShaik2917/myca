@@ -169,9 +169,11 @@ def validate_invoice_financials(
     # 2. Date Verification
     inv_date = invoice.get("invoice_date")
     if inv_date:
-        if isinstance(inv_date, str):
+        if isinstance(inv_date, datetime):
+            inv_date = inv_date.date()
+        elif isinstance(inv_date, str):
             try:
-                inv_date = date.fromisoformat(inv_date)
+                inv_date = date.fromisoformat(inv_date[:10])
             except ValueError:
                 inv_date = None
 
@@ -325,11 +327,11 @@ def validate_invoice_financials(
         sum_total += tot
 
     # 4. Total Consistency Checks
-    inv_taxable = Decimal(str(invoice.get("total_taxable_amount", 0)))
-    inv_cgst = Decimal(str(invoice.get("cgst_amount", 0)))
-    inv_sgst = Decimal(str(invoice.get("sgst_amount", 0)))
-    inv_igst = Decimal(str(invoice.get("igst_amount", 0)))
-    inv_total = Decimal(str(invoice.get("total_amount", 0)))
+    inv_taxable = Decimal(str(invoice.get("total_taxable_amount") if invoice.get("total_taxable_amount") is not None else 0))
+    inv_cgst = Decimal(str(invoice.get("cgst_amount") if invoice.get("cgst_amount") is not None else 0))
+    inv_sgst = Decimal(str(invoice.get("sgst_amount") if invoice.get("sgst_amount") is not None else 0))
+    inv_igst = Decimal(str(invoice.get("igst_amount") if invoice.get("igst_amount") is not None else 0))
+    inv_total = Decimal(str(invoice.get("total_amount") if invoice.get("total_amount") is not None else 0))
 
     arithmetic_valid = not has_missing_line_fields
     if abs(sum_taxable - inv_taxable) > Decimal("0.50"):
@@ -341,6 +343,44 @@ def validate_invoice_financials(
         ))
         has_critical = True
         arithmetic_valid = False
+
+    if line_items and not has_missing_line_fields:
+        if abs(sum_cgst - inv_cgst) > Decimal("0.50"):
+            flags.append(ValidationFlag(
+                code="ERR_SUM_CGST_MISMATCH",
+                severity="error",
+                field="cgst_amount",
+                message=f"Invoice CGST amount ({inv_cgst}) does not match sum of lines ({sum_cgst})"
+            ))
+            has_critical = True
+            arithmetic_valid = False
+        if abs(sum_sgst - inv_sgst) > Decimal("0.50"):
+            flags.append(ValidationFlag(
+                code="ERR_SUM_SGST_MISMATCH",
+                severity="error",
+                field="sgst_amount",
+                message=f"Invoice SGST amount ({inv_sgst}) does not match sum of lines ({sum_sgst})"
+            ))
+            has_critical = True
+            arithmetic_valid = False
+        if abs(sum_igst - inv_igst) > Decimal("0.50"):
+            flags.append(ValidationFlag(
+                code="ERR_SUM_IGST_MISMATCH",
+                severity="error",
+                field="igst_amount",
+                message=f"Invoice IGST amount ({inv_igst}) does not match sum of lines ({sum_igst})"
+            ))
+            has_critical = True
+            arithmetic_valid = False
+        if abs(sum_total - inv_total) > Decimal("1.00"):
+            flags.append(ValidationFlag(
+                code="ERR_SUM_TOTAL_MISMATCH",
+                severity="error",
+                field="total_amount",
+                message=f"Invoice grand total ({inv_total}) does not match sum of line totals ({sum_total})"
+            ))
+            has_critical = True
+            arithmetic_valid = False
 
     expected_grand_total = inv_taxable + inv_cgst + inv_sgst + inv_igst
     if abs(expected_grand_total - inv_total) > Decimal("1.00"):

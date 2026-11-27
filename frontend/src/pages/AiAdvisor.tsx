@@ -1,89 +1,121 @@
-import React, { useState, useEffect } from "react";
-import { 
-  Bot, 
-  Send, 
-  Building2, 
-  Sparkles, 
-  ShieldAlert, 
-  Info, 
-  CheckCircle2, 
-  AlertTriangle,
-  FileText,
-  RefreshCw
+import React, { useState, useEffect, useRef } from "react";
+import {
+  Send,
+  Sparkles,
+  Bot,
+  User,
+  ShieldAlert,
+  TrendingUp,
+  Info,
+  Loader2,
+  AlertCircle,
 } from "lucide-react";
-import { 
-  sendAiChat, 
-  getQuickInsights, 
-  QuickInsightOut, 
-  ChatResponseOut 
-} from "../api";
+import { chatWithAdvisor, getQuickInsights, QuickInsight } from "../api";
 
-interface Message {
+interface ChatMsg {
   role: "user" | "assistant";
   content: string;
-  groundingContext?: any;
+  isFallback?: boolean;
+  metrics?: Record<string, any>;
 }
 
-export function AiAdvisor() {
-  const [messages, setMessages] = useState<Message[]>([
+const SUGGESTED_PROMPTS = [
+  "Why is my Financial Readiness score at its current level?",
+  "Summarize my GSTR-3B tax payable and cash challan obligations.",
+  "Which MSME government schemes am I most eligible for right now?",
+  "How can I optimize my ITC recovery for pending invoices?",
+];
+
+function renderSafeMarkdownText(text: string) {
+  return text.split("\n").map((line, i) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return <div key={i} className="h-2" />;
+    }
+    const isBullet = trimmed.startsWith("- ") || trimmed.startsWith("* ");
+    const content = isBullet ? trimmed.slice(2) : line;
+    const parts = content.split(/(\*\*[^*]+\*\*)/g).map((seg, idx) =>
+      seg.startsWith("**") && seg.endsWith("**") && seg.length > 4 ? (
+        <strong key={idx}>{seg.slice(2, -2)}</strong>
+      ) : (
+        <React.Fragment key={idx}>{seg}</React.Fragment>
+      )
+    );
+    if (isBullet) {
+      return (
+        <div key={i} className="flex items-start gap-2 pl-1">
+          <span className="text-indigo-500 font-bold">•</span>
+          <span>{parts}</span>
+        </div>
+      );
+    }
+    return <p key={i}>{parts}</p>;
+  });
+}
+
+export default function AiAdvisor() {
+  const [messages, setMessages] = useState<ChatMsg[]>([
     {
       role: "assistant",
-      content: "Namaste! I am your **MyCA AI Statutory Copilot**, grounded in your organization's real-time GST filings, ITC ledgers, and MSME credit readiness score. How can I assist you with your tax compliance, credit building, or scheme matching today?"
-    }
+      content:
+        "Hello! I am MyCA, your Virtual Chartered Accountant. I analyze your live database metrics (GSTR-3B tax liabilities, Net ITC balances, Financial Readiness Scores, and Matched MSME Schemes) to provide grounded financial and compliance guidance. How can I assist you today?",
+    },
   ]);
+  const [insights, setInsights] = useState<QuickInsight[]>([]);
+  const [insightsError, setInsightsError] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [insights, setInsights] = useState<QuickInsightOut[]>([]);
-  const [error, setError] = useState<string | null>(null);
-
-  const suggestedPrompts = [
-    "Explain Rule 37 (180-day payment) vs Rule 37A",
-    "How does Rule 88A credit offset work for GSTR-3B?",
-    "Summarize our latest tax liability and eligible ITC",
-    "What government loan schemes are we eligible for?"
-  ];
-
-  const loadInsights = async () => {
-    try {
-      const res = await getQuickInsights();
-      setInsights(res);
-    } catch {
-      // Non-blocking fallback
-    }
-  };
+  const endOfMessagesRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    loadInsights();
+    setInsightsError(null);
+    getQuickInsights()
+      .then((res) => setInsights(res))
+      .catch((err: any) => {
+        setInsights([]);
+        setInsightsError(err?.message || "Failed to load quick financial insights.");
+      });
   }, []);
 
-  const handleSend = async (userText: string) => {
-    if (!userText.trim() || loading) return;
+  useEffect(() => {
+    endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
-    const newMessages: Message[] = [...messages, { role: "user", content: userText }];
-    setMessages(newMessages);
-    setInput("");
+  const handleSend = async (textOverride?: string) => {
+    const msg = (textOverride ?? input).trim();
+    if (!msg || loading) return;
+
+    const historyPayload = [
+      ...messages.map((m) => ({ role: m.role, content: m.content })),
+      { role: "user" as const, content: msg },
+    ];
+    setMessages((prev) => [...prev, { role: "user", content: msg }]);
+    if (!textOverride) setInput("");
     setLoading(true);
-    setError(null);
+    setChatError(null);
 
     try {
-      const apiPayload = newMessages.map((m) => ({ role: m.role, content: m.content }));
-      const res: ChatResponseOut = await sendAiChat(apiPayload, true);
+      const res = await chatWithAdvisor(historyPayload, true);
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
           content: res.reply,
-          groundingContext: res.grounding_context
-        }
+          isFallback: res.model_used === "myca-gst-intelligence-engine-v2",
+          metrics: res.grounding_context,
+        },
       ]);
     } catch (err: any) {
-      setError(err?.message || "Failed to generate AI response.");
+      const errMsg = err?.message || "Unable to connect to the AI Advisor backend.";
+      setChatError(errMsg);
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: "I encountered an error retrieving live accounting context. Please check your session connection or try again."
-        }
+          content: `Request could not be completed: ${errMsg}`,
+          isFallback: true,
+        },
       ]);
     } finally {
       setLoading(false);
@@ -93,128 +125,183 @@ export function AiAdvisor() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div>
-        <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2">
-          <Bot className="w-6 h-6 text-indigo-600" />
-          AI Financial & Statutory Advisor
-        </h2>
-        <p className="text-sm text-slate-500">
-          Grounded in PostgreSQL 16 RLS Statutory Ledgers & Google Gemini Domain Reasoning
-        </p>
+      <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-indigo-600" />
+            AI Financial Advisor &amp; Virtual CA
+          </h2>
+          <p className="text-sm text-slate-500 mt-1">
+            Grounded conversational assistant powered by your live GST, Cash Flow, and MSME Scheme data.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 px-3 py-1.5 bg-indigo-50 border border-indigo-100 rounded-lg text-xs text-indigo-700 font-semibold">
+          <Bot className="w-4 h-4" />
+          <span>Context-Grounded Financial Reasoning</span>
+        </div>
       </div>
 
-      {/* Proactive Statutory Alert Cards */}
-      {insights.length > 0 && (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-          {insights.map((ins) => (
-            <div 
-              key={ins.id}
-              className={`p-3.5 rounded-xl border text-xs shadow-sm flex flex-col justify-between ${
-                ins.severity === "warning" ? "bg-amber-50/60 border-amber-200 text-amber-900" :
-                ins.severity === "critical" ? "bg-rose-50/60 border-rose-200 text-rose-900" :
-                ins.severity === "success" ? "bg-emerald-50/60 border-emerald-200 text-emerald-900" :
-                "bg-indigo-50/60 border-indigo-200 text-indigo-900"
-              }`}
-            >
-              <div>
-                <div className="flex items-center gap-1.5 font-bold mb-1">
-                  {ins.severity === "warning" ? <AlertTriangle className="w-3.5 h-3.5 text-amber-600 flex-shrink-0" /> :
-                   ins.severity === "success" ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 flex-shrink-0" /> :
-                   <Info className="w-3.5 h-3.5 text-indigo-600 flex-shrink-0" />}
-                  <span className="truncate">{ins.title}</span>
-                </div>
-                <p className="text-[11px] leading-relaxed opacity-90">{ins.summary}</p>
+      {/* Main Split Interface */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Left Column: Quick Insights & Suggested Questions */}
+        <div className="space-y-4">
+          <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+            <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
+              <TrendingUp className="w-4 h-4 text-indigo-600" />
+              Live Compliance Snapshot
+            </h3>
+            {insightsError && (
+              <div className="mb-3 p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700 flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{insightsError}</span>
               </div>
-              {ins.statutory_reference && (
-                <div className="mt-2 text-[10px] font-mono font-semibold opacity-75">
-                  Ref: {ins.statutory_reference}
+            )}
+            <div className="space-y-3">
+              {insights.map((ins) => (
+                <div key={ins.id} className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                  <div className="flex justify-between items-center mb-1 gap-2">
+                    <span className="text-xs font-semibold text-slate-700">{ins.title}</span>
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase ${
+                        ins.severity === "critical"
+                          ? "bg-rose-100 text-rose-800"
+                          : ins.severity === "warning"
+                          ? "bg-amber-100 text-amber-800"
+                          : "bg-emerald-100 text-emerald-800"
+                      }`}
+                    >
+                      {ins.severity}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-600">{ins.summary}</p>
+                  {ins.statutory_reference && (
+                    <div className="text-[10px] text-indigo-700 font-mono mt-1">
+                      Ref: {ins.statutory_reference}
+                    </div>
+                  )}
                 </div>
+              ))}
+              {!insightsError && insights.length === 0 && (
+                <p className="text-xs text-slate-400">
+                  Sign in and select an organization to view grounded compliance metrics.
+                </p>
               )}
             </div>
-          ))}
-        </div>
-      )}
+          </div>
 
-      {/* Main Chat Interface */}
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm flex flex-col h-[540px] overflow-hidden">
-        {/* Messages Scroll Area */}
-        <div className="flex-1 p-5 overflow-y-auto space-y-4">
-          {messages.map((m, idx) => (
-            <div 
-              key={idx}
-              className={`flex items-start gap-3 ${m.role === "user" ? "flex-row-reverse" : ""}`}
-            >
-              <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
-                m.role === "user" 
-                  ? "bg-indigo-600 text-white" 
-                  : "bg-slate-100 text-indigo-600 border border-slate-200"
-              }`}>
-                {m.role === "user" ? <Building2 className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
-              </div>
-
-              <div className={`max-w-2xl text-xs md:text-sm p-4 rounded-2xl leading-relaxed whitespace-pre-wrap ${
-                m.role === "user"
-                  ? "bg-indigo-600 text-white rounded-tr-none shadow-sm"
-                  : "bg-slate-50 border border-slate-200 text-slate-800 rounded-tl-none shadow-sm"
-              }`}>
-                {m.content}
-
-                {/* Grounding Context pill if available */}
-                {m.groundingContext && (
-                  <div className="mt-3 pt-2.5 border-t border-slate-200/60 text-[11px] text-slate-500 font-medium flex items-center gap-1.5">
-                    <Sparkles className="w-3 h-3 text-indigo-500" />
-                    <span>Grounded in {m.groundingContext.org_legal_name} ({m.groundingContext.gstin || 'Active'})</span>
-                  </div>
-                )}
-              </div>
+          <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+            <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">
+              Recommended Advisory Queries
+            </h3>
+            <div className="space-y-2">
+              {SUGGESTED_PROMPTS.map((q, i) => (
+                <button
+                  key={i}
+                  onClick={() => handleSend(q)}
+                  disabled={loading}
+                  className="w-full text-left p-2.5 text-xs bg-slate-50 hover:bg-indigo-50 text-slate-700 hover:text-indigo-800 rounded-lg border border-slate-200 hover:border-indigo-200 transition font-medium"
+                >
+                  &ldquo;{q}&rdquo;
+                </button>
+              ))}
             </div>
-          ))}
+          </div>
 
-          {loading && (
-            <div className="flex items-center gap-2 text-xs text-slate-400 p-2">
-              <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-600" />
-              <span>Analyzing statutory provisions and ledger balances...</span>
+          <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-start gap-2.5">
+            <ShieldAlert className="w-4 h-4 flex-shrink-0 mt-0.5 text-amber-600" />
+            <div>
+              <strong>Disclaimer:</strong> MyCA AI is an advisory assistant providing guidance from live metrics. It does not substitute statutory tax audit sign-off by a practicing Chartered Accountant.
+            </div>
+          </div>
+        </div>
+
+        {/* Right Column: Conversational Thread */}
+        <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200 shadow-sm flex flex-col h-[600px]">
+          {chatError && (
+            <div className="px-4 py-2 bg-rose-50 border-b border-rose-200 text-xs text-rose-700 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{chatError}</span>
             </div>
           )}
-        </div>
+          <div className="flex-1 p-5 overflow-y-auto space-y-4">
+            {messages.map((m, idx) => (
+              <div
+                key={idx}
+                className={`flex gap-3 ${m.role === "user" ? "flex-row-reverse" : "flex-row"}`}
+              >
+                <div
+                  className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
+                    m.role === "user"
+                      ? "bg-slate-900 text-white"
+                      : "bg-indigo-600 text-white shadow-sm"
+                  }`}
+                >
+                  {m.role === "user" ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+                </div>
 
-        {/* Suggested Prompts */}
-        <div className="px-4 py-2 border-t border-slate-100 bg-slate-50 flex items-center gap-2 overflow-x-auto scrollbar-none">
-          <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider whitespace-nowrap">Suggested:</span>
-          {suggestedPrompts.map((p, idx) => (
-            <button
-              key={idx}
-              type="button"
-              onClick={() => handleSend(p)}
-              className="text-xs bg-white hover:bg-indigo-50 hover:text-indigo-600 text-slate-600 border border-slate-200 px-3 py-1 rounded-full whitespace-nowrap transition shadow-2xs font-medium"
+                <div
+                  className={`max-w-[85%] rounded-2xl p-4 text-xs leading-relaxed ${
+                    m.role === "user"
+                      ? "bg-slate-900 text-white rounded-tr-none"
+                      : "bg-slate-50 border border-slate-200 text-slate-800 rounded-tl-none"
+                  }`}
+                >
+                  <div className="space-y-1">{renderSafeMarkdownText(m.content)}</div>
+
+                  {m.isFallback && (
+                    <div className="mt-2 pt-2 border-t border-slate-200/70 flex items-center gap-1.5 text-[10px] text-slate-500">
+                      <Info className="w-3 h-3 text-indigo-500" />
+                      <span>
+                        Response computed directly from verified database metrics (Deterministic Advisor Mode).
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+
+            {loading && (
+              <div className="flex gap-3">
+                <div className="w-8 h-8 rounded-full bg-indigo-600 text-white flex items-center justify-center">
+                  <Bot className="w-4 h-4" />
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-2xl rounded-tl-none p-4 text-xs text-slate-500 flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
+                  <span>Analyzing tax ledger and readiness metrics...</span>
+                </div>
+              </div>
+            )}
+            <div ref={endOfMessagesRef} />
+          </div>
+
+          <div className="p-4 border-t border-slate-100 bg-slate-50 rounded-b-xl">
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleSend();
+              }}
+              className="flex gap-2"
             >
-              {p}
-            </button>
-          ))}
+              <input
+                type="text"
+                placeholder="Ask MyCA about GST compliance, working capital, credit readiness, or MSME schemes..."
+                className="flex-1 bg-white border border-slate-300 rounded-lg px-4 py-2.5 text-xs focus:ring-2 focus:ring-indigo-500 outline-none shadow-inner"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                disabled={loading}
+              />
+              <button
+                type="submit"
+                disabled={loading || !input.trim()}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-semibold flex items-center gap-2 shadow-sm transition"
+              >
+                <Send className="w-3.5 h-3.5" />
+                <span>Send</span>
+              </button>
+            </form>
+          </div>
         </div>
-
-        {/* Input Form */}
-        <form 
-          onSubmit={(e) => { e.preventDefault(); handleSend(input); }} 
-          className="p-3 bg-white border-t border-slate-200 flex gap-2"
-        >
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            disabled={loading}
-            placeholder="Ask a question about GST rules, GSTR-3B offset, credit readiness, or government subsidies..."
-            className="flex-1 px-4 py-2 text-xs md:text-sm border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-slate-100"
-          />
-          <button
-            type="submit"
-            disabled={loading || !input.trim()}
-            className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
-          >
-            <Send className="w-3.5 h-3.5" />
-            <span>Send</span>
-          </button>
-        </form>
       </div>
     </div>
   );

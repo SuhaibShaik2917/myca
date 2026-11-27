@@ -1,554 +1,829 @@
-import React, { useEffect, useState } from "react";
-import { 
-  FileText, 
-  TrendingUp, 
-  Award, 
-  Bot, 
-  Shield, 
-  AlertCircle,
-  Building2,
-  Send,
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  FileText,
   UploadCloud,
-  Info,
-  GitCompare,
+  CheckCircle2,
+  XCircle,
   BookOpen,
-  ShieldCheck,
-  Layers,
-  FileCheck
+  GitCompare,
+  ShieldAlert,
+  FileCheck2,
+  TrendingUp,
+  Compass,
+  Sparkles,
+  RefreshCw,
+  LogOut,
+  Eye,
+  X,
 } from "lucide-react";
-
 import { Gstr2bUpload } from "./pages/Gstr2bUpload";
 import { PurchaseRegister } from "./pages/PurchaseRegister";
 import { ReconciliationWorkbench } from "./pages/ReconciliationWorkbench";
 import { ItcRiskDashboard } from "./pages/ItcRiskDashboard";
-import { Gstr3bFilingView } from "./pages/Gstr3bFilingView";
-import { CreditBuilder } from "./pages/CreditBuilder";
-import { SchemeNavigator } from "./pages/SchemeNavigator";
-import { AiAdvisor } from "./pages/AiAdvisor";
+import Gstr3bFilingView from "./pages/Gstr3bFilingView";
+import CreditBuilder from "./pages/CreditBuilder";
+import SchemeNavigator from "./pages/SchemeNavigator";
+import AiAdvisor from "./pages/AiAdvisor";
 import {
-  approveOutwardInvoice,
-  buildOidcAuthorizeUrl,
-  clearSession,
-  exchangeIdpAuthCode,
-  generatePkcePair,
-  getStoredSession,
+  loadSession,
+  saveSession,
   isDemoAuthEnabled,
-  listInvoices,
+  getCurrentUser,
+  getBusinessProfile,
+  logoutSession,
   requestDemoToken,
   requestIdpNonce,
-  saveSession,
-  uploadOutwardInvoice,
+  exchangeIdpCode,
+  generatePkceVerifier,
+  generateOidcState,
+  derivePkceChallenge,
+  buildOidcAuthorizeUrl,
+  listInvoices,
+  getInvoiceDetail,
+  patchInvoice,
+  uploadInvoice,
+  approveInvoice,
+  rejectInvoice,
+  fetchGstr1Draft,
+  listRegistrations,
+  AuthenticatedContext,
+  InvoiceItem,
+  GstRegistration,
+  SessionConfig,
 } from "./api";
 
-const PKCE_STORAGE_KEY = "myca_oidc_pending";
+type TabKey =
+  | "invoices"
+  | "gstr1"
+  | "purchases"
+  | "gstr2b"
+  | "reconcile"
+  | "itc-risk"
+  | "gstr3b"
+  | "credit"
+  | "schemes"
+  | "advisor";
 
-export default function App() {
-  const [activeTab, setActiveTab] = useState<
-    "invoices" | "gstr2b" | "purchase" | "reconciliation" | "itc_risk" | "gstr3b" | "credit" | "schemes" | "ai"
-  >("gstr2b");
-  const [uploadNotification, setUploadNotification] = useState<string | null>(null);
-  const [session, setSession] = useState(() => getStoredSession());
-  const [sessionError, setSessionError] = useState<string | null>(null);
-  const [isGettingToken, setIsGettingToken] = useState(false);
+export function App() {
+  const [activeTab, setActiveTab] = useState<TabKey>("invoices");
+  const [session, setSession] = useState<SessionConfig>(() => loadSession());
+  const [authContext, setAuthContext] = useState<AuthenticatedContext | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
 
-  const [idpProvider, setIdpProvider] = useState("google");
+  const [invoices, setInvoices] = useState<InvoiceItem[]>([]);
+  const [registrations, setRegistrations] = useState<GstRegistration[]>([]);
+  const [gstr1Draft, setGstr1Draft] = useState<Record<string, unknown> | null>(null);
+  const [loadingInvoices, setLoadingInvoices] = useState(false);
+  const [invoiceFile, setInvoiceFile] = useState<File | null>(null);
+
+  // Invoice Review Modal State
+  const [inspectInvoice, setInspectInvoice] = useState<InvoiceItem | null>(null);
+  const [editCounterpartyGstin, setEditCounterpartyGstin] = useState("");
+  const [editCounterpartyName, setEditCounterpartyName] = useState("");
+  const [editInvNum, setEditInvNum] = useState("");
+  const [editTotal, setEditTotal] = useState("");
+  const [rejectReason, setRejectReason] = useState("");
+  const [showRejectBox, setShowRejectBox] = useState<string | null>(null);
+
+  // Federated OIDC Authorization Code + PKCE Settings
+  const [oidcOrgId, setOidcOrgId] = useState(
+    () => localStorage.getItem("myca.oidc.orgId") || loadSession().orgId || ""
+  );
   const [oidcAuthorizeUrl, setOidcAuthorizeUrl] = useState(
-    ((import.meta as any).env?.VITE_OIDC_AUTHORIZE_URL as string) ?? ""
+    () => localStorage.getItem("myca.oidc.authorizeUrl") || ""
   );
   const [oidcClientId, setOidcClientId] = useState(
-    ((import.meta as any).env?.VITE_OIDC_CLIENT_ID as string) ?? ""
+    () => localStorage.getItem("myca.oidc.clientId") || ""
+  );
+  const [oidcRedirectUri, setOidcRedirectUri] = useState(
+    () => localStorage.getItem("myca.oidc.redirectUri") || `${window.location.origin}/auth/callback`
+  );
+  const demoAllowed = isDemoAuthEnabled();
+
+  const handleSaveSession = (patch: Partial<SessionConfig>) => {
+    const next = saveSession(patch);
+    setSession(next);
+  };
+
+  const resolveProfileIdForReg = useCallback(
+    async (me: AuthenticatedContext | null, regId: string): Promise<string> => {
+      const regGstin = me?.registrations?.find((r) => r.id === regId)?.gstin;
+      const profiles = me?.profiles || [];
+      if (regGstin) {
+        const matched = profiles.find((p) => (p.gstin || "").toUpperCase() === regGstin.toUpperCase());
+        if (matched) return matched.id;
+      }
+      if (profiles[0]?.id) return profiles[0].id;
+      try {
+        const bp = await getBusinessProfile();
+        return bp.id;
+      } catch {
+        return "";
+      }
+    },
+    []
   );
 
-  const [invoices, setInvoices] = useState<any[]>([]);
-  const [invoicesLoading, setInvoicesLoading] = useState(false);
-  const [invoicesError, setInvoicesError] = useState<string | null>(null);
-  const [profileId, setProfileId] = useState("");
-  const [selectedInvoiceFile, setSelectedInvoiceFile] = useState<File | null>(null);
-  const demoEnabled = isDemoAuthEnabled();
-
-  useEffect(() => {
-    const queryParams = new URLSearchParams(window.location.search);
-    const oidcError = queryParams.get("error");
-    if (oidcError) {
-      setSessionError(`OIDC provider rejected sign-in: ${queryParams.get("error_description") || oidcError}`);
+  const refreshContextAndWorkspace = useCallback(async () => {
+    const cur = loadSession();
+    if (!cur.token && (!demoAllowed || !cur.orgId || !cur.userId)) {
       return;
     }
+    setAuthError(null);
+    setLoadingInvoices(true);
+    try {
+      const me = await getCurrentUser();
+      setAuthContext(me);
+      setRegistrations(me.registrations || []);
+      const defaultReg =
+        me.registrations?.find((r) => r.id === cur.registrationId)?.id ||
+        me.registrations?.find((r) => r.is_primary)?.id ||
+        me.registrations?.[0]?.id ||
+        "";
+      const defaultProfileId = await resolveProfileIdForReg(me, defaultReg);
+      const nextSess = saveSession({
+        orgId: me.org_id,
+        userId: me.user_id || cur.userId,
+        email: me.email || cur.email,
+        role: me.role,
+        pan: me.organization?.pan || "",
+        registrationId: defaultReg,
+        profileId: defaultProfileId,
+      });
+      setSession(nextSess);
 
-    const authCode = queryParams.get("code");
-    const returnedState = queryParams.get("state");
-    if (!authCode || !returnedState) return;
-
-    const rawPending = sessionStorage.getItem(PKCE_STORAGE_KEY);
-    if (!rawPending) {
-      setSessionError("OIDC callback missing pending PKCE session state.");
-      return;
-    }
-
-    (async () => {
-      setIsGettingToken(true);
-      setSessionError(null);
+      const invList = await listInvoices();
+      setInvoices(invList);
+    } catch (err: any) {
+      setAuthError(err?.message || "Failed to load organization workspace.");
       try {
-        const pending = JSON.parse(rawPending);
-        if (pending.state !== returnedState) {
-          throw new Error("OIDC state mismatch: possible login CSRF rejected.");
-        }
-        const tokenResp = await exchangeIdpAuthCode({
-          idp_provider: pending.idpProvider,
-          org_id: pending.orgId,
-          code: authCode,
-          state: returnedState,
-          code_verifier: pending.codeVerifier,
-          redirect_uri: pending.redirectUri,
-        });
-        sessionStorage.removeItem(PKCE_STORAGE_KEY);
-        window.history.replaceState({}, document.title, window.location.pathname);
-        const next = { ...getStoredSession(), token: tokenResp.access_token, userId: tokenResp.user_id, orgId: tokenResp.org_id };
-        saveSession(next);
-        setSession(next);
-        setUploadNotification("Federated OIDC Authorization Code + PKCE sign-in succeeded.");
-      } catch (err: any) {
-        setSessionError(err?.message || "OIDC authorization code exchange failed.");
-      } finally {
-        setIsGettingToken(false);
+        const [invList, regList] = await Promise.all([listInvoices(), listRegistrations()]);
+        setInvoices(invList);
+        setRegistrations(regList);
+      } catch {
+        // leave empty cleanly
       }
-    })();
-  }, []);
-
-  const refreshInvoices = async () => {
-    setInvoicesLoading(true);
-    setInvoicesError(null);
-    try {
-      const items = await listInvoices();
-      setInvoices(items);
-    } catch (err: any) {
-      setInvoicesError(err?.message || "Failed to load outward invoices.");
     } finally {
-      setInvoicesLoading(false);
+      setLoadingInvoices(false);
     }
-  };
+  }, [demoAllowed, resolveProfileIdForReg]);
 
   useEffect(() => {
-    if (activeTab === "invoices" && session.token) {
-      void refreshInvoices();
-    }
-  }, [activeTab, session.token]);
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const returnedState = params.get("state");
+    const savedState = sessionStorage.getItem("myca.oidc.state");
+    const savedVerifier = sessionStorage.getItem("myca.oidc.code_verifier");
+    const savedRedirectUri = sessionStorage.getItem("myca.oidc.redirect_uri");
+    const savedProvider = sessionStorage.getItem("myca.oidc.provider") || session.idpProvider || "google";
+    const savedOrgId = sessionStorage.getItem("myca.oidc.org_id") || oidcOrgId || session.orgId;
 
-  const handleInvoiceUpload = async () => {
-    if (!selectedInvoiceFile || !profileId.trim()) {
-      setInvoicesError("Provide both a Business Profile UUID and an invoice PDF/image file.");
+    if (code && returnedState) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      if (!savedState || returnedState !== savedState || !savedVerifier || !savedOrgId || !savedRedirectUri) {
+        setAuthError("OIDC state mismatch or missing PKCE verifier/org context. Restart sign-in.");
+        return;
+      }
+      exchangeIdpCode({
+        provider: savedProvider,
+        orgId: savedOrgId,
+        code,
+        state: returnedState,
+        codeVerifier: savedVerifier,
+        redirectUri: savedRedirectUri,
+      })
+        .then((res) => {
+          sessionStorage.removeItem("myca.oidc.state");
+          sessionStorage.removeItem("myca.oidc.code_verifier");
+          sessionStorage.removeItem("myca.oidc.redirect_uri");
+          sessionStorage.removeItem("myca.oidc.provider");
+          sessionStorage.removeItem("myca.oidc.org_id");
+          setSession(loadSession());
+          setAuthNotice(
+            `Authenticated via ${res.provider || savedProvider} (${res.role}) for org ${res.org_id}.`
+          );
+          refreshContextAndWorkspace();
+        })
+        .catch((err: any) => {
+          setAuthError(err?.message || "OIDC authorization code exchange failed.");
+        });
       return;
     }
-    setInvoicesLoading(true);
-    setInvoicesError(null);
-    try {
-      await uploadOutwardInvoice(profileId.trim(), selectedInvoiceFile);
-      setSelectedInvoiceFile(null);
-      setUploadNotification("Outward invoice uploaded and queued for OCR extraction.");
-      await refreshInvoices();
-    } catch (err: any) {
-      setInvoicesError(err?.message || "Invoice upload failed.");
-    } finally {
-      setInvoicesLoading(false);
-    }
-  };
 
-  const handleApproveInvoice = async (invoiceId: string) => {
-    setInvoicesError(null);
-    try {
-      await approveOutwardInvoice(invoiceId);
-      setUploadNotification("Outward invoice approved.");
-      await refreshInvoices();
-    } catch (err: any) {
-      setInvoicesError(err?.message || "Failed to approve invoice.");
-    }
-  };
-
-  const handleSaveSession = () => {
-    saveSession(session);
-    setSessionError(null);
-    setUploadNotification("Session saved. All statutory API calls will use these credentials.");
-    setTimeout(() => setUploadNotification(null), 4000);
-  };
+    refreshContextAndWorkspace();
+  }, [refreshContextAndWorkspace]);
 
   const handleOidcSignIn = async () => {
-    if (!session.orgId || !oidcAuthorizeUrl || !oidcClientId) {
-      setSessionError("Organization ID, OIDC Authorize URL, and OIDC Client ID are required.");
-      return;
-    }
-    setIsGettingToken(true);
-    setSessionError(null);
+    setAuthError(null);
+    setAuthNotice(null);
     try {
-      const redirectUri = window.location.origin + window.location.pathname;
-      const pkce = await generatePkcePair();
-      const nonceResp = await requestIdpNonce(session.orgId, idpProvider, pkce.state, pkce.codeChallenge);
-      sessionStorage.setItem(
-        PKCE_STORAGE_KEY,
-        JSON.stringify({
-          orgId: session.orgId,
-          idpProvider,
-          nonce: nonceResp.nonce,
-          state: pkce.state,
-          codeVerifier: pkce.codeVerifier,
-          redirectUri,
-        })
-      );
-      const authUrl = buildOidcAuthorizeUrl({
+      const targetOrgId = oidcOrgId.trim();
+      if (!targetOrgId || !oidcAuthorizeUrl || !oidcClientId || !oidcRedirectUri) {
+        throw new Error(
+          "Enter Organization UUID, IdP Authorize URL, Client ID, and Redirect URI to launch OIDC PKCE login."
+        );
+      }
+      const verifier = generatePkceVerifier();
+      const challenge = await derivePkceChallenge(verifier);
+      const clientState = generateOidcState();
+      const provider = session.idpProvider || "google";
+
+      const nonceRes = await requestIdpNonce({
+        orgId: targetOrgId,
+        provider,
+        state: clientState,
+        codeChallenge: challenge,
+      });
+
+      localStorage.setItem("myca.oidc.orgId", targetOrgId);
+      localStorage.setItem("myca.oidc.authorizeUrl", oidcAuthorizeUrl);
+      localStorage.setItem("myca.oidc.clientId", oidcClientId);
+      localStorage.setItem("myca.oidc.redirectUri", oidcRedirectUri);
+      sessionStorage.setItem("myca.oidc.state", nonceRes.state);
+      sessionStorage.setItem("myca.oidc.code_verifier", verifier);
+      sessionStorage.setItem("myca.oidc.redirect_uri", oidcRedirectUri);
+      sessionStorage.setItem("myca.oidc.provider", provider);
+      sessionStorage.setItem("myca.oidc.org_id", targetOrgId);
+
+      const authorizeTarget = buildOidcAuthorizeUrl({
         authorizeEndpoint: oidcAuthorizeUrl,
         clientId: oidcClientId,
-        redirectUri,
-        state: pkce.state,
-        nonce: nonceResp.nonce,
-        codeChallenge: pkce.codeChallenge,
+        redirectUri: oidcRedirectUri,
+        state: nonceRes.state,
+        nonce: nonceRes.nonce,
+        codeChallenge: challenge,
       });
-      window.location.assign(authUrl);
+      window.location.assign(authorizeTarget);
     } catch (err: any) {
-      setSessionError(err?.message || "Failed to initiate OIDC sign-in.");
-      setIsGettingToken(false);
+      setAuthError(err?.message || "OIDC sign-in initialization failed.");
     }
   };
 
-  const handleGetDemoToken = async () => {
-    setIsGettingToken(true);
-    setSessionError(null);
+  const handleIssueDemoToken = async () => {
+    setAuthError(null);
+    setAuthNotice(null);
     try {
-      const token = await requestDemoToken(session.userId, session.orgId);
-      const next = { ...session, token: token.access_token };
-      saveSession(next);
-      setSession(next);
-      setUploadNotification("Development JWT Bearer access token issued and saved.");
-      setTimeout(() => setUploadNotification(null), 4000);
+      if (!session.orgId || !session.userId) {
+        throw new Error("Provide Org ID and User ID to request a dev token.");
+      }
+      const res = await requestDemoToken(session.orgId, session.userId);
+      setSession(loadSession());
+      setAuthNotice(`Issued signed HS256 dev Bearer token (${res.role}, ${res.expires_in}s).`);
+      await refreshContextAndWorkspace();
     } catch (err: any) {
-      setSessionError(err?.message || "Could not issue access token.");
-    } finally {
-      setIsGettingToken(false);
+      setAuthError(err?.message || "Failed to issue dev token.");
     }
   };
 
-  const handleLogout = () => {
-    clearSession();
-    sessionStorage.removeItem(PKCE_STORAGE_KEY);
-    setSession(getStoredSession());
+  const handleSignOut = async () => {
+    setAuthError(null);
+    await logoutSession();
+    setSession(loadSession());
+    setAuthContext(null);
+    setInvoices([]);
+    setRegistrations([]);
+    setGstr1Draft(null);
+    setAuthNotice("Session revoked and signed out.");
   };
+
+  const handleUploadInvoice = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!invoiceFile) return;
+    setAuthError(null);
+    try {
+      const pid = session.profileId || (await resolveProfileIdForReg(authContext, session.registrationId));
+      const res = await uploadInvoice(invoiceFile, pid);
+      setAuthNotice(`Invoice uploaded (${res.invoice_id.slice(0, 8)}..., status: ${res.status}).`);
+      setInvoiceFile(null);
+      await refreshContextAndWorkspace();
+    } catch (err: any) {
+      setAuthError(err?.message || "Invoice upload failed.");
+    }
+  };
+
+  const handleApproveInvoice = async (id: string) => {
+    setAuthError(null);
+    try {
+      await approveInvoice(id);
+      setAuthNotice(`Invoice ${id.slice(0, 8)}... approved.`);
+      await refreshContextAndWorkspace();
+    } catch (err: any) {
+      setAuthError(err?.message || "Approval failed.");
+    }
+  };
+
+  const handleRejectInvoice = async (id: string) => {
+    if (!rejectReason.trim()) {
+      setAuthError("Rejection reason is required.");
+      return;
+    }
+    setAuthError(null);
+    try {
+      await rejectInvoice(id, rejectReason.trim());
+      setShowRejectBox(null);
+      setRejectReason("");
+      setAuthNotice(`Invoice ${id.slice(0, 8)}... rejected.`);
+      await refreshContextAndWorkspace();
+    } catch (err: any) {
+      setAuthError(err?.message || "Rejection failed.");
+    }
+  };
+
+  const handleOpenInspect = async (id: string) => {
+    setAuthError(null);
+    try {
+      const detail = await getInvoiceDetail(id);
+      setInspectInvoice(detail);
+      setEditCounterpartyGstin(detail.counterparty_gstin || "");
+      setEditCounterpartyName(detail.counterparty_name || "");
+      setEditInvNum(detail.invoice_number || "");
+      setEditTotal(String(detail.total_amount ?? ""));
+    } catch (err: any) {
+      setAuthError(err?.message || "Failed to load invoice details.");
+    }
+  };
+
+  const handleSaveInspectEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inspectInvoice) return;
+    setAuthError(null);
+    try {
+      await patchInvoice(inspectInvoice.id, {
+        invoice_number: editInvNum.trim(),
+        counterparty_gstin: editCounterpartyGstin.trim() || null,
+        counterparty_name: editCounterpartyName.trim() || null,
+        total_amount: parseFloat(editTotal) || undefined,
+      });
+      setInspectInvoice(null);
+      setAuthNotice("Invoice updated and validation report refreshed.");
+      await refreshContextAndWorkspace();
+    } catch (err: any) {
+      setAuthError(err?.message || "Failed to save invoice edits.");
+    }
+  };
+
+  const handleLoadGstr1 = async () => {
+    setAuthError(null);
+    try {
+      const pid = session.profileId || (await resolveProfileIdForReg(authContext, session.registrationId));
+      const draft = await fetchGstr1Draft(session.returnPeriod || "2026-11", pid || undefined);
+      setGstr1Draft(draft);
+    } catch (err: any) {
+      setAuthError(err?.message || "Failed to generate GSTR-1 working draft.");
+    }
+  };
+
+  const tabs: Array<{ key: TabKey; label: string; icon: React.ReactNode }> = [
+    { key: "invoices", label: "Outward Invoices", icon: <FileText className="w-4 h-4" /> },
+    { key: "gstr1", label: "GSTR-1 Draft", icon: <FileCheck2 className="w-4 h-4" /> },
+    { key: "purchases", label: "Purchase Register", icon: <BookOpen className="w-4 h-4" /> },
+    { key: "gstr2b", label: "GSTR-2B & IMS", icon: <UploadCloud className="w-4 h-4" /> },
+    { key: "reconcile", label: "2B vs Books", icon: <GitCompare className="w-4 h-4" /> },
+    { key: "itc-risk", label: "ITC Risk & Table 4", icon: <ShieldAlert className="w-4 h-4" /> },
+    { key: "gstr3b", label: "GSTR-3B Filing", icon: <FileCheck2 className="w-4 h-4" /> },
+    { key: "credit", label: "Credit Builder", icon: <TrendingUp className="w-4 h-4" /> },
+    { key: "schemes", label: "Schemes", icon: <Compass className="w-4 h-4" /> },
+    { key: "advisor", label: "Virtual CA AI", icon: <Sparkles className="w-4 h-4" /> },
+  ];
+
+  const isAuthenticated = Boolean(session.token || authContext);
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 font-sans">
-      {/* Integration & Sandbox Status Banner */}
-      <div className="bg-amber-950 text-amber-100 text-xs py-1.5 px-4 text-center font-medium flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-b border-amber-900">
-        <ShieldCheck className="w-4 h-4 text-amber-300" />
-        <span>
-          Mode: {demoEnabled ? "Development / Demo Auth Allowed" : "Staging / Production Guarded (Demo Auth Disabled)"}
-        </span>
-        <span>&bull;</span>
-        <span>Auth: {oidcAuthorizeUrl && oidcClientId ? "OIDC Auth Code + PKCE Configured" : "OIDC External Config Pending"}</span>
-        <span>&bull;</span>
-        <span>GSTN: GSP Sandbox Simulation Only (Live GSTN Transport Unavailable Pending Authorized Onboarding)</span>
-      </div>
-
-      {/* Header */}
-      <header className="bg-white border-b border-slate-200 px-4 md:px-8 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-        <div className="flex items-center space-x-3">
-          <div className="bg-indigo-600 text-white px-3 py-1.5 rounded-lg font-bold text-xl tracking-tight">MyCA</div>
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      {/* Top Bar */}
+      <header className="bg-slate-900 text-white px-6 py-4 shadow">
+        <div className="max-w-7xl mx-auto flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div>
-            <h1 className="text-lg md:text-xl font-bold text-slate-800">Financial Companion for Indian MSMEs</h1>
-            <p className="text-xs text-slate-500">Autonomous Invoicing &bull; 4-Pass Reconciliation &bull; Statutory ITC Ledger &bull; Credit Builder &bull; Scheme Navigator</p>
+            <h1 className="text-xl font-bold tracking-tight flex items-center gap-2">
+              MyCA
+              <span className="text-[11px] font-mono bg-indigo-500/20 text-indigo-200 px-2 py-0.5 rounded border border-indigo-400/30">
+                GST &amp; MSME Compliance
+              </span>
+            </h1>
+            <p className="text-xs text-slate-400">
+              {authContext
+                ? `${authContext.organization?.legal_name || "Organization"} (PAN: ${
+                    authContext.organization?.pan || "N/A"
+                  }) • Role: ${authContext.role.toUpperCase()}`
+                : "Sign in via OIDC PKCE to bind your organization workspace"}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <input
+              type="text"
+              placeholder="API Base (empty = same-origin /api)"
+              value={session.apiBase}
+              onChange={(e) => handleSaveSession({ apiBase: e.target.value })}
+              className="px-2.5 py-1.5 rounded bg-slate-800 border border-slate-700 text-slate-100 font-mono w-44"
+            />
+            {registrations.length > 0 && (
+              <select
+                value={session.registrationId}
+                onChange={async (e) => {
+                  const regId = e.target.value;
+                  const pid = await resolveProfileIdForReg(authContext, regId);
+                  handleSaveSession({ registrationId: regId, profileId: pid });
+                }}
+                className="px-2.5 py-1.5 rounded bg-slate-800 border border-slate-700 text-slate-100 font-mono"
+              >
+                {registrations.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.gstin} ({r.state_code})
+                  </option>
+                ))}
+              </select>
+            )}
+            <input
+              type="month"
+              value={session.returnPeriod}
+              onChange={(e) => handleSaveSession({ returnPeriod: e.target.value })}
+              className="px-2.5 py-1.5 rounded bg-slate-800 border border-slate-700 text-slate-100 font-mono"
+            />
+            <button
+              onClick={refreshContextAndWorkspace}
+              className="px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 font-semibold flex items-center gap-1"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingInvoices ? "animate-spin" : ""}`} />
+              Sync Workspace
+            </button>
+            {isAuthenticated && (
+              <button
+                onClick={handleSignOut}
+                className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 font-semibold flex items-center gap-1"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                Sign Out
+              </button>
+            )}
           </div>
         </div>
-        <div className="flex items-center space-x-4 self-end sm:self-auto">
-          <div className="flex items-center text-xs bg-slate-100 text-slate-700 px-3 py-1.5 rounded-full border border-slate-300">
-            <Shield className="w-3.5 h-3.5 mr-1.5 text-indigo-600" />
-            Security: PostgreSQL 16 Forced RLS
-          </div>
-          <div className="text-right">
-            <div className="text-xs font-semibold text-slate-500">Enterprise Workspace</div>
-            <div className="text-xs text-slate-400 font-mono">
-              {session.orgId ? `Org: ${session.orgId}` : "Org Context Unbound"}
-            </div>
-          </div>
+
+        {/* Auth Panel: Production OIDC PKCE + Gated Dev Token */}
+        <div className="max-w-7xl mx-auto mt-3 pt-3 border-t border-slate-800 flex flex-wrap items-center gap-2 text-xs">
+          <select
+            value={session.idpProvider}
+            onChange={(e) => handleSaveSession({ idpProvider: e.target.value })}
+            className="px-2.5 py-1 rounded bg-slate-800 border border-slate-700 text-slate-100"
+          >
+            <option value="google">Google OIDC</option>
+            <option value="azuread">Microsoft Entra ID</option>
+            <option value="okta">Okta</option>
+            <option value="auth0">Auth0</option>
+          </select>
+          <input
+            type="text"
+            placeholder="Organization UUID"
+            value={oidcOrgId}
+            onChange={(e) => setOidcOrgId(e.target.value)}
+            className="px-2.5 py-1 rounded bg-slate-800 border border-slate-700 text-slate-100 font-mono w-44"
+          />
+          <input
+            type="text"
+            placeholder="OIDC Authorize URL (https://...)"
+            value={oidcAuthorizeUrl}
+            onChange={(e) => setOidcAuthorizeUrl(e.target.value)}
+            className="px-2.5 py-1 rounded bg-slate-800 border border-slate-700 text-slate-100 font-mono w-52"
+          />
+          <input
+            type="text"
+            placeholder="OIDC Client ID"
+            value={oidcClientId}
+            onChange={(e) => setOidcClientId(e.target.value)}
+            className="px-2.5 py-1 rounded bg-slate-800 border border-slate-700 text-slate-100 font-mono w-36"
+          />
+          <input
+            type="text"
+            placeholder="Redirect URI"
+            value={oidcRedirectUri}
+            onChange={(e) => setOidcRedirectUri(e.target.value)}
+            className="px-2.5 py-1 rounded bg-slate-800 border border-slate-700 text-slate-100 font-mono w-48"
+          />
+          <button
+            onClick={handleOidcSignIn}
+            className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 font-semibold"
+          >
+            Sign in with OIDC (PKCE)
+          </button>
+
+          {demoAllowed && (
+            <>
+              <input
+                type="text"
+                placeholder="Dev Org UUID"
+                value={session.orgId}
+                onChange={(e) => handleSaveSession({ orgId: e.target.value })}
+                className="px-2 py-1 rounded bg-slate-800 border border-slate-700 text-slate-100 font-mono w-32"
+              />
+              <input
+                type="text"
+                placeholder="Dev User UUID"
+                value={session.userId}
+                onChange={(e) => handleSaveSession({ userId: e.target.value })}
+                className="px-2 py-1 rounded bg-slate-800 border border-slate-700 text-slate-100 font-mono w-32"
+              />
+              <button
+                onClick={handleIssueDemoToken}
+                className="px-3 py-1 rounded bg-amber-600 hover:bg-amber-500 font-semibold"
+              >
+                Issue Dev Token
+              </button>
+            </>
+          )}
+          <span className="ml-auto text-[11px] font-mono text-slate-400">
+            Auth: {session.token ? `Bearer Active (${session.role || "member"})` : "Signed Out"}
+          </span>
         </div>
       </header>
 
-      {/* Tenant Context & OIDC Auth Bar */}
-      <div className="bg-white border-b border-slate-200 px-4 md:px-8 py-3 space-y-2">
-        <div className="flex flex-col lg:flex-row lg:items-end gap-3">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 flex-1">
-            <label className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
-              User ID
-              <input value={session.userId} onChange={(e) => setSession((s) => ({ ...s, userId: e.target.value }))} className="mt-1 w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-mono normal-case" placeholder="User UUID" />
-            </label>
-            <label className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
-              Organization ID
-              <input value={session.orgId} onChange={(e) => setSession((s) => ({ ...s, orgId: e.target.value }))} className="mt-1 w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-mono normal-case" placeholder="Organization UUID" />
-            </label>
-            <label className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
-              Registration ID
-              <input value={session.registrationId} onChange={(e) => setSession((s) => ({ ...s, registrationId: e.target.value }))} className="mt-1 w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-mono normal-case" placeholder="GST registration UUID" />
-            </label>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span className={`text-[11px] font-semibold px-2 py-1 rounded-full ${session.token ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-600"}`}>
-              {session.token ? "Bearer Token Active" : "Unauthenticated"}
-            </span>
-            <button onClick={handleSaveSession} className="px-3 py-1.5 bg-slate-900 text-white rounded-lg text-xs font-semibold">Save Context</button>
-            <button onClick={handleOidcSignIn} disabled={isGettingToken || !session.orgId || !oidcAuthorizeUrl || !oidcClientId} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-semibold">
-              {isGettingToken ? "Authenticating..." : "Sign In (OIDC)"}
+      {/* Navigation Tabs */}
+      <nav className="bg-white border-b border-slate-200">
+        <div className="max-w-7xl mx-auto px-6 flex overflow-x-auto gap-1 py-2">
+          {tabs.map((tab) => (
+            <button
+              key={tab.key}
+              onClick={() => setActiveTab(tab.key)}
+              className={`px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap transition ${
+                activeTab === tab.key
+                  ? "bg-indigo-600 text-white shadow-sm"
+                  : "text-slate-600 hover:bg-slate-100"
+              }`}
+            >
+              {tab.icon}
+              <span>{tab.label}</span>
             </button>
-            {demoEnabled && (
-              <button onClick={handleGetDemoToken} disabled={isGettingToken || !session.userId || !session.orgId} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-semibold">
-                Dev Demo Token
-              </button>
-            )}
-            <button onClick={handleLogout} className="px-3 py-1.5 bg-white border border-slate-300 text-slate-700 rounded-lg text-xs font-semibold">Logout</button>
-          </div>
+          ))}
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-          <label className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
-            IdP Provider
-            <select value={idpProvider} onChange={(e) => setIdpProvider(e.target.value)} className="mt-1 w-full px-2.5 py-1 text-xs border border-slate-300 rounded-lg bg-white normal-case">
-              <option value="google">Google Workspace</option>
-              <option value="azuread">Microsoft Entra ID</option>
-              <option value="okta">Okta</option>
-              <option value="auth0">Auth0</option>
-            </select>
-          </label>
-          <label className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
-            OIDC Authorize Endpoint
-            <input value={oidcAuthorizeUrl} onChange={(e) => setOidcAuthorizeUrl(e.target.value)} className="mt-1 w-full px-2.5 py-1 text-xs border border-slate-300 rounded-lg font-mono normal-case" placeholder="https://accounts.google.com/o/oauth2/v2/auth" />
-          </label>
-          <label className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
-            OIDC Client ID
-            <input value={oidcClientId} onChange={(e) => setOidcClientId(e.target.value)} className="mt-1 w-full px-2.5 py-1 text-xs border border-slate-300 rounded-lg font-mono normal-case" placeholder="MyCA OIDC client_id" />
-          </label>
-        </div>
-        {sessionError && <p className="mt-2 text-xs text-rose-700">{sessionError}</p>}
-      </div>
-
-      {/* Responsive Navigation */}
-      <nav className="bg-white border-b border-slate-200 px-4 md:px-8 flex space-x-4 md:space-x-6 overflow-x-auto scrollbar-none">
-        <button
-          onClick={() => setActiveTab("gstr2b")}
-          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "gstr2b"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-700"
-          }`}
-        >
-          <Layers className="w-4 h-4 mr-1.5" />
-          GSTR-2B Ingest
-        </button>
-
-        <button
-          onClick={() => setActiveTab("purchase")}
-          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "purchase"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-700"
-          }`}
-        >
-          <BookOpen className="w-4 h-4 mr-1.5" />
-          Purchase Register
-        </button>
-
-        <button
-          onClick={() => setActiveTab("reconciliation")}
-          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "reconciliation"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-700"
-          }`}
-        >
-          <GitCompare className="w-4 h-4 mr-1.5" />
-          Reconciliation (4-Pass)
-        </button>
-
-        <button
-          onClick={() => setActiveTab("itc_risk")}
-          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "itc_risk"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-700"
-          }`}
-        >
-          <ShieldCheck className="w-4 h-4 mr-1.5" />
-          ITC Risk Analysis
-        </button>
-
-        <button
-          onClick={() => setActiveTab("gstr3b")}
-          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "gstr3b"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-700"
-          }`}
-        >
-          <FileCheck className="w-4 h-4 mr-1.5" />
-          GSTR-3B &amp; Offset (M3)
-        </button>
-
-        <button
-          onClick={() => setActiveTab("credit")}
-          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "credit"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-700"
-          }`}
-        >
-          <TrendingUp className="w-4 h-4 mr-1.5" />
-          Credit Builder (M4)
-        </button>
-
-        <button
-          onClick={() => setActiveTab("schemes")}
-          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "schemes"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-700"
-          }`}
-        >
-          <Award className="w-4 h-4 mr-1.5" />
-          Scheme Navigator (M5)
-        </button>
-
-        <button
-          onClick={() => setActiveTab("ai")}
-          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "ai"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-700"
-          }`}
-        >
-          <Bot className="w-4 h-4 mr-1.5" />
-          AI Financial Advisor
-        </button>
-
-        <button
-          onClick={() => setActiveTab("invoices")}
-          className={`py-3.5 px-2 font-medium text-xs md:text-sm flex items-center border-b-2 whitespace-nowrap transition-colors ${
-            activeTab === "invoices"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-700"
-          }`}
-        >
-          <FileText className="w-4 h-4 mr-1.5" />
-          Outward Invoices (M1)
-        </button>
       </nav>
 
-      {/* Main Content Area */}
-      <main className="flex-1 p-4 md:p-8 max-w-7xl mx-auto w-full">
-        {uploadNotification && (
-          <div className="mb-6 p-4 bg-indigo-50 border border-indigo-200 rounded-lg text-indigo-700 text-sm flex items-center space-x-2">
-            <Info className="w-5 h-5 flex-shrink-0" />
-            <span>{uploadNotification}</span>
+      {/* Alerts */}
+      <div className="max-w-7xl mx-auto px-6 pt-4 space-y-2">
+        {authError && (
+          <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-800">
+            {authError}
           </div>
         )}
+        {authNotice && (
+          <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-800">
+            {authNotice}
+          </div>
+        )}
+      </div>
 
-        {/* Milestone 2 Views */}
-        {activeTab === "gstr2b" && <Gstr2bUpload />}
-        {activeTab === "purchase" && <PurchaseRegister />}
-        {activeTab === "reconciliation" && <ReconciliationWorkbench />}
-        {activeTab === "itc_risk" && <ItcRiskDashboard />}
-
-        {/* Milestone 3 View */}
-        {activeTab === "gstr3b" && <Gstr3bFilingView />}
-
-        {/* Milestone 4 View */}
-        {activeTab === "credit" && <CreditBuilder />}
-
-        {/* Milestone 5 View */}
-        {activeTab === "schemes" && <SchemeNavigator />}
-
-        {/* AI Financial Advisor */}
-        {activeTab === "ai" && <AiAdvisor />}
-
-        {/* Tab: Outward Invoice Brain (Milestone 1) */}
+      {/* Main Content */}
+      <main className="max-w-7xl mx-auto px-6 py-6">
         {activeTab === "invoices" && (
           <div className="space-y-6">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-              <div>
-                <h2 className="text-xl md:text-2xl font-bold text-slate-800">Invoice Brain (Outward Supplies)</h2>
-                <p className="text-sm text-slate-500">Live OCR Ingestion, Validation, and GST Cross-Checking (State Machine Enforced)</p>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  value={profileId}
-                  onChange={(e) => setProfileId(e.target.value)}
-                  className="px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-mono"
-                  placeholder="Business Profile UUID"
-                />
+            <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+              <h2 className="text-lg font-bold text-slate-900 mb-2">Outward Invoice Brain &amp; OCR Review</h2>
+              <p className="text-xs text-slate-500 mb-4">
+                Upload sales invoices (PDF/Image). Validations follow strict Section 37 / Rule 46 GST rules before Maker-Checker approval.
+              </p>
+              <form onSubmit={handleUploadInvoice} className="flex flex-wrap items-center gap-3">
                 <input
                   type="file"
                   accept=".pdf,.png,.jpg,.jpeg"
-                  onChange={(e) => setSelectedInvoiceFile(e.target.files?.[0] ?? null)}
+                  onChange={(e) => setInvoiceFile(e.target.files?.[0] || null)}
                   className="text-xs"
                 />
                 <button
-                  onClick={handleInvoiceUpload}
-                  disabled={invoicesLoading}
-                  className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white px-4 py-2 rounded-lg text-sm font-medium transition flex items-center space-x-2 shadow-sm"
+                  type="submit"
+                  disabled={!invoiceFile}
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-semibold"
                 >
-                  <UploadCloud className="w-4 h-4" />
-                  <span>{invoicesLoading ? "Uploading..." : "Upload Outward Invoice"}</span>
+                  Upload &amp; Enqueue OCR
                 </button>
-              </div>
+              </form>
             </div>
-            {invoicesError && <p className="text-xs text-rose-700">{invoicesError}</p>}
-            <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
-              <div className="flex justify-between items-center">
-                <div className="text-sm text-slate-600 font-semibold">Live Outward Invoicing Pipeline</div>
-                <button onClick={() => void refreshInvoices()} className="text-xs text-indigo-600 font-semibold">
-                  Refresh
-                </button>
+
+            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+              <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center">
+                <h3 className="text-sm font-bold text-slate-800">Outward Invoice Queue ({invoices.length})</h3>
               </div>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div className="bg-slate-50 p-4 rounded-lg border border-slate-100">
-                  <div className="text-xs text-slate-400 font-medium">Uploaded</div>
-                  <div className="text-2xl font-bold text-slate-800 mt-1">{invoices.filter((i) => i.status === "uploaded").length}</div>
-                </div>
-                <div className="bg-blue-50 p-4 rounded-lg border border-blue-100">
-                  <div className="text-xs text-blue-600 font-medium">Processing</div>
-                  <div className="text-2xl font-bold text-blue-700 mt-1">{invoices.filter((i) => i.status === "processing").length}</div>
-                </div>
-                <div className="bg-amber-50 p-4 rounded-lg border border-amber-100">
-                  <div className="text-xs text-amber-600 font-medium">Review / Extracted</div>
-                  <div className="text-2xl font-bold text-amber-700 mt-1">{invoices.filter((i) => i.status === "review_required" || i.status === "extracted").length}</div>
-                </div>
-                <div className="bg-emerald-50 p-4 rounded-lg border border-emerald-100">
-                  <div className="text-xs text-emerald-600 font-medium">Approved (Export Ready)</div>
-                  <div className="text-2xl font-bold text-emerald-700 mt-1">{invoices.filter((i) => i.status === "approved").length}</div>
-                </div>
-              </div>
-              {invoices.length > 0 && (
-                <table className="w-full text-xs text-left">
-                  <thead className="bg-slate-50 border-b text-slate-600">
-                    <tr>
-                      <th className="py-2 px-3">Invoice #</th>
-                      <th className="py-2 px-3">Status</th>
-                      <th className="py-2 px-3 text-right">Total (INR)</th>
-                      <th className="py-2 px-3 text-right">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {invoices.map((inv) => (
-                      <tr key={inv.id}>
-                        <td className="py-2 px-3 font-mono">{inv.invoice_number}</td>
-                        <td className="py-2 px-3">{inv.status}</td>
-                        <td className="py-2 px-3 text-right font-mono">{inv.total_amount}</td>
-                        <td className="py-2 px-3 text-right">
-                          {inv.status !== "approved" && (
-                            <button onClick={() => void handleApproveInvoice(inv.id)} className="text-indigo-600 font-semibold">
-                              Approve
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
+                  <tr>
+                    <th className="px-4 py-3">Invoice No</th>
+                    <th className="px-4 py-3">Date</th>
+                    <th className="px-4 py-3">Counterparty GSTIN</th>
+                    <th className="px-4 py-3 text-right">Amount (₹)</th>
+                    <th className="px-4 py-3 text-center">Status</th>
+                    <th className="px-4 py-3 text-center">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-mono">
+                  {invoices.map((inv) => (
+                    <tr key={inv.id} className="hover:bg-slate-50">
+                      <td className="px-4 py-3 font-bold">{inv.invoice_number}</td>
+                      <td className="px-4 py-3">{inv.invoice_date}</td>
+                      <td className="px-4 py-3">{inv.counterparty_gstin || "B2C"}</td>
+                      <td className="px-4 py-3 text-right">₹{inv.total_amount}</td>
+                      <td className="px-4 py-3 text-center font-sans">
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            inv.status === "approved"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : inv.status === "rejected"
+                              ? "bg-rose-100 text-rose-800"
+                              : inv.status === "pending_review"
+                              ? "bg-amber-100 text-amber-800"
+                              : "bg-slate-100 text-slate-700"
+                          }`}
+                        >
+                          {inv.status.replace(/_/g, " ").toUpperCase()}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-center font-sans space-x-1">
+                        <button
+                          onClick={() => handleOpenInspect(inv.id)}
+                          className="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded text-[11px] font-semibold inline-flex items-center gap-1"
+                        >
+                          <Eye className="w-3 h-3" /> Inspect
+                        </button>
+                        {inv.status === "pending_review" && (
+                          <>
+                            <button
+                              onClick={() => handleApproveInvoice(inv.id)}
+                              className="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[11px] font-semibold inline-flex items-center gap-1"
+                            >
+                              <CheckCircle2 className="w-3 h-3" /> Approve
                             </button>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+                            <button
+                              onClick={() => {
+                                setShowRejectBox(inv.id);
+                                setRejectReason("");
+                              }}
+                              className="px-2 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded text-[11px] font-semibold inline-flex items-center gap-1"
+                            >
+                              <XCircle className="w-3 h-3" /> Reject
+                            </button>
+                          </>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {invoices.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="px-4 py-8 text-center font-sans text-slate-400">
+                        No outward invoices found for this tenant. Sign in above and upload an invoice or sync workspace.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
+
+            {showRejectBox && (
+              <div className="bg-rose-50 border border-rose-200 rounded-xl p-4 flex flex-wrap items-center gap-2 text-xs">
+                <input
+                  type="text"
+                  value={rejectReason}
+                  onChange={(e) => setRejectReason(e.target.value)}
+                  placeholder="Enter statutory rejection reason..."
+                  className="flex-1 min-w-64 px-3 py-1.5 bg-white border border-rose-300 rounded"
+                />
+                <button
+                  onClick={() => handleRejectInvoice(showRejectBox)}
+                  className="px-3 py-1.5 bg-rose-600 text-white rounded font-semibold"
+                >
+                  Confirm Rejection
+                </button>
+                <button
+                  onClick={() => setShowRejectBox(null)}
+                  className="px-3 py-1.5 bg-white border border-slate-300 rounded"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+
+            {inspectInvoice && (
+              <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                <div className="bg-white rounded-xl shadow-xl border border-slate-200 max-w-2xl w-full p-6 space-y-4 max-h-[85vh] overflow-y-auto">
+                  <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+                    <h3 className="text-sm font-bold text-slate-900">
+                      Invoice Details &amp; Validation Report — {inspectInvoice.invoice_number}
+                    </h3>
+                    <button onClick={() => setInspectInvoice(null)} className="text-slate-400 hover:text-slate-700">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                  {inspectInvoice.validation_report && (
+                    <div
+                      className={`p-3 rounded-lg text-xs border ${
+                        inspectInvoice.validation_report.is_valid
+                          ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                          : "bg-amber-50 border-amber-200 text-amber-900"
+                      }`}
+                    >
+                      <strong>Validation Status:</strong>{" "}
+                      {inspectInvoice.validation_report.is_valid
+                        ? "Passed Statutory Rule Checks"
+                        : (inspectInvoice.validation_report.flags || [])
+                            .map((f) => `[${f.severity.toUpperCase()}] ${f.message}`)
+                            .join("; ") || "Requires Human Review"}
+                    </div>
+                  )}
+                  <form onSubmit={handleSaveInspectEdit} className="grid grid-cols-2 gap-3 text-xs">
+                    <div>
+                      <label className="block font-semibold text-slate-600 mb-1">Invoice Number</label>
+                      <input
+                        type="text"
+                        value={editInvNum}
+                        onChange={(e) => setEditInvNum(e.target.value)}
+                        disabled={inspectInvoice.status === "approved"}
+                        className="w-full px-3 py-1.5 border border-slate-300 rounded font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-600 mb-1">Counterparty GSTIN</label>
+                      <input
+                        type="text"
+                        value={editCounterpartyGstin}
+                        onChange={(e) => setEditCounterpartyGstin(e.target.value.toUpperCase())}
+                        disabled={inspectInvoice.status === "approved"}
+                        className="w-full px-3 py-1.5 border border-slate-300 rounded font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-600 mb-1">Counterparty Name</label>
+                      <input
+                        type="text"
+                        value={editCounterpartyName}
+                        onChange={(e) => setEditCounterpartyName(e.target.value)}
+                        disabled={inspectInvoice.status === "approved"}
+                        className="w-full px-3 py-1.5 border border-slate-300 rounded"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-600 mb-1">Total Amount (₹)</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={editTotal}
+                        onChange={(e) => setEditTotal(e.target.value)}
+                        disabled={inspectInvoice.status === "approved"}
+                        className="w-full px-3 py-1.5 border border-slate-300 rounded font-mono"
+                      />
+                    </div>
+                    {inspectInvoice.status !== "approved" && (
+                      <div className="col-span-2 flex justify-end gap-2 pt-2">
+                        <button
+                          type="submit"
+                          className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded font-semibold"
+                        >
+                          Save Corrections
+                        </button>
+                      </div>
+                    )}
+                  </form>
+                </div>
+              </div>
+            )}
           </div>
         )}
+
+        {activeTab === "gstr1" && (
+          <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">GSTR-1 Working Draft</h2>
+                <p className="text-xs text-slate-500">
+                  Generated exclusively from human-approved outward invoices for the active business profile &amp; period.
+                </p>
+              </div>
+              <button
+                onClick={handleLoadGstr1}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold"
+              >
+                Load GSTR-1 Draft
+              </button>
+            </div>
+            <pre className="p-4 bg-slate-900 text-slate-100 rounded-lg text-xs overflow-auto max-h-[520px]">
+              {gstr1Draft
+                ? JSON.stringify(gstr1Draft, null, 2)
+                : "Click 'Load GSTR-1 Draft' after syncing workspace to inspect B2B, B2CL, B2CS, HSN, and Doc summary."}
+            </pre>
+          </div>
+        )}
+
+        {activeTab === "purchases" && (
+          <PurchaseRegister
+            registrations={registrations}
+            orgPan={authContext?.organization?.pan || session.pan || ""}
+          />
+        )}
+        {activeTab === "gstr2b" && <Gstr2bUpload registrations={registrations} />}
+        {activeTab === "reconcile" && <ReconciliationWorkbench registrations={registrations} />}
+        {activeTab === "itc-risk" && <ItcRiskDashboard registrations={registrations} />}
+        {activeTab === "gstr3b" && <Gstr3bFilingView registrations={registrations} />}
+        {activeTab === "credit" && <CreditBuilder />}
+        {activeTab === "schemes" && <SchemeNavigator />}
+        {activeTab === "advisor" && <AiAdvisor />}
       </main>
     </div>
   );
 }
+
+export default App;

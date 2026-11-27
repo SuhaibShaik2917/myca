@@ -324,8 +324,8 @@ def test_ims_lifecycle_deemed_acceptance_and_recomputation(setup_m2_1_tenant):
     snap_data = res.json()
     snapshot_v1_id = snap_data["snapshot_id"]
     assert snap_data["version_number"] == 1
-    # Total Part A: 18,000 + 9,000 + 3,600 = 30,600
-    assert Decimal(str(snap_data["total_itc_available"])) == Decimal("30600.00")
+    # Total Part A net of Credit Note (Section 34): 18,000 + 9,000 - 3,600 = 23,400
+    assert Decimal(str(snap_data["total_itc_available"])) == Decimal("23400.00")
 
     # 2. Verify all B2B records were created with deemed_accepted_at_generation = true
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
@@ -381,8 +381,8 @@ def test_ims_lifecycle_deemed_acceptance_and_recomputation(setup_m2_1_tenant):
     assert recomp_data["pending_docs_held_count"] == 1
 
     # Total available in newly recomputed Snapshot v2:
-    # 30,600 - 9,000 (INV-02 is excluded because it is PENDING in IMS) = 21,600
-    assert Decimal(str(recomp_data["total_itc_available"])) == Decimal("21600.00")
+    # 23,400 - 9,000 (INV-02 is excluded because it is PENDING in IMS) = 14,400
+    assert Decimal(str(recomp_data["total_itc_available"])) == Decimal("14400.00")
 
     # 6. Test GSTR-3B Filing Freeze
     freeze_res = client.post(

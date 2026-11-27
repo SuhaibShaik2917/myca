@@ -156,10 +156,11 @@ def verify_manual_evidence_review(
     session_ref = str(claims.get("jti") or f"TOKEN-SESS:{hashlib.sha256(clean_token.encode()).hexdigest()[:16]}").strip()
 
     # 6. Separation of Duties (Maker-Checker): Reviewer cannot approve their own submitted evidence
-    if uploader_id:
-        clean_uploader = str(uploader_id).strip().lower()
-        if clean_uploader in (reviewer_user_id.lower(), reviewer_email.lower()):
-            return False, "MAKER_CHECKER_VIOLATION: Reviewer cannot approve their own submitted auditor evidence (self-approval prohibited).", {}
+    if not uploader_id or not str(uploader_id).strip():
+        return False, "MISSING_UPLOADER_ID: uploader_id is mandatory to verify maker-checker separation.", {}
+    clean_uploader = str(uploader_id).strip().lower()
+    if clean_uploader in (reviewer_user_id.lower(), reviewer_email.lower()):
+        return False, "MAKER_CHECKER_VIOLATION: Reviewer cannot approve their own submitted auditor evidence (self-approval prohibited).", {}
 
     # 7. Documentary Evidence Validation
     if not document_bytes or not isinstance(document_bytes, (bytes, bytearray)):
@@ -173,6 +174,12 @@ def verify_manual_evidence_review(
 
     if document_content_type not in ALLOWED_DOCUMENT_TYPES:
         return False, f"INVALID_CONTENT_TYPE: Document type '{document_content_type}' is not an authorized statutory evidence type.", {}
+    if document_content_type == "application/pdf" and not bytes(document_bytes).startswith(b"%PDF-"):
+        return False, "INVALID_DOCUMENT_MAGIC_BYTES: Uploaded PDF evidence failed %PDF- signature validation.", {}
+    if document_content_type == "image/png" and not bytes(document_bytes).startswith(b"\x89PNG\r\n\x1a\n"):
+        return False, "INVALID_DOCUMENT_MAGIC_BYTES: Uploaded PNG evidence failed PNG signature validation.", {}
+    if document_content_type in ("image/jpeg", "image/jpg") and not bytes(document_bytes).startswith(b"\xff\xd8\xff"):
+        return False, "INVALID_DOCUMENT_MAGIC_BYTES: Uploaded JPEG evidence failed JPEG signature validation.", {}
 
     # Compute SHA-256 strictly server-side from raw bytes
     server_sha256 = hashlib.sha256(document_bytes).hexdigest()

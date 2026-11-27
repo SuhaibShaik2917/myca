@@ -72,6 +72,8 @@ class GSTR3BFilingResponse(BaseModel):
     maker_remarks: Optional[str]
     checker_remarks: Optional[str]
     is_live_portal_filing: bool = False
+    filing_mode: str = "SANDBOX"
+    gsp_reference_id: Optional[str] = None
     disclaimer: str
 
 class GSTR3BStatusResponse(BaseModel):
@@ -90,6 +92,9 @@ class GSTR3BStatusResponse(BaseModel):
     cin: Optional[str]
     filing_date: Optional[str]
     payload_hash: Optional[str]
+    filing_mode: str = "SANDBOX"
+    is_live_portal_filing: bool = False
+    gsp_reference_id: Optional[str] = None
     created_at: str
     updated_at: str
     revision_number: int = 1

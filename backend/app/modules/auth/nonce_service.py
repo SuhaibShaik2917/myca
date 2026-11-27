@@ -318,7 +318,7 @@ async def run_periodic_rate_limit_cleanup(
     logger.info("Periodic rate-limit cleanup task stopped.")
 
 
-_last_cleanup_monotonic: float = 0.0
+_last_cleanup_monotonic: Optional[float] = None
 _cleanup_dispatch_lock = threading.Lock()
 
 
@@ -335,11 +335,11 @@ def schedule_rate_limit_cleanup_if_due(
     """
     global _last_cleanup_monotonic
     now = time.monotonic()
-    if now - _last_cleanup_monotonic < min_interval_seconds:
+    if _last_cleanup_monotonic is not None and (now - _last_cleanup_monotonic) < min_interval_seconds:
         return False
 
     with _cleanup_dispatch_lock:
-        if now - _last_cleanup_monotonic < min_interval_seconds:
+        if _last_cleanup_monotonic is not None and (now - _last_cleanup_monotonic) < min_interval_seconds:
             return False
         _last_cleanup_monotonic = now
 
@@ -495,9 +495,9 @@ def create_idp_login_nonce(
                 detail=f"ACTIVE_NONCE_LIMIT_EXCEEDED: Maximum active authentication transactions ({MAX_ACTIVE_NONCES_PER_ORG}) reached for organization.",
             )
 
-        # 6. Generate transaction tokens and cryptographic browser session binding
+        # 6. Generate transaction tokens and always rotate fresh cryptographic browser session secret (anti-fixation)
         nonce = secrets.token_urlsafe(32)
-        resolved_session_token = session_token or secrets.token_urlsafe(32)
+        resolved_session_token = secrets.token_urlsafe(32)
         session_binding_hash = hashlib.sha256(resolved_session_token.encode("utf-8")).hexdigest()
 
         db.execute(

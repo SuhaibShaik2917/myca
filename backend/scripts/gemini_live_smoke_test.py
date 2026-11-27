@@ -45,7 +45,11 @@ def run_smoke_test(require_live: bool = False, test_fallback: bool = False):
     fallback_model = settings.GEMINI_FALLBACK_MODEL
 
     # Create controlled synthetic GST tax invoice with redacted/generic data
-    sample_pdf_path = "/tmp/operational_smoke_invoice.pdf"
+    import tempfile
+    smoke_org_id = "operational-smoke-org"
+    smoke_dir = os.path.join(tempfile.gettempdir(), smoke_org_id)
+    os.makedirs(smoke_dir, exist_ok=True)
+    sample_pdf_path = os.path.join(smoke_dir, "operational_smoke_invoice.pdf")
     with open(sample_pdf_path, "wb") as f:
         f.write(
             b"%PDF-1.4\n"
@@ -66,7 +70,7 @@ def run_smoke_test(require_live: bool = False, test_fallback: bool = False):
         settings.GEMINI_MODEL = "gemini-invalid-primary-model"
         t0 = time.time()
         try:
-            extracted = extract_invoice_with_gemini(sample_pdf_path, "application/pdf")
+            extracted = extract_invoice_with_gemini(sample_pdf_path, "application/pdf", expected_org_id=smoke_org_id)
             elapsed = time.time() - t0
             print(f"[SUCCESS] Fallback extraction completed in {elapsed:.3f} seconds.")
         except Exception as e:
@@ -95,7 +99,7 @@ def run_smoke_test(require_live: bool = False, test_fallback: bool = False):
         print("[INFO] GEMINI_API_KEY is not configured in environment.")
         print("Executing operational verification using deterministic test harness parser.")
         t0 = time.time()
-        extracted = extract_invoice_mock(sample_pdf_path, "application/pdf")
+        extracted = extract_invoice_mock(sample_pdf_path, "application/pdf", expected_org_id=smoke_org_id)
         elapsed = time.time() - t0
         print(f"[SUCCESS] Synthetic extraction completed in {elapsed:.3f} seconds.")
 
@@ -123,7 +127,7 @@ def run_smoke_test(require_live: bool = False, test_fallback: bool = False):
     print(f"Executing LIVE API request using primary model: {primary_model}")
     t0 = time.time()
     try:
-        extracted = extract_invoice_with_gemini(sample_pdf_path, "application/pdf")
+        extracted = extract_invoice_with_gemini(sample_pdf_path, "application/pdf", expected_org_id=smoke_org_id)
         elapsed = time.time() - t0
         print(f"[SUCCESS] Live Gemini extraction completed in {elapsed:.3f} seconds.")
     except Exception as e:

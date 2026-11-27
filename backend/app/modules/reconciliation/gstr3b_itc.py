@@ -82,13 +82,23 @@ def generate_gstr3b_table4_summary(
 
     # 1. Tally GSTR-2B statement components into Table 4(A) and Table 4(D)(2)
     for doc in gstr2b_docs:
+        ims_act = str(doc.get("ims_action") or doc.get("current_action") or "").strip().upper()
+        if ims_act in ("PENDING", "REJECTED"):
+            continue
+
         itc_status = doc.get("itc_availability", "available")
         c = Decimal(str(doc.get("central_tax") or 0))
         s = Decimal(str(doc.get("state_ut_tax") or 0))
         i = Decimal(str(doc.get("integrated_tax") or 0))
         cs = Decimal(str(doc.get("cess_amount") or 0))
-        tax = c + s + i + cs
+        doc_type_upper = str(doc.get("document_type") or "").strip().upper()
         sec = (doc.get("section_name") or "").upper()
+        is_crn = (doc_type_upper in ("CRN", "C", "CREDIT_NOTE", "CDNR")) or (
+            sec in ("CDNR", "CDNRA") and doc_type_upper not in ("DBN", "D", "DEBIT_NOTE")
+        )
+        if is_crn and (c > 0 or s > 0 or i > 0 or cs > 0):
+            c, s, i, cs = -abs(c), -abs(s), -abs(i), -abs(cs)
+        tax = c + s + i + cs
         doc_id = str(doc.get("id"))
 
         if itc_status == "available":
@@ -193,7 +203,8 @@ def generate_gstr3b_table4_summary(
     reversals_lineage: List[Dict[str, Any]] = []
     purchase_map = {str(p["id"]): p for p in purchase_docs}
 
-    # If explicit reversal events from ledger are supplied, use them; otherwise use assessments
+    # Apply explicit reversal ledger entries first, then merge any unrecorded assessment risks
+    recorded_ledger_keys = set()
     if reversals_ledger:
         for rev in reversals_ledger:
             rc = Decimal(str(rev.get("reversed_cgst") or 0))
@@ -203,17 +214,23 @@ def generate_gstr3b_table4_summary(
             rule = rev.get("rule_code", "")
             p_id = str(rev.get("purchase_doc_id", ""))
             p_doc = purchase_map.get(p_id, {})
+            recorded_ledger_keys.add((p_id, rule))
 
             if rule.startswith("SEC_17_5") or rule in ("RULE_38", "RULE_42", "RULE_43"):
                 comp_4b1 = _add_component(comp_4b1, rc, rs, ri, rcs)
+                ledger_bucket = "4B1"
             elif rule == "RULE_37_180_DAYS":
                 comp_4b2_r37 = _add_component(comp_4b2_r37, rc, rs, ri, rcs)
+                ledger_bucket = "4B2"
             elif rule == "RULE_37A_NON_FILING":
                 comp_4b2_r37a = _add_component(comp_4b2_r37a, rc, rs, ri, rcs)
+                ledger_bucket = "4B2"
             elif rule in ("SEC_16_2_B", "SEC_16_2_B_PENDING_RECEIPT", "RULE_16_2_B", "PENDING_RECEIPT", "UNBOOKED_RECEIPT_REVERSAL", "REVERSAL_SECTION_16_2_B"):
                 comp_4b2_receipt = _add_component(comp_4b2_receipt, rc, rs, ri, rcs)
+                ledger_bucket = "4B2"
             else:
                 comp_4b2_other = _add_component(comp_4b2_other, rc, rs, ri, rcs)
+                ledger_bucket = "4B2"
 
             reversals_lineage.append({
                 "reversal_id": str(rev.get("id")),
@@ -224,6 +241,7 @@ def generate_gstr3b_table4_summary(
                 "availed_period": p_doc.get("availed_period", rev.get("reversal_period", "N/A")),
                 "is_availed_in_3b": p_doc.get("is_availed_in_3b", True),
                 "rule_code": rule,
+                "table4_bucket": ledger_bucket,
                 "reversal_status": rev.get("reversal_status") or ("DISCHARGED" if rev.get("filing_arn") else "PENDING_RETURN_FILING"),
                 "reversal_due_date": rev.get("reversal_due_date"),
                 "reversal_scheduled_date": rev.get("reversal_scheduled_date"),
@@ -234,12 +252,21 @@ def generate_gstr3b_table4_summary(
                 "interest_basis": rev.get("interest_basis") or "Section 50(3) conditional on utilization",
                 "interest_calculation_inputs": rev.get("interest_calculation_inputs")
             })
-    else:
+
+    if assessments:
+        seen_assessment_keys = set()
         for a in assessments:
             rule = a.get("rule_code", "")
             status = a.get("eligibility_status")
             rev_amt = Decimal(str(a.get("risk_reversal_amount") or 0))
             p_id = str(a.get("purchase_doc_id", ""))
+            # Avoid double counting if already recorded in reversals_ledger or duplicated in assessment rows
+            if (p_id, rule) in recorded_ledger_keys or (p_id, rule) in seen_assessment_keys:
+                continue
+            seen_assessment_keys.add((p_id, rule))
+            # Note: If reversals_ledger already covers 4(B)(2) Rule 37/37A/16(2)(b) explicitly, also avoid duplicate counting by category
+            if reversals_ledger and rule in ("RULE_37_180_DAYS", "RULE_37A_NON_FILING") and any(k[0] == p_id for k in recorded_ledger_keys):
+                continue
             p_doc = purchase_map.get(p_id, {})
 
             # Apportion reversal across components proportionately if individual tax fields omitted
@@ -261,11 +288,13 @@ def generate_gstr3b_table4_summary(
                 ri = rev_amt
                 rcs = Decimal("0.00")
 
+            assess_bucket = "4B2"
             if status in (ITCEligibilityEnum.REVIEW_REQUIRED, "REVIEW_REQUIRED") or str(rule).endswith("_FACTS_PENDING"):
                 # Items under factual review are potential exposures, not confirmed statutory reversals
                 pass
             elif rule.startswith("SEC_17_5") or rule in ("RULE_38", "RULE_42", "RULE_43") or status == ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR:
                 comp_4b1 = _add_component(comp_4b1, rc, rs, ri, rcs)
+                assess_bucket = "4B1"
             elif rule == "RULE_37_180_DAYS" or status == ITCEligibilityEnum.PAYMENT_180_DAY_RISK:
                 comp_4b2_r37 = _add_component(comp_4b2_r37, rc, rs, ri, rcs)
             elif rule == "RULE_37A_NON_FILING" or status == ITCEligibilityEnum.RULE_37A_RISK:
@@ -284,6 +313,7 @@ def generate_gstr3b_table4_summary(
                     "availed_period": p_doc.get("availed_period", "N/A"),
                     "is_availed_in_3b": p_doc.get("is_availed_in_3b", False),
                     "rule_code": rule,
+                    "table4_bucket": assess_bucket,
                     "reversal_amount": rev_amt,
                     "cgst": rc, "sgst": rs, "igst": ri, "cess": rcs,
                     "interest_liability": Decimal("0.00"),
@@ -311,6 +341,7 @@ def generate_gstr3b_table4_summary(
                     "availed_period": return_period,
                     "is_availed_in_3b": False,
                     "rule_code": "SEC_16_2_B_PENDING_RECEIPT",
+                    "table4_bucket": "4B2",
                     "reversal_status": "AUTO_NEUTRALIZED_UNBOOKED",
                     "reversal_due_date": None,
                     "reversal_scheduled_date": str(return_period),

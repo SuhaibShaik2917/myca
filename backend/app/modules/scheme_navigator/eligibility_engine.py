@@ -27,8 +27,10 @@ def evaluate_single_rule(
     elif op == "CONTAINS":
         passed = target_value.strip().lower() in actual_str.strip().lower()
     elif op in (">", ">=", "<", "<="):
+        if actual is None or actual_str == "":
+            return False, actual_str
         try:
-            actual_num = Decimal(str(actual)) if actual is not None else Decimal("0")
+            actual_num = Decimal(str(actual))
             target_num = Decimal(target_value)
             if op == ">":
                 passed = actual_num > target_num

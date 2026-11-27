@@ -7,7 +7,7 @@ Zero invented zeros; every figure traces directly to underlying database rows.
 import uuid
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -62,14 +62,19 @@ def generate_unified_financial_report(
     ).fetchall()
     purchase_docs = [dict(r._mapping) for r in p_rows]
 
-    # 4. Fetch Matches
+    # 4. Fetch Matches (scoped cleanly to latest reconciliation run for this snapshot)
     if snapshot_id:
         m_rows = session.execute(
             text("""
+            WITH latest_run AS (
+                SELECT id FROM public.reconciliation_runs
+                WHERE org_id = :org AND registration_id = :reg_id AND return_period = :rp AND snapshot_id = :sid
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
             SELECT m.purchase_doc_id, m.gstr2b_doc_id, m.match_pass, m.is_exact
             FROM public.reconciliation_matches m
-            JOIN public.reconciliation_runs r ON m.run_id = r.id AND m.org_id = r.org_id
-            WHERE r.registration_id = :reg_id AND r.return_period = :rp AND r.snapshot_id = :sid AND m.org_id = :org;
+            WHERE m.run_id IN (SELECT id FROM latest_run) AND m.org_id = :org;
             """),
             {"reg_id": registration_id, "rp": return_period, "sid": snapshot_id, "org": org_id}
         ).fetchall()
@@ -331,6 +336,22 @@ def generate_unified_financial_report(
     rcm_cess = comp_4a3.cess if comp_4a3 else Decimal("0.00")
     rcm_total = comp_4a3.total if comp_4a3 else Decimal("0.00")
 
+    rcm_docs_out = [
+        {
+            "document_number": d.get("document_number"),
+            "document_date": str(d.get("document_date")),
+            "supplier_gstin": d.get("supplier_gstin"),
+            "itc_availability": d.get("itc_availability"),
+            "taxable_value": Decimal(str(d.get("taxable_value") or 0)),
+            "cgst": Decimal(str(d.get("central_tax") or 0)),
+            "sgst": Decimal(str(d.get("state_ut_tax") or 0)),
+            "igst": Decimal(str(d.get("integrated_tax") or 0)),
+            "cess": Decimal(str(d.get("cess_amount") or 0)),
+        }
+        for d in gstr2b_docs
+        if d.get("supply_attract_reverse_charge") or str(d.get("section_name") or "").upper() in ("RCM", "B2B_RCM")
+    ]
+
     table_3_1_d_rcm_reconciliation = {
         "description": "Statutory Inward RCM Reconciliation: Table 3.1(d) Cash Liability vs Table 4(A)(3) ITC Claim",
         "tax_period": return_period,
@@ -350,23 +371,18 @@ def generate_unified_financial_report(
             "cess": rcm_cess,
             "total_itc_claimed": rcm_total,
             "statutory_classification": "Eligible Inward Supplies Liable to Reverse Charge (Section 9(3)/9(4))",
-            "ineligible_rcm_amount": Decimal("0.00"),
+            "ineligible_rcm_amount": sum(
+                (Decimal(str(d.get("central_tax") or 0)) + Decimal(str(d.get("state_ut_tax") or 0)) +
+                 Decimal(str(d.get("integrated_tax") or 0)) + Decimal(str(d.get("cess_amount") or 0)))
+                for d in gstr2b_docs
+                if (d.get("supply_attract_reverse_charge") or str(d.get("section_name") or "").upper() in ("RCM", "B2B_RCM"))
+                and d.get("itc_availability") == "not_available"
+            ),
             "eligibility_condition": "Discharged in cash via Table 3.1(d) and used in furtherance of business (Section 16(1))."
         },
+        "rcm_documents": rcm_docs_out,
         "variance": Decimal("0.00"),
         "is_reconciled": True,
-        "historical_rcm_audit": {
-            "prior_period_discharged_doc": "RCM-INELIG-01",
-            "statutory_period": "2025-07",
-            "time_of_supply": "2025-07-15",
-            "cash_discharge_date": "2025-08-19",
-            "payment_reference_cin": "SBIN25082700123456",
-            "filing_arn": "AA2708250087654",
-            "cash_ledger_debit_ref": "DR-2025-08-00441",
-            "cash_discharged_amount": Decimal("2500.00"),
-            "current_period_table_3_1_d_inclusion": False,
-            "statutory_rule": "Tax liability was discharged in cash in July 2025 return period; not re-chargeable to November 2026 Table 3.1(d). Ineligible for ITC under Section 16(4) time-bar and reported as unavailable in GSTR-2B Part B (Table 4(D)(2)); strictly excluded from Table 4(A)(3)."
-        }
     }
 
     # 6. Statutory ITC Accounting States Breakdown
@@ -388,28 +404,59 @@ def generate_unified_financial_report(
         for r in state_rows
     }
 
-    # 7. Electronic Credit Reversal and Re-claimed Statement (GST Portal Reconciled Ledger)
+    # 7. Electronic Credit Reversal and Re-claimed Statement (Notification No. 38/2023-CT)
+    # Derive Opening Reversal Balance strictly from prior-period reclaimable reversals minus prior reclaims!
+    prior_rev = session.execute(
+        text("""
+        SELECT COALESCE(SUM(r.reversed_cgst), 0) AS cgst,
+               COALESCE(SUM(r.reversed_sgst), 0) AS sgst,
+               COALESCE(SUM(r.reversed_igst), 0) AS igst,
+               COALESCE(SUM(r.reversed_cess), 0) AS cess
+        FROM public.itc_reversal_events r
+        JOIN public.purchase_documents p ON r.purchase_doc_id = p.id AND r.org_id = p.org_id
+        WHERE r.org_id = :org AND p.registration_id = :reg AND r.reversal_period < :period
+          AND r.rule_code IN ('RULE_37_180_DAYS', 'RULE_37A_NON_FILING', 'SEC_16_2_B', 'SEC_16_2_B_PENDING_RECEIPT', 'RULE_16_2_B', 'PENDING_RECEIPT', 'UNBOOKED_RECEIPT_REVERSAL', 'REVERSAL_SECTION_16_2_B', 'REVERSAL_OTHER_TEMP');
+        """),
+        {"org": org_id, "reg": registration_id, "period": return_period},
+    ).fetchone()
+    prior_reav = session.execute(
+        text("""
+        SELECT COALESCE(SUM(e.reavailed_cgst), 0) AS cgst,
+               COALESCE(SUM(e.reavailed_sgst), 0) AS sgst,
+               COALESCE(SUM(e.reavailed_igst), 0) AS igst,
+               COALESCE(SUM(e.reavailed_cess), 0) AS cess
+        FROM public.itc_reavailment_events e
+        JOIN public.purchase_documents p ON e.purchase_doc_id = p.id AND e.org_id = p.org_id
+        WHERE e.org_id = :org AND p.registration_id = :reg AND e.reavailment_period < :period;
+        """),
+        {"org": org_id, "reg": registration_id, "period": return_period},
+    ).fetchone()
+
+    open_cgst = max(Decimal("0.00"), Decimal(str(prior_rev.cgst or 0)) - Decimal(str(prior_reav.cgst or 0)))
+    open_sgst = max(Decimal("0.00"), Decimal(str(prior_rev.sgst or 0)) - Decimal(str(prior_reav.sgst or 0)))
+    open_igst = max(Decimal("0.00"), Decimal(str(prior_rev.igst or 0)) - Decimal(str(prior_reav.igst or 0)))
+    open_cess = max(Decimal("0.00"), Decimal(str(prior_rev.cess or 0)) - Decimal(str(prior_reav.cess or 0)))
+    open_tot = open_cgst + open_sgst + open_igst + open_cess
+
     comp_4b2_tot = t4.components_4b.get("4B2_total")
     comp_4d1 = t4.components_4d.get("4D1_reclaimed")
-
-    open_cgst = comp_4d1.cgst if comp_4d1 else Decimal("0.00")
-    open_sgst = comp_4d1.sgst if comp_4d1 else Decimal("0.00")
-    open_igst = comp_4d1.igst if comp_4d1 else Decimal("0.00")
-    open_tot = t4.itc_reclaimed_earlier_reversal_4d1
 
     add_cgst = comp_4b2_tot.cgst if comp_4b2_tot else Decimal("0.00")
     add_sgst = comp_4b2_tot.sgst if comp_4b2_tot else Decimal("0.00")
     add_igst = comp_4b2_tot.igst if comp_4b2_tot else Decimal("0.00")
+    add_cess = comp_4b2_tot.cess if comp_4b2_tot else Decimal("0.00")
     add_tot = t4.total_itc_reversed_reclaimable_4b2
 
     sub_cgst = comp_4d1.cgst if comp_4d1 else Decimal("0.00")
     sub_sgst = comp_4d1.sgst if comp_4d1 else Decimal("0.00")
     sub_igst = comp_4d1.igst if comp_4d1 else Decimal("0.00")
+    sub_cess = comp_4d1.cess if comp_4d1 else Decimal("0.00")
     sub_tot = t4.itc_reclaimed_earlier_reversal_4d1
 
     close_cgst = open_cgst + add_cgst - sub_cgst
     close_sgst = open_sgst + add_sgst - sub_sgst
     close_igst = open_igst + add_igst - sub_igst
+    close_cess = open_cess + add_cess - sub_cess
     close_tot = open_tot + add_tot - sub_tot
 
     reversal_reclaim_statement = {
@@ -419,71 +466,90 @@ def generate_unified_financial_report(
         "current_period_reclaims_table_4d1": sub_tot,
         "closing_reversal_balance": close_tot,
         "tax_head_breakdown": {
-            "opening_balance": {"cgst": open_cgst, "sgst": open_sgst, "igst": open_igst, "total": open_tot},
-            "additions_table_4b2": {"cgst": add_cgst, "sgst": add_sgst, "igst": add_igst, "total": add_tot},
-            "reclaims_table_4d1": {"cgst": sub_cgst, "sgst": sub_sgst, "igst": sub_igst, "total": sub_tot},
-            "closing_balance": {"cgst": close_cgst, "sgst": close_sgst, "igst": close_igst, "total": close_tot}
+            "opening_balance": {"cgst": open_cgst, "sgst": open_sgst, "igst": open_igst, "cess": open_cess, "total": open_tot},
+            "additions_table_4b2": {"cgst": add_cgst, "sgst": add_sgst, "igst": add_igst, "cess": add_cess, "total": add_tot},
+            "reclaims_table_4d1": {"cgst": sub_cgst, "sgst": sub_sgst, "igst": sub_igst, "cess": sub_cess, "total": sub_tot},
+            "closing_balance": {"cgst": close_cgst, "sgst": close_sgst, "igst": close_igst, "cess": close_cess, "total": close_tot}
         },
-        "source_reversals_lineage": [
-            {
-                "rule_code": "RULE_37_180_DAYS",
-                "document_number": "INV-B2B-05",
-                "supplier_name": "TechPack Solutions",
-                "cgst": Decimal("9000.00"), "sgst": Decimal("9000.00"), "igst": Decimal("0.00"), "total": Decimal("18000.00"),
-                "statutory_reason": "Rule 37(1) non-payment of consideration within 180 days from invoice date"
-            },
-            {
-                "rule_code": "RULE_37A_NON_FILING",
-                "document_number": "INV-B2B-06",
-                "supplier_name": "Apex Industrial Fasteners",
-                "cgst": Decimal("0.00"), "sgst": Decimal("0.00"), "igst": Decimal("32400.00"), "total": Decimal("32400.00"),
-                "statutory_reason": "Rule 37A supplier failure to furnish Form GSTR-3B by 30th September"
-            },
-            {
-                "rule_code": "SEC_16_2_B_PENDING_RECEIPT",
-                "document_number": "SUP-2B-998",
-                "supplier_name": "Trans-State Components",
-                "cgst": Decimal("0.00"), "sgst": Decimal("0.00"), "igst": Decimal("18000.00"), "total": Decimal("18000.00"),
-                "statutory_reason": "Section 16(2)(b) receipt verification pending; neutralizes unbooked GSTR-2B credit per Circular 170"
-            }
-        ],
-        "is_reconciled": True,
+        "source_reversals_lineage": t4.reversals_lineage,
+        "is_reconciled": close_tot == (open_tot + add_tot - sub_tot),
         "statutory_basis": "Notification No. 38/2023-Central Tax & GST Portal Reclaim Ledger Mechanism"
     }
 
-    # 8. Rule 37 Section 50 Interest Dual Assessment
-    rule_37_interest_dual_assessment = {
-        "target_invoice": "INV-B2B-05",
-        "statutory_obligation": "Rule 37(1) CGST Rules (180-day non-payment)",
-        "reversal_tax": Decimal("18000.00"),
-        "certification_status": "REQUIRES_TAX_PROFESSIONAL_REVIEW",
-        "prevent_automatic_certification": True,
-        "unresolved_legal_interpretation": (
-            "Whether the phrase 'along with interest payable thereon under section 50' in Rule 37(1) "
-            "invokes Section 50(1) (time-based tax default) or Section 50(3) (utilization-based credit default under Rule 88B(3)) "
-            "remains an open legal controversy. Automatic statutory certification of Nil interest is withheld pending manual tax professional review."
-        ),
-        "primary_statutory_basis_rule_88b_3": {
-            "statutory_provision": "Section 50(3) read with Rule 88B(3) and Finance Act 2022",
-            "condition": "Interest applies strictly on wrongly availed and UTILIZED credit.",
-            "ecl_balance_status": "Maintained above ₹18,000 throughout lifecycle.",
-            "interest_liability": Decimal("0.00"),
-            "status": "NIL_INTEREST"
-        },
-        "departmental_assessment_view_sec_50_1": {
-            "statutory_provision": "Section 50(1) time-based assessment without utilization defense",
-            "basis_from_181st_day": {
-                "days": 43,
-                "applicable_rate": "18% p.a.",
-                "interest_exposure": Decimal("381.70")
+    # 8. Rule 37 Section 50 Interest Dual Assessment (computed strictly from DB Rule 37 records)
+    from app.modules.reconciliation.itc_engine import calculate_rule_37_interest
+
+    r37_row = session.execute(
+        text("""
+        SELECT p.id, p.document_number, p.document_date, p.availed_period,
+               r.reversed_cgst, r.reversed_sgst, r.reversed_igst, r.reversed_cess,
+               r.reversal_period, r.created_at
+        FROM public.itc_reversal_events r
+        JOIN public.purchase_documents p ON r.purchase_doc_id = p.id AND r.org_id = p.org_id
+        WHERE r.org_id = :org AND p.registration_id = :reg AND r.reversal_period = :period
+          AND r.rule_code = 'RULE_37_180_DAYS'
+        ORDER BY r.created_at DESC
+        LIMIT 1;
+        """),
+        {"org": org_id, "reg": registration_id, "period": return_period},
+    ).fetchone()
+
+    if r37_row:
+        r37_tax = Decimal(str(
+            (r37_row.reversed_cgst or 0) + (r37_row.reversed_sgst or 0) +
+            (r37_row.reversed_igst or 0) + (r37_row.reversed_cess or 0)
+        ))
+        inv_dt = r37_row.document_date if isinstance(r37_row.document_date, date) else datetime.strptime(str(r37_row.document_date)[:10], "%Y-%m-%d").date()
+        # Filing/reversal reference date in return_period & availment filing date (20th of following month)
+        rp_y, rp_m = int(return_period[:4]), int(return_period[5:7])
+        rev_dt = date(rp_y, rp_m, 20)
+        av_p = r37_row.availed_period or return_period
+        av_y, av_m = int(str(av_p)[:4]), int(str(av_p)[5:7])
+        av_next_y, av_next_m = (av_y + 1, 1) if av_m == 12 else (av_y, av_m + 1)
+        av_dt = date(av_next_y, av_next_m, 20)
+
+        calc = calculate_rule_37_interest(
+            reversal_tax=r37_tax,
+            ecl_minimum_balance=r37_tax,  # Utilization-safe default until ECL statement uploaded
+            invoice_date=inv_dt,
+            availment_date=av_dt,
+            reversal_date=rev_dt,
+        )
+        da_comps = (calc.get("dual_assessment") or {}).get("computations", {})
+        da_dates = (calc.get("dual_assessment") or {}).get("dates", {})
+        rule_37_interest_dual_assessment = {
+            "target_invoice": r37_row.document_number,
+            "statutory_obligation": "Rule 37(1) CGST Rules (180-day non-payment)",
+            "reversal_tax": r37_tax,
+            "certification_status": "REQUIRES_TAX_PROFESSIONAL_REVIEW",
+            "prevent_automatic_certification": True,
+            "unresolved_legal_interpretation": (
+                "Whether the phrase 'along with interest payable thereon under section 50' in Rule 37(1) "
+                "invokes Section 50(1) (time-based tax default) or Section 50(3) (utilization-based credit default under Rule 88B(3)) "
+                "remains an open legal controversy. Automatic statutory certification of Nil interest is withheld pending manual tax professional review."
+            ),
+            "primary_statutory_basis_rule_88b_3": {
+                "statutory_provision": "Section 50(3) read with Rule 88B(3) and Finance Act 2022",
+                "condition": "Interest applies strictly on wrongly availed and UTILIZED credit.",
+                "interest_liability": calc["interest_amount"],
+                "status": "NIL_INTEREST" if calc["interest_amount"] == Decimal("0.00") else "INTEREST_APPLICABLE",
             },
-            "basis_from_availment_date": {
-                "days": 184,
-                "applicable_rate": "18% p.a.",
-                "interest_exposure": Decimal("1633.32")
-            }
+            "departmental_assessment_view_sec_50_1": {
+                "statutory_provision": "Section 50(1) time-based assessment without utilization defense",
+                "basis_from_181st_day": {
+                    "days": da_dates.get("days_beyond_180", 0),
+                    "applicable_rate": "18% p.a.",
+                    "interest_exposure": da_comps.get("basis_b1_sec_50_1_from_181st_day", {}).get("interest_amount", Decimal("0.00")),
+                },
+                "basis_from_availment_date": {
+                    "days": da_dates.get("days_from_availment", 0),
+                    "applicable_rate": "18% p.a.",
+                    "interest_exposure": da_comps.get("basis_b2_sec_50_1_from_availment", {}).get("interest_amount", Decimal("0.00")),
+                },
+            },
         }
-    }
+    else:
+        rule_37_interest_dual_assessment = None
 
     return {
         "registration_id": registration_id,

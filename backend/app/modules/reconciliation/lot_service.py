@@ -79,6 +79,14 @@ def record_lot_to_ledger(
             detail=f"Receipt date {payload.receipt_date} cannot precede invoice/document date ({doc.document_date})."
         )
 
+    if payload.expected_lots_count is not None and doc.total_lots_expected and payload.expected_lots_count < doc.total_lots_expected:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Section 16(2)(b) Integrity Violation: Cannot reduce expected_lots_count ({payload.expected_lots_count}) "
+                f"below persisted contract expectation ({doc.total_lots_expected}) to accelerate last-lot ITC."
+            ),
+        )
     expected_lots = payload.expected_lots_count or doc.total_lots_expected or 1
     expected_qty = doc.quantity_expected or Decimal("0.00")
 

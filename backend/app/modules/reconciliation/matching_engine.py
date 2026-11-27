@@ -58,6 +58,19 @@ class DeterministicReconciliationEngine:
         self.cess_tolerance = cess_tolerance if cess_tolerance is not None else Decimal("1.00")
         self.engine_version = engine_version
 
+    @staticmethod
+    def _doc_cls(raw: Any) -> str:
+        v = str(raw or "").strip().lower()
+        if any(k in v for k in ("credit", "crn", "cdnr")):
+            return "crn"
+        if any(k in v for k in ("debit", "dbn")):
+            return "dbn"
+        if "isd" in v:
+            return "isd"
+        if "boe" in v or "bill_of_entry" in v:
+            return "boe"
+        return "inv"
+
     def run_reconciliation(
         self,
         purchase_docs: List[Dict[str, Any]],
@@ -106,9 +119,23 @@ class DeterministicReconciliationEngine:
                 diff_taxable = abs(p_taxable - g_taxable)
                 diff_tax = abs(p_tax - g_tax)
                 diff_total = abs(p_total - g_total)
+                diff_cgst = abs(Decimal(str(p_doc.get("cgst_amount") or 0)) - Decimal(str(g_doc.get("central_tax") or 0)))
+                diff_sgst = abs(Decimal(str(p_doc.get("sgst_amount") or 0)) - Decimal(str(g_doc.get("state_ut_tax") or 0)))
+                diff_igst = abs(Decimal(str(p_doc.get("igst_amount") or 0)) - Decimal(str(g_doc.get("integrated_tax") or 0)))
+                diff_cess = abs(Decimal(str(p_doc.get("cess_amount") or 0)) - Decimal(str(g_doc.get("cess_amount") or 0)))
 
-                # Exact match condition: Non-amended, same date & differences == 0
-                if not g_doc.get("is_amended") and p_date == g_date and diff_taxable == Decimal("0.00") and diff_tax == Decimal("0.00"):
+                # Exact match condition: compatible doc type, non-amended, same date & head-level tax identity
+                if (
+                    self._doc_cls(p_doc.get("document_type")) == self._doc_cls(g_doc.get("document_type"))
+                    and not g_doc.get("is_amended")
+                    and p_date == g_date
+                    and diff_taxable == Decimal("0.00")
+                    and diff_tax == Decimal("0.00")
+                    and diff_cgst == Decimal("0.00")
+                    and diff_sgst == Decimal("0.00")
+                    and diff_igst == Decimal("0.00")
+                    and diff_cess == Decimal("0.00")
+                ):
                     matched_purchase_ids.add(p_id)
                     matched_gstr2b_ids.add(g_id)
                     matches.append(MatchDetailOut(
@@ -146,6 +173,8 @@ class DeterministicReconciliationEngine:
                 g_id = str(g_doc["id"])
                 if g_id in matched_gstr2b_ids:
                     continue
+                if self._doc_cls(p_doc.get("document_type")) != self._doc_cls(g_doc.get("document_type")):
+                    continue
 
                 if g_doc.get("is_amended") or g_doc.get("section_name") in ("B2BA", "CDNRA", "IMPGA", "IMPGSEZA"):
                     orig_num = g_doc.get("original_document_number")
@@ -157,6 +186,9 @@ class DeterministicReconciliationEngine:
                     g_tax = Decimal(str((g_doc.get("central_tax") or 0) + (g_doc.get("state_ut_tax") or 0) + (g_doc.get("integrated_tax") or 0)))
                     p_tax = Decimal(str((p_doc.get("cgst_amount") or 0) + (p_doc.get("sgst_amount") or 0) + (p_doc.get("igst_amount") or 0)))
 
+                    g_total = Decimal(str(g_doc.get("invoice_value") or (g_taxable + g_tax)))
+                    p_total = Decimal(str(p_doc.get("total_invoice_value") or (p_taxable + p_tax)))
+
                     matches.append(MatchDetailOut(
                         purchase_doc_id=p_id,
                         gstr2b_doc_id=g_id,
@@ -165,7 +197,7 @@ class DeterministicReconciliationEngine:
                         is_exact=False,
                         taxable_difference=abs(p_taxable - g_taxable),
                         tax_difference=abs(p_tax - g_tax),
-                        total_difference=Decimal("0.00"),
+                        total_difference=abs(p_total - g_total),
                         match_evidence={
                             "pass": "Amendment-Aware",
                             "amendment_section": g_doc.get("section_name"),
@@ -188,6 +220,7 @@ class DeterministicReconciliationEngine:
         # -------------------------------------------------------------
         # PASS 3: Configurable Amount Tolerances
         # -------------------------------------------------------------
+        deferred_tax_mismatches: Dict[Tuple[str, str], VarianceDetailOut] = {}
         for p_doc in purchase_docs:
             p_id = str(p_doc["id"])
             if p_id in matched_purchase_ids:
@@ -204,6 +237,8 @@ class DeterministicReconciliationEngine:
             for g_doc in candidates:
                 g_id = str(g_doc["id"])
                 if g_id in matched_gstr2b_ids:
+                    continue
+                if self._doc_cls(p_doc.get("document_type")) != self._doc_cls(g_doc.get("document_type")):
                     continue
 
                 g_date = parse_date(g_doc.get("document_date"))
@@ -256,19 +291,22 @@ class DeterministicReconciliationEngine:
                         ))
                     break
                 elif diff_taxable > self.taxable_tolerance or diff_tax > self.tax_tolerance:
-                    # Explicit tax mismatch variance record
-                    variances.append(VarianceDetailOut(
-                        variance_category=MatchCategoryEnum.TAX_MISMATCH,
-                        purchase_doc_id=p_id,
-                        gstr2b_doc_id=g_id,
-                        difference_details={
-                            "book_taxable": str(p_taxable),
-                            "portal_taxable": str(g_taxable),
-                            "taxable_difference": str(diff_taxable),
-                            "tax_difference": str(diff_tax),
-                            "exceeds_tolerance": True
-                        }
-                    ))
+                    # Defer emission until Pass 4 completes so date-shifted or subsequent candidates do not produce duplicate/spurious variances
+                    deferred_tax_mismatches.setdefault(
+                        (p_id, g_id),
+                        VarianceDetailOut(
+                            variance_category=MatchCategoryEnum.TAX_MISMATCH,
+                            purchase_doc_id=p_id,
+                            gstr2b_doc_id=g_id,
+                            difference_details={
+                                "book_taxable": str(p_taxable),
+                                "portal_taxable": str(g_taxable),
+                                "taxable_difference": str(diff_taxable),
+                                "tax_difference": str(diff_tax),
+                                "exceeds_tolerance": True
+                            }
+                        ),
+                    )
 
         # -------------------------------------------------------------
         # PASS 4: Controlled Near-Match Candidates (e.g. ±3 days date variance)
@@ -287,11 +325,27 @@ class DeterministicReconciliationEngine:
                 g_id = str(g_doc["id"])
                 if g_id in matched_gstr2b_ids:
                     continue
+                if self._doc_cls(p_doc.get("document_type")) != self._doc_cls(g_doc.get("document_type")):
+                    continue
 
                 g_date = parse_date(g_doc.get("document_date"))
                 if p_date and g_date:
                     day_diff = abs((p_date - g_date).days)
-                    if 0 < day_diff <= 3:
+                    p_taxable = Decimal(str(p_doc.get("total_taxable_amount") or 0))
+                    p_tax = Decimal(str((p_doc.get("cgst_amount") or 0) + (p_doc.get("sgst_amount") or 0) + (p_doc.get("igst_amount") or 0)))
+                    p_total = Decimal(str(p_doc.get("total_invoice_value") or (p_taxable + p_tax)))
+                    g_taxable = Decimal(str(g_doc.get("taxable_value") or 0))
+                    g_tax = Decimal(str((g_doc.get("central_tax") or 0) + (g_doc.get("state_ut_tax") or 0) + (g_doc.get("integrated_tax") or 0)))
+                    g_total = Decimal(str(g_doc.get("invoice_value") or (g_taxable + g_tax)))
+                    diff_taxable = abs(p_taxable - g_taxable)
+                    diff_tax = abs(p_tax - g_tax)
+                    diff_total = abs(p_total - g_total)
+                    if (
+                        0 < day_diff <= 3
+                        and diff_taxable <= self.taxable_tolerance
+                        and diff_tax <= self.tax_tolerance
+                        and diff_total <= self.total_tolerance
+                    ):
                         matched_purchase_ids.add(p_id)
                         matched_gstr2b_ids.add(g_id)
                         matches.append(MatchDetailOut(
@@ -300,9 +354,9 @@ class DeterministicReconciliationEngine:
                             match_pass=4,
                             match_score=Decimal("0.850"),
                             is_exact=False,
-                            taxable_difference=Decimal("0.00"),
-                            tax_difference=Decimal("0.00"),
-                            total_difference=Decimal("0.00"),
+                            taxable_difference=diff_taxable,
+                            tax_difference=diff_tax,
+                            total_difference=diff_total,
                             match_evidence={
                                 "pass": "Date Near-Match Candidate",
                                 "book_date": str(p_date),
@@ -321,6 +375,10 @@ class DeterministicReconciliationEngine:
                             }
                         ))
                         break
+
+        for (p_id, g_id), var_item in deferred_tax_mismatches.items():
+            if p_id not in matched_purchase_ids and g_id not in matched_gstr2b_ids:
+                variances.append(var_item)
 
         # -------------------------------------------------------------
         # Identify Residual Unmatched Documents

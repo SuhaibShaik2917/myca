@@ -481,7 +481,7 @@ def test_ocr_mock_fallback_prohibited_in_production(monkeypatch):
     assert "strictly prohibited in production" in str(exc.value)
 
 
-def test_worker_task_reprocessing_idempotency(test_tenants):
+def test_worker_task_reprocessing_idempotency(test_tenants, tmp_path):
     """
     Operational Integrity Verification:
     Reprocessing an OCR task multiple times must NOT duplicate line items.
@@ -491,15 +491,18 @@ def test_worker_task_reprocessing_idempotency(test_tenants):
     doc_id = str(uuid.uuid4())
     org_id = test_tenants["org_a"]
 
-    mock_pdf = Path("/tmp/mock.pdf")
+    tenant_dir = tmp_path / org_id
+    tenant_dir.mkdir(parents=True, exist_ok=True)
+    mock_pdf = tenant_dir / "mock.pdf"
     mock_pdf.write_bytes(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\nxref\n0 2\n0000000000 65535 f\ntrailer<</Root 1 0 R>>\nstartxref\n50\n%%EOF\n")
+    mock_pdf_str = str(mock_pdf)
 
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
-                VALUES (%s, %s, 'invoice', 'reprocess_test.pdf', 1024, 'application/pdf', '/tmp/mock.pdf', 'fake_hash_reprocess');
-            """, (doc_id, org_id))
+                VALUES (%s, %s, 'invoice', 'reprocess_test.pdf', 1024, 'application/pdf', %s, 'fake_hash_reprocess');
+            """, (doc_id, org_id, mock_pdf_str))
             cur.execute("""
                 INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, status)
                 VALUES (%s, %s, %s, 'INV-REPROCESS', '2026-11-01', 'Test Counterparty', 0, 0, 0, 0, 0, 'uploaded');
@@ -511,7 +514,7 @@ def test_worker_task_reprocessing_idempotency(test_tenants):
             """, (json.dumps({
                 "invoice_id": inv_id,
                 "document_id": doc_id,
-                "file_path": "/tmp/mock.pdf",
+                "file_path": mock_pdf_str,
                 "mime_type": "application/pdf"
             }), org_id))
             task_id = str(cur.fetchone()[0])
@@ -528,7 +531,7 @@ def test_worker_task_reprocessing_idempotency(test_tenants):
         res1 = process_invoice_ocr_task(
             db_conn=conn, task_id=task_id, invoice_id=inv_id,
             document_id=doc_id, org_id=org_id,
-            file_path="/tmp/mock.pdf", mime_type="application/pdf",
+            file_path=mock_pdf_str, mime_type="application/pdf",
             lease_token=lease_token
         )
         assert res1["status"] in ("pending_review", "validation_failed")
@@ -545,7 +548,7 @@ def test_worker_task_reprocessing_idempotency(test_tenants):
         res2 = process_invoice_ocr_task(
             db_conn=conn, task_id=task_id, invoice_id=inv_id,
             document_id=doc_id, org_id=org_id,
-            file_path="/tmp/mock.pdf", mime_type="application/pdf",
+            file_path=mock_pdf_str, mime_type="application/pdf",
             lease_token=lease_token
         )
         assert res2.get("skipped") is True
@@ -832,7 +835,7 @@ def test_transition_rules_worker_pending_review_to_processing_revoked():
             assert cur.fetchone()[0] == 0
 
 
-def test_human_corrections_survive_worker_retry(test_tenants):
+def test_human_corrections_survive_worker_retry(test_tenants, tmp_path):
     """
     Human Review Integrity Verification:
     Human edits on an invoice in pending_review must NEVER be overwritten
@@ -845,15 +848,18 @@ def test_human_corrections_survive_worker_retry(test_tenants):
 
     inv_id = str(uuid.uuid4())
     doc_id = str(uuid.uuid4())
-    mock_pdf = Path("/tmp/human_test.pdf")
+    tenant_dir = tmp_path / org_id
+    tenant_dir.mkdir(parents=True, exist_ok=True)
+    mock_pdf = tenant_dir / "human_test.pdf"
     mock_pdf.write_bytes(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\nxref\n0 2\n0000000000 65535 f\ntrailer<</Root 1 0 R>>\nstartxref\n50\n%%EOF\n")
+    mock_pdf_str = str(mock_pdf)
 
     with psycopg.connect(DB_ADMIN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO public.documents (id, org_id, doc_type, file_name, file_size_bytes, mime_type, file_path, sha256_checksum)
-                VALUES (%s, %s, 'invoice', 'human_test.pdf', 1024, 'application/pdf', '/tmp/human_test.pdf', 'fake_hash_human');
-            """, (doc_id, org_id))
+                VALUES (%s, %s, 'invoice', 'human_test.pdf', 1024, 'application/pdf', %s, 'fake_hash_human');
+            """, (doc_id, org_id, mock_pdf_str))
             cur.execute("""
                 INSERT INTO public.invoices (id, org_id, profile_id, invoice_number, invoice_date, counterparty_name, total_taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, status)
                 VALUES (%s, %s, %s, 'INV-HUMAN', '2026-11-01', 'Original Counterparty', 0, 0, 0, 0, 0, 'uploaded');
@@ -861,7 +867,7 @@ def test_human_corrections_survive_worker_retry(test_tenants):
             cur.execute("SELECT set_config('app.current_org', %s, false);", (org_id,))
             cur.execute("""
                 SELECT public.enqueue_task('invoice_ocr', %s::jsonb, %s::uuid);
-            """, (json.dumps({"invoice_id": inv_id, "document_id": doc_id, "file_path": "/tmp/human_test.pdf", "mime_type": "application/pdf"}), org_id))
+            """, (json.dumps({"invoice_id": inv_id, "document_id": doc_id, "file_path": mock_pdf_str, "mime_type": "application/pdf"}), org_id))
             task_id = str(cur.fetchone()[0])
 
     # Worker claims and processes initial OCR
@@ -873,7 +879,7 @@ def test_human_corrections_survive_worker_retry(test_tenants):
         process_invoice_ocr_task(
             db_conn=conn, task_id=task_id, invoice_id=inv_id,
             document_id=doc_id, org_id=org_id,
-            file_path="/tmp/human_test.pdf", mime_type="application/pdf",
+            file_path=mock_pdf_str, mime_type="application/pdf",
             lease_token=token
         )
 
@@ -899,7 +905,7 @@ def test_human_corrections_survive_worker_retry(test_tenants):
         retry_res = process_invoice_ocr_task(
             db_conn=conn, task_id=task_id, invoice_id=inv_id,
             document_id=doc_id, org_id=org_id,
-            file_path="/tmp/human_test.pdf", mime_type="application/pdf",
+            file_path=mock_pdf_str, mime_type="application/pdf",
             lease_token=token
         )
         assert retry_res.get("skipped") is True
@@ -1982,10 +1988,12 @@ def test_gemini_vision_live_smoke_test_harness(tmp_path):
     Verifies that the Gemini extraction engine produces structured, validated
     ExtractedInvoiceData without fabricated numbers.
     """
-    sample_pdf = tmp_path / "smoke_invoice.pdf"
+    smoke_org_dir = tmp_path / "smoke-org-1"
+    smoke_org_dir.mkdir(parents=True, exist_ok=True)
+    sample_pdf = smoke_org_dir / "smoke_invoice.pdf"
     sample_pdf.write_bytes(b"%PDF-1.4\n%Redacted Synthetic GST Tax Invoice\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF")
 
-    extracted = extract_invoice_with_gemini(str(sample_pdf), "application/pdf")
+    extracted = extract_invoice_with_gemini(str(sample_pdf), "application/pdf", expected_org_id="smoke-org-1")
     assert extracted is not None
     assert extracted.invoice_number.startswith("INV-")
     assert extracted.counterparty_name is not None

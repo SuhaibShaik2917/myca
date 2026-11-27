@@ -10,6 +10,22 @@ import os
 import psycopg
 from sqlalchemy import create_engine, text
 
+def _to_psycopg_dsn(url: str) -> str:
+    if url.startswith("postgresql+psycopg://"):
+        return "postgresql://" + url[len("postgresql+psycopg://"):]
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+def _to_sqlalchemy_dsn(url: str) -> str:
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://"):]
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://" + url[len("postgres://"):]
+    return url
+
+
 def run_diagnostics() -> bool:
     print("=" * 70)
     print("MyCA v1.0.6 CI DATABASE & ROLE DIAGNOSTICS")
@@ -17,7 +33,8 @@ def run_diagnostics() -> bool:
 
     # 1. Resolve connection URLs
     admin_url = (
-        os.environ.get("DB_ADMIN_URL")
+        os.environ.get("MIGRATION_DATABASE_URL")
+        or os.environ.get("DB_ADMIN_URL")
         or os.environ.get("DATABASE_ADMIN_URL")
         or os.environ.get("TEST_DATABASE_URL")
         or "postgresql://postgres:postgres@localhost:5432/myca"
@@ -44,11 +61,11 @@ def run_diagnostics() -> bool:
     )
 
     roles_to_check = [
-        ("Admin / DDL", admin_url, "postgres"),
-        ("App Service User", app_url, "app_service_user"),
-        ("Worker Service User", worker_url, "worker_service_user"),
-        ("Worker 1 Service User", worker1_url, "worker_service_user_1"),
-        ("Worker 2 Service User", worker2_url, "worker_service_user_2"),
+        ("Admin / DDL", _to_psycopg_dsn(admin_url), "postgres"),
+        ("App Service User", _to_psycopg_dsn(app_url), "app_service_user"),
+        ("Worker Service User", _to_psycopg_dsn(worker_url), "worker_service_user"),
+        ("Worker 1 Service User", _to_psycopg_dsn(worker1_url), "worker_service_user_1"),
+        ("Worker 2 Service User", _to_psycopg_dsn(worker2_url), "worker_service_user_2"),
     ]
 
     all_ok = True
@@ -75,7 +92,7 @@ def run_diagnostics() -> bool:
 
     print("\n--- 2. Verifying Table Schemas & Catalogs ---")
     try:
-        engine = create_engine(admin_url)
+        engine = create_engine(_to_sqlalchemy_dsn(admin_url))
         with engine.connect() as conn:
             # Check Alembic version
             ver_row = conn.execute(text("SELECT version_num FROM public.alembic_version;")).fetchone()

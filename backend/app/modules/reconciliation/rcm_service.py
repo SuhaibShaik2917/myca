@@ -144,10 +144,49 @@ def validate_rcm_and_gta_eligibility(
             )
         )
 
-    # 2. Non-GTA other services (Legal services by advocate, Director remuneration, etc.)
+    # 2. Import of Services (Section 5(3) IGST Act / Notification 10/2017-IT(R)): always IGST
+    if srv in ("IMPORT_SERVICES", "IMPORT_OF_SERVICES"):
+        c = Decimal("0.00")
+        s = Decimal("0.00")
+        i = total_tax
+        cash_discharged = bool(cash_payment_challan_ref)
+        status = "ELIGIBLE_4A3" if cash_discharged else "PENDING_CASH_DISCHARGE_31D"
+        return RCMValidationResult(
+            is_rcm_applicable=True,
+            tax_type="INTER_STATE",
+            cgst_amount=c,
+            sgst_amount=s,
+            igst_amount=i,
+            total_rcm_tax=total_tax,
+            is_cash_discharged=cash_discharged,
+            itc_eligibility_status=status,
+            statutory_basis="Section 5(3) of IGST Act read with Notification No. 10/2017-Integrated Tax (Rate), Entry 1",
+            explanation=(
+                f"Import of services from supplier located outside India is taxable as INTER_STATE supply under IGST RCM "
+                f"(IGST ₹{i:,.2f}). Mandatory cash discharge via Table 3.1(d) before claiming Table 4(A)(2)/(3) ITC."
+            ),
+        )
+
+    # 3. Known Statutory Reverse Charge Service Categories (Section 9(3) / Notification 13/2017-CT(R))
+    KNOWN_RCM_SERVICES = {
+        "LEGAL_ADVOCATE", "ADVOCATE", "ARBITRAL_TRIBUNAL", "DIRECTOR_REMUNERATION", "SPONSORSHIP",
+        "GOVERNMENT_LOCAL_AUTHORITY", "RECOVERY_AGENT", "AUTHOR_MUSIC_ARTIST", "OVERSEEING_COMMITTEE",
+        "RENTING_MOTOR_VEHICLE", "SECURITY_SERVICES", "RESIDENTIAL_DWELLING",
+    }
     if srv != "GTA_ROAD_TRANSPORT":
-        # General RCM service (e.g. Legal services by advocate, Director services, etc.)
-        # Section 12 PoS check
+        if srv not in KNOWN_RCM_SERVICES:
+            return RCMValidationResult(
+                is_rcm_applicable=False,
+                tax_type="FORWARD_CHARGE",
+                cgst_amount=Decimal("0.00"),
+                sgst_amount=Decimal("0.00"),
+                igst_amount=Decimal("0.00"),
+                total_rcm_tax=Decimal("0.00"),
+                is_cash_discharged=False,
+                itc_eligibility_status="NOT_APPLICABLE_FORWARD_CHARGE",
+                statutory_basis="Section 9(1) of CGST Act / Notification No. 13/2017-CT(R) Schedule Exhaustive List",
+                explanation=f"Service type '{srv}' does not fall under notified Section 9(3)/5(3) Reverse Charge categories."
+            )
         rec_state = recipient_gstin[:2] if len(recipient_gstin) >= 2 else place_of_supply
         supp_state = (supplier_gstin[:2] if supplier_gstin and len(supplier_gstin) >= 2 else rec_state)
         is_intra = (supp_state == place_of_supply)
@@ -191,7 +230,7 @@ def validate_rcm_and_gta_eligibility(
     # B. Check Consignment Note Requirement:
     # Under GST law, goods transport by road without a consignment note is NOT a GTA service.
     # It is an exempt supply of transport of goods by road under Entry 18 of Notification 12/2017-CT(R).
-    if not has_consignment_note or (consignment_note_number is None and not has_consignment_note):
+    if not has_consignment_note or not (consignment_note_number and str(consignment_note_number).strip()):
         return RCMValidationResult(
             is_rcm_applicable=False,
             tax_type="EXEMPT",

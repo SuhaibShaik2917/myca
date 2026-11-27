@@ -3,7 +3,6 @@ import time
 import hashlib
 from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any, List
-import uuid
 from urllib.parse import urlparse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -23,7 +22,7 @@ class StorageError(Exception):
 
 
 class DuplicateDocumentError(StorageError):
-    def __init__(self, message: str, existing_document_id: str):
+    def __init__(self, message: str, existing_document_id: Optional[str] = None):
         super().__init__(message)
         self.existing_document_id = existing_document_id
 
@@ -53,10 +52,37 @@ def _get_s3_client():
     return boto3.client("s3", region_name=region)
 
 
+_UUID_SEGMENT_RE = None
+
+
+def _is_uuid_segment(segment: str) -> bool:
+    import re
+    global _UUID_SEGMENT_RE
+    if _UUID_SEGMENT_RE is None:
+        _UUID_SEGMENT_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+    return bool(_UUID_SEGMENT_RE.match(segment))
+
+
+def _validate_storage_segment(value: str, field_name: str) -> str:
+    clean = str(value or "").strip()
+    if (
+        not clean
+        or clean in {".", ".."}
+        or any(ch in clean for ch in ("/", "\\", "\x00"))
+        or ".." in clean
+    ):
+        raise StorageError(
+            f"INVALID_STORAGE_SEGMENT: Invalid {field_name} '{value}' for tenant storage isolation."
+        )
+    return clean
+
+
 def _assert_org_isolation(file_path: str, expected_org_id: Optional[str]) -> None:
-    if not expected_org_id:
-        return
-    org_clean = str(expected_org_id).strip()
+    if expected_org_id is None or not str(expected_org_id).strip():
+        raise StorageError(
+            "TENANT_STORAGE_ISOLATION_VIOLATION: expected_org_id is mandatory for document storage access."
+        )
+    org_clean = _validate_storage_segment(str(expected_org_id), "org_id")
     if is_s3_uri(file_path):
         _, key = parse_s3_uri(file_path)
         if not key.startswith(f"{org_clean}/"):
@@ -64,12 +90,37 @@ def _assert_org_isolation(file_path: str, expected_org_id: Optional[str]) -> Non
                 f"TENANT_STORAGE_ISOLATION_VIOLATION: Object key '{key}' does not belong to org '{org_clean}'."
             )
     else:
-        norm = os.path.normpath(os.path.abspath(file_path))
-        expected_segment = f"{os.sep}{org_clean}{os.sep}"
-        if expected_segment not in norm:
-            raise StorageError(
-                f"TENANT_STORAGE_ISOLATION_VIOLATION: Path '{file_path}' does not belong to org '{org_clean}'."
-            )
+        from app.config import settings
+
+        norm = os.path.normcase(os.path.realpath(file_path))
+        configured_root = (os.getenv("STORAGE_LOCAL_ROOT") or getattr(settings, "STORAGE_LOCAL_ROOT", "storage") or "storage").strip()
+        abs_root = os.path.normcase(os.path.realpath(configured_root))
+        try:
+            in_default_root = os.path.commonpath([abs_root, norm]) == abs_root
+        except ValueError:
+            in_default_root = False
+        if in_default_root:
+            expected_org_dir = os.path.normcase(os.path.realpath(os.path.join(configured_root, org_clean)))
+            try:
+                if os.path.commonpath([expected_org_dir, norm]) != expected_org_dir:
+                    raise StorageError(
+                        f"TENANT_STORAGE_ISOLATION_VIOLATION: Path '{file_path}' escapes tenant directory '{org_clean}'."
+                    )
+            except ValueError:
+                raise StorageError(f"TENANT_STORAGE_ISOLATION_VIOLATION: Path '{file_path}' invalid for org '{org_clean}'.")
+        else:
+            env_os = (os.getenv("ENVIRONMENT") or "").strip().lower()
+            env_attr = (getattr(settings, "ENVIRONMENT", None) or "").strip().lower()
+            if env_os in ("production", "staging") or env_attr in ("production", "staging"):
+                raise StorageError(
+                    f"TENANT_STORAGE_ISOLATION_VIOLATION: Local path '{file_path}' outside STORAGE_LOCAL_ROOT is prohibited in {env_os or env_attr}."
+                )
+            # Outside configured STORAGE_LOCAL_ROOT (temp test fixtures): require expected org_id segment in path
+            parts = norm.replace("\\", "/").split("/")
+            if org_clean.lower() not in [p.lower() for p in parts]:
+                raise StorageError(
+                    f"TENANT_STORAGE_ISOLATION_VIOLATION: Path '{file_path}' does not belong to org '{org_clean}'."
+                )
 
 
 def read_document_bytes(file_path: str, expected_org_id: Optional[str] = None) -> bytes:
@@ -110,6 +161,7 @@ def delete_stored_document(file_path: str, expected_org_id: Optional[str] = None
         return True
     return False
 
+
 def validate_magic_bytes(header: bytes) -> str:
     """
     Validates file format against expected magic byte signatures.
@@ -117,34 +169,33 @@ def validate_magic_bytes(header: bytes) -> str:
     """
     if header.startswith(b"%PDF"):
         return "application/pdf"
-    elif header.startswith(b"\x89PNG\r\n\x1a\n"):
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
-    elif header.startswith(b"\xff\xd8\xff"):
+    if header.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     raise StorageError("Invalid file signature. Only PDF, PNG, and JPEG documents are permitted.")
+
 
 def compute_stream_sha256_and_save(
     file_stream,
     org_id: str,
     doc_id: str,
-    base_dir: Optional[str] = None
+    base_dir: Optional[str] = None,
 ) -> Tuple[str, int, str, str]:
     """
     Streams file from input, validates magic bytes and size, computes SHA-256,
     and writes to configured STORAGE_BACKEND ('local' or fail-closed 's3').
-    Returns: (storage_path_or_uri, file_size_bytes, sha256_hex, mime_type)
     """
     from app.config import settings
 
     backend_mode = (os.getenv("STORAGE_BACKEND") or getattr(settings, "STORAGE_BACKEND", "local") or "local").strip().lower()
+    bucket = ""
+    s3_client = None
     if backend_mode == "s3":
         bucket = (os.getenv("AWS_S3_BUCKET_NAME") or getattr(settings, "AWS_S3_BUCKET_NAME", None) or "").strip()
         if not bucket:
             raise StorageError("S3_STORAGE_UNAVAILABLE: AWS_S3_BUCKET_NAME must be configured when STORAGE_BACKEND=s3.")
-        try:
-            import boto3  # type: ignore
-        except ImportError as exc:
-            raise StorageError("S3_STORAGE_UNAVAILABLE: boto3 dependency is required for STORAGE_BACKEND=s3.") from exc
+        s3_client = _get_s3_client()
     elif backend_mode != "local":
         raise StorageError(f"UNSUPPORTED_STORAGE_BACKEND: '{backend_mode}'")
 
@@ -155,8 +206,9 @@ def compute_stream_sha256_and_save(
     header_bytes = bytearray()
     mime_type: Optional[str] = None
 
-    # Temporary staging directory to prevent partial uploads on error
-    target_dir = os.path.join(effective_base_dir, str(org_id))
+    org_id = _validate_storage_segment(str(org_id), "org_id")
+    doc_id = _validate_storage_segment(str(doc_id), "doc_id")
+    target_dir = os.path.join(effective_base_dir, org_id)
     os.makedirs(target_dir, exist_ok=True)
     temp_path = os.path.join(target_dir, f"tmp_{doc_id}.bin")
 
@@ -169,11 +221,15 @@ def compute_stream_sha256_and_save(
                 total_bytes += len(chunk)
                 if total_bytes > MAX_FILE_SIZE_BYTES:
                     raise StorageError(f"File exceeds maximum allowed size of {MAX_FILE_SIZE_BYTES / (1024 * 1024)} MB")
-                
+
                 if len(header_bytes) < 16:
                     header_bytes.extend(chunk[:16 - len(header_bytes)])
-                    if len(header_bytes) >= 4 and mime_type is None:
-                        mime_type = validate_magic_bytes(bytes(header_bytes))
+                    if mime_type is None:
+                        hb = bytes(header_bytes)
+                        if hb.startswith(b"%PDF") or hb.startswith(b"\xff\xd8\xff"):
+                            mime_type = validate_magic_bytes(hb)
+                        elif len(hb) >= 8:
+                            mime_type = validate_magic_bytes(hb)
 
                 hasher.update(chunk)
                 f_out.write(chunk)
@@ -189,7 +245,6 @@ def compute_stream_sha256_and_save(
 
         if backend_mode == "s3":
             s3_key = f"{org_id}/{hash_prefix}/{doc_id}.bin"
-            region = (os.getenv("AWS_REGION") or getattr(settings, "AWS_REGION", "ap-south-1") or "ap-south-1").strip()
             kms_key = (os.getenv("AWS_S3_KMS_KEY_ID") or getattr(settings, "AWS_S3_KMS_KEY_ID", None) or "").strip()
             put_kwargs: Dict[str, Any] = {
                 "Bucket": bucket,
@@ -199,7 +254,6 @@ def compute_stream_sha256_and_save(
             }
             if kms_key:
                 put_kwargs["SSEKMSKeyId"] = kms_key
-            s3_client = boto3.client("s3", region_name=region)
             with open(temp_path, "rb") as f_in:
                 put_kwargs["Body"] = f_in
                 s3_client.put_object(**put_kwargs)
@@ -225,20 +279,59 @@ def compute_stream_sha256_and_save(
 def reconcile_storage_orphans(
     session: Session,
     base_dir: Optional[str] = None,
-    grace_period_seconds: int = 1800
+    grace_period_seconds: int = 1800,
+    org_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Periodic storage reconciliation mechanism across configured backend ('local' or 's3'):
-    1. Queries all active document file paths from PostgreSQL public.documents.
-    2. Scans storage root (directory tree for local, list_objects_v2 for S3) ignoring cross-backend URIs.
-    3. Reclaims space by purging unreferenced orphan objects older than grace_period_seconds.
-    4. Safely preserves in-flight uploads younger than grace_period_seconds.
+    Periodic storage reconciliation mechanism across configured backend ('local' or 's3').
+    Security invariant: When executing under RLS-restricted app_service_user without org_id,
+    active_paths only reflects the single tenant context (or 0 rows). Therefore org_id is
+    scoped strictly to the tenant subtree (or inferred safely from session context) when running
+    as app_service_user so cross-tenant files are NEVER deleted!
     """
     from app.config import settings
 
     backend_mode = (os.getenv("STORAGE_BACKEND") or getattr(settings, "STORAGE_BACKEND", "local") or "local").strip().lower()
-    doc_stmt = text("SELECT file_path FROM public.documents WHERE file_path IS NOT NULL;")
-    rows = session.execute(doc_stmt).fetchall()
+    session_info = getattr(session, "info", None)
+    info_org = session_info.get("current_org") if isinstance(session_info, dict) else None
+    info_org = str(info_org).strip() if info_org is not None and str(info_org).strip() else None
+
+    guc_org = None
+    try:
+        guc_org = (session.execute(text("SELECT NULLIF(current_setting('app.current_org', true), '');")).scalar() or "").strip() or None
+    except Exception:
+        guc_org = None
+
+    explicit_org = None
+    if org_id is not None:
+        explicit_org = _validate_storage_segment(str(org_id), "org_id")
+
+    bound_org = guc_org or info_org
+    if bound_org:
+        bound_org = _validate_storage_segment(bound_org, "org_id")
+    if explicit_org and bound_org and explicit_org != bound_org:
+        raise StorageError(
+            f"TENANT_STORAGE_ISOLATION_VIOLATION: Explicit org_id '{explicit_org}' conflicts with active tenant session '{bound_org}'."
+        )
+
+    scoped_org = explicit_org or bound_org
+
+    db_role = None
+    try:
+        db_role = session.execute(text("SELECT current_user;")).scalar()
+    except Exception:
+        pass
+    if db_role and (str(db_role) == "app_service_user" or str(db_role).startswith("worker_service_user")) and not scoped_org:
+        raise StorageError(
+            "TENANT_SCOPE_REQUIRED: RLS-restricted orphan reconciliation requires explicit org_id scoping to prevent cross-tenant deletion."
+        )
+
+    if scoped_org:
+        doc_stmt = text("SELECT file_path FROM public.documents WHERE org_id = :org AND file_path IS NOT NULL;")
+        rows = session.execute(doc_stmt, {"org": scoped_org}).fetchall()
+    else:
+        doc_stmt = text("SELECT file_path FROM public.documents WHERE file_path IS NOT NULL;")
+        rows = session.execute(doc_stmt).fetchall()
 
     now = time.time()
     scanned_count = 0
@@ -254,9 +347,14 @@ def reconcile_storage_orphans(
         active_uris = {str(r[0]).strip() for r in rows if r[0] and is_s3_uri(r[0])}
         s3_client = _get_s3_client()
         paginator = s3_client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket):
+        page_kwargs: Dict[str, Any] = {"Bucket": bucket}
+        if scoped_org:
+            page_kwargs["Prefix"] = f"{scoped_org}/"
+        for page in paginator.paginate(**page_kwargs):
             for obj in page.get("Contents", []) or []:
                 key = obj["Key"]
+                if scoped_org and not key.startswith(f"{scoped_org}/"):
+                    continue
                 uri = f"s3://{bucket}/{key}"
                 scanned_count += 1
                 if uri in active_uris:
@@ -280,29 +378,39 @@ def reconcile_storage_orphans(
         }
 
     effective_base_dir = base_dir or (os.getenv("STORAGE_LOCAL_ROOT") or getattr(settings, "STORAGE_LOCAL_ROOT", "storage") or "storage")
-    if not os.path.exists(effective_base_dir):
+    if scoped_org:
+        org_subdir = os.path.join(effective_base_dir, scoped_org)
+        if os.path.isdir(org_subdir) or base_dir is None:
+            scan_dir = org_subdir
+        else:
+            scan_dir = effective_base_dir
+    else:
+        scan_dir = effective_base_dir
+    if not os.path.exists(scan_dir):
         return {
             "scanned_files": 0,
             "active_db_files": 0,
             "in_flight_files": 0,
             "orphaned_files_deleted": 0,
             "reclaimed_bytes": 0,
-            "deleted_file_paths": []
+            "deleted_file_paths": [],
         }
 
     active_paths = {
-        os.path.normcase(os.path.abspath(r[0]))
+        os.path.normcase(os.path.realpath(r[0]))
         for r in rows
         if r[0] and not is_s3_uri(r[0])
     }
 
-    for root, dirs, files in os.walk(effective_base_dir):
+    for root, dirs, files in os.walk(scan_dir, topdown=True):
+        if scoped_org:
+            dirs[:] = [d for d in dirs if not (_is_uuid_segment(d) and d.lower() != scoped_org.lower())]
         for f in files:
             if f == ".gitkeep":
                 continue
             scanned_count += 1
             full_path = os.path.join(root, f)
-            norm_path = os.path.normcase(os.path.abspath(full_path))
+            norm_path = os.path.normcase(os.path.realpath(full_path))
 
             if norm_path in active_paths:
                 continue
@@ -327,5 +435,5 @@ def reconcile_storage_orphans(
         "in_flight_files": in_flight_count,
         "orphaned_files_deleted": orphan_count,
         "reclaimed_bytes": reclaimed_bytes,
-        "deleted_file_paths": deleted_files
+        "deleted_file_paths": deleted_files,
     }

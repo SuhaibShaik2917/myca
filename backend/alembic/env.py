@@ -16,13 +16,27 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-# Dynamic database URL override from DB_ADMIN_URL or DATABASE_URL
-env_db_url = os.environ.get("DB_ADMIN_URL") or os.environ.get("DATABASE_URL")
+# Dynamic database URL override honoring MIGRATION_DATABASE_URL -> DB_ADMIN_URL -> DATABASE_ADMIN_URL -> DATABASE_URL
+env_db_url = (
+    os.environ.get("MIGRATION_DATABASE_URL")
+    or os.environ.get("DB_ADMIN_URL")
+    or os.environ.get("DATABASE_ADMIN_URL")
+    or os.environ.get("DATABASE_URL")
+)
 if env_db_url:
-    cleaned_url = env_db_url
-    if cleaned_url.startswith("postgresql+psycopg://"):
-        cleaned_url = cleaned_url.replace("postgresql+psycopg://", "postgresql://")
+    cleaned_url = env_db_url.strip()
+    if cleaned_url.startswith("postgres://"):
+        cleaned_url = "postgresql+psycopg://" + cleaned_url[len("postgres://"):]
+    elif cleaned_url.startswith("postgresql://"):
+        cleaned_url = "postgresql+psycopg://" + cleaned_url[len("postgresql://"):]
     config.set_main_option("sqlalchemy.url", cleaned_url)
+else:
+    cfg_url = config.get_main_option("sqlalchemy.url") or ""
+    if cfg_url.startswith("postgres://"):
+        config.set_main_option("sqlalchemy.url", "postgresql+psycopg://" + cfg_url[len("postgres://"):])
+    elif cfg_url.startswith("postgresql://"):
+        config.set_main_option("sqlalchemy.url", "postgresql+psycopg://" + cfg_url[len("postgresql://"):])
+
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
@@ -37,6 +51,7 @@ def run_migrations_offline() -> None:
 
     with context.begin_transaction():
         context.run_migrations()
+
 
 def run_migrations_online() -> None:
     connectable = engine_from_config(
@@ -55,6 +70,7 @@ def run_migrations_online() -> None:
 
         with context.begin_transaction():
             context.run_migrations()
+
 
 if context.is_offline_mode():
     run_migrations_offline()

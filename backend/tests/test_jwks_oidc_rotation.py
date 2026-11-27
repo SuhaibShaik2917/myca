@@ -452,6 +452,63 @@ def test_oidc_authorization_code_pkce_end_to_end_and_security_failures(monkeypat
         )
         assert r_replay.status_code == 401
 
+        # Negative 4: Legacy direct ID-token endpoint /idp-exchange is permanently retired (410 Gone)
+        r_retired = client.post(
+            "/api/v1/auth/idp-exchange",
+            json={
+                "idp_provider": "google",
+                "idp_token": id_token,
+                "org_id": org_id,
+                "state": state,
+                "code_verifier": verifier,
+            },
+        )
+        assert r_retired.status_code == 410
+        assert "IDP_EXCHANGE_RETIRED" in r_retired.json()["detail"]
+
+        # Negative 5: End-to-end wrong issuer, wrong audience, HS256 alg confusion, and missing nonce via /idp-code-exchange
+        for bad_label, extra_claims, bad_alg in (
+            ("wrong_iss", {"iss": "https://evil.example.org", "email": email, "email_verified": True}, "RS256"),
+            ("wrong_aud", {"aud": "other-client", "email": email, "email_verified": True}, "RS256"),
+            ("missing_nonce", {"nonce": None, "email": email, "email_verified": True}, "RS256"),
+        ):
+            st_neg = secrets.token_urlsafe(24)
+            ver_neg = secrets.token_urlsafe(48)
+            chal_neg = base64.urlsafe_b64encode(hashlib.sha256(ver_neg.encode("ascii")).digest()).decode("ascii").rstrip("=")
+            nr = client.post(
+                "/api/v1/auth/idp-nonce",
+                json={"org_id": org_id, "idp_provider": "google", "state": st_neg, "code_challenge": chal_neg},
+            )
+            assert nr.status_code == 200
+            nonce_neg = nr.json()["nonce"]
+            code_neg = f"code_{bad_label}_{secrets.token_urlsafe(8)}"
+            merged_extra = {"nonce": nonce_neg, **extra_claims}
+            tok_neg = _sign_idp_jwt(
+                priv,
+                "code-k1",
+                iss=merged_extra.pop("iss", srv.discovery_issuer),
+                aud=merged_extra.pop("aud", "myca-web-client"),
+                alg=bad_alg,
+                extra=merged_extra,
+            )
+            srv.issued_codes[code_neg] = {
+                "code_challenge": chal_neg,
+                "redirect_uri": redirect_uri,
+                "id_token": tok_neg,
+            }
+            r_neg = client.post(
+                "/api/v1/auth/idp-code-exchange",
+                json={
+                    "idp_provider": "google",
+                    "org_id": org_id,
+                    "code": code_neg,
+                    "state": st_neg,
+                    "code_verifier": ver_neg,
+                    "redirect_uri": redirect_uri,
+                },
+            )
+            assert r_neg.status_code == 401, f"{bad_label} expected 401, got {r_neg.status_code}: {r_neg.text}"
+
     # Cleanup DB records
     admin_db = get_admin_session()
     try:

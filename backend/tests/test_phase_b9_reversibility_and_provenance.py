@@ -1157,7 +1157,7 @@ def _setup_concurrent_downgrade_case(prefix: str):
     env["ALLOW_DISPOSABLE_DATABASE_ROLLBACK"] = "true"
 
     backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    subprocess.run(["python", "-m", "alembic", "upgrade", "head"], cwd=backend_dir, env=env, check=True)
+    subprocess.run(["python", "-m", "alembic", "upgrade", "0039_gstr3b_legacy_claim_meta"], cwd=backend_dir, env=env, check=True)
     e_db = create_engine(b9_admin_str)
 
     org_id = str(uuid.uuid4())

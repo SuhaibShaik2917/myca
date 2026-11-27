@@ -89,3 +89,33 @@ def dispatch_gstr3b_filing(
         checker_approved=checker_approved,
     )
     return arn, cin, filing_date_iso, payload_hash, False
+
+
+def check_gstr3b_filing_status(gstin: str, tax_period: str, arn: str) -> Dict[str, Any]:
+    """Queries GSP gateway for return status (fails closed in live mode without provider transport)."""
+    cfg = resolve_gsp_config()
+    if cfg.mode == "live":
+        validate_live_gsp_credentials(cfg)
+        raise GSPIntegrationUnavailableError(
+            "GSP_LIVE_TRANSPORT_NOT_IMPLEMENTED: Live GSP status adapter is awaiting provider onboarding."
+        )
+    return {
+        "gstin": gstin,
+        "tax_period": tax_period,
+        "arn": arn,
+        "status": "FILED_SANDBOX",
+        "is_live_portal_filing": False,
+    }
+
+
+def download_gstr2b_json(gstin: str, tax_period: str) -> Dict[str, Any]:
+    """Downloads GSTR-2B JSON from GSP (fails closed in live/sandbox portal fetch without onboarding)."""
+    cfg = resolve_gsp_config()
+    if cfg.mode == "live":
+        validate_live_gsp_credentials(cfg)
+        raise GSPIntegrationUnavailableError(
+            "GSP_LIVE_TRANSPORT_NOT_IMPLEMENTED: Live GSP GSTR-2B pull adapter is awaiting provider onboarding."
+        )
+    raise GSPIntegrationUnavailableError(
+        "GSP_SANDBOX_PULL_NOT_SUPPORTED: Upload official GSTR-2B JSON/Excel statement via /reconciliation/gstr2b/upload."
+    )

@@ -426,160 +426,6 @@ def calculate_rule_37_interest(
         "dual_assessment": dual_assessment
     }
 
-    # 2. Evaluate from chronological ECL transaction ledger if provided (legacy interval walk)
-    if ecl_transactions:
-        min_txn_balance: Optional[Decimal] = None
-        first_dip_date: Optional[date] = None
-
-        for txn in ecl_transactions:
-            t_dt_raw = txn.get("date") or txn.get("transaction_date")
-            if isinstance(t_dt_raw, str):
-                t_dt = datetime.strptime(t_dt_raw[:10], "%Y-%m-%d").date()
-            elif isinstance(t_dt_raw, date):
-                t_dt = t_dt_raw
-            else:
-                t_dt = None
-
-            b_igst = Decimal(str(txn.get("balance_igst") or 0))
-            b_cgst = Decimal(str(txn.get("balance_cgst") or 0))
-            b_sgst = Decimal(str(txn.get("balance_sgst") or 0))
-            b_cess = Decimal(str(txn.get("balance_cess") or 0))
-
-            if t_head == "IGST":
-                txn_rel = b_igst + b_cgst + b_sgst  # Circular 192: Cess strictly excluded
-            elif t_head == "CGST":
-                txn_rel = b_cgst + b_igst
-            elif t_head == "SGST":
-                txn_rel = b_sgst + b_igst
-            elif t_head == "CESS":
-                txn_rel = b_cess
-            else:
-                txn_rel = b_igst + b_cgst + b_sgst
-
-            if min_txn_balance is None or txn_rel < min_txn_balance:
-                min_txn_balance = txn_rel
-
-            if txn_rel < rev_tax and first_dip_date is None:
-                first_dip_date = t_dt
-
-        relevant_ecl = min_txn_balance
-        if computed_u_date is None and first_dip_date is not None:
-            computed_u_date = first_dip_date
-
-    # 3. Evaluate from head balances snapshot if transactions not provided
-    elif ecl_head_balances:
-        b_igst = Decimal(str(ecl_head_balances.get("igst") or ecl_head_balances.get("IGST") or 0))
-        b_cgst = Decimal(str(ecl_head_balances.get("cgst") or ecl_head_balances.get("CGST") or 0))
-        b_sgst = Decimal(str(ecl_head_balances.get("sgst") or ecl_head_balances.get("SGST") or 0))
-        b_cess = Decimal(str(ecl_head_balances.get("cess") or ecl_head_balances.get("CESS") or 0))
-
-        if t_head == "IGST":
-            relevant_ecl = b_igst + b_cgst + b_sgst
-        elif t_head == "CGST":
-            relevant_ecl = b_cgst + b_igst
-        elif t_head == "SGST":
-            relevant_ecl = b_sgst + b_igst
-        elif t_head == "CESS":
-            relevant_ecl = b_cess
-        else:
-            relevant_ecl = b_igst + b_cgst + b_sgst
-
-    # 4. Direct minimum balance fallback
-    elif ecl_minimum_balance is not None:
-        relevant_ecl = Decimal(str(ecl_minimum_balance))
-        relevant_ecl = Decimal(str(ecl_minimum_balance))
-
-    # Determine statutory basis string
-    if t_head == "IGST":
-        statutory_basis = "Section 50(3) read with Rule 88B(3) and CBIC Circular No. 192/04/2023-GST"
-    else:
-        statutory_basis = "Section 50(3) read with Rule 88B(3)"
-
-    # When relevant ECL balance >= reversal_tax: NEVER utilised -> Nil interest
-    if relevant_ecl is not None and relevant_ecl >= rev_tax:
-        if t_head == "IGST":
-            reason = (
-                f"Combined ECL minimum balance across IGST+CGST+SGST (₹{relevant_ecl:,.2f}, excluding Cess) "
-                f">= wrongly availed IGST (₹{rev_tax:,.2f}). Per CBIC Circular 192/04/2023-GST, credit was "
-                f"never utilised. Statutory interest under Section 50(3) is Nil (₹0.00)."
-            )
-        else:
-            reason = (
-                f"ECL relevant minimum balance (₹{relevant_ecl:,.2f}) >= reversal amount (₹{rev_tax:,.2f}). "
-                f"Wrongly availed ITC was never utilised. Statutory interest under Section 50(3) is Nil (₹0.00)."
-            )
-
-        return {
-            "reversal_tax": rev_tax,
-            "ecl_minimum_balance": ecl_minimum_balance if ecl_minimum_balance is not None else relevant_ecl,
-            "relevant_ecl_balance": relevant_ecl,
-            "tax_head": t_head,
-            "cess_excluded": cess_excluded,
-            "utilised_amount": Decimal("0.00"),
-            "utilized_amount": Decimal("0.00"),
-            "utilisation_date": None,
-            "reversal_date": rev_dt,
-            "days_utilised": 0,
-            "interest_rate_pct": rate,
-            "interest_amount": Decimal("0.00"),
-            "is_utilised": False,
-            "statutory_basis": statutory_basis,
-            "explanation": reason,
-            "source_ecl_transactions": ecl_transactions,
-            "dual_assessment": dual_assessment
-        }
-
-    # When utilised or ECL balance fell below reversal amount
-    min_bal = max(Decimal("0.00"), relevant_ecl) if relevant_ecl is not None else Decimal("0.00")
-    utilised = (rev_tax - min_bal).quantize(Decimal("0.01"))
-
-    if computed_u_date and rev_dt > computed_u_date:
-        days = (rev_dt - computed_u_date).days
-    else:
-        days = 0
-
-    if days > 0 and utilised > Decimal("0.00"):
-        interest = (utilised * (rate / Decimal("100.00")) * Decimal(days) / Decimal("365")).quantize(Decimal("0.01"))
-    else:
-        interest = Decimal("0.00")
-
-    if t_head == "IGST":
-        exp = (
-            f"Combined ECL balance (IGST+CGST+SGST, excluding Cess) fell to ₹{min_bal:,.2f}, resulting in "
-            f"statutory credit utilisation of ₹{utilised:,.2f} for {days} days ({computed_u_date} to {rev_dt}) "
-            f"at {rate}% p.a. per Rule 88B(3) and CBIC Circular 192/04/2023-GST."
-        )
-    else:
-        exp = (
-            f"Relevant ECL balance fell to ₹{min_bal:,.2f}, resulting in actual credit utilisation of ₹{utilised:,.2f} "
-            f"for {days} days ({computed_u_date} to {rev_dt}) at {rate}% p.a. under Section 50(3)."
-        )
-
-    if dual_assessment:
-        dual_assessment["computations"]["basis_a_rule_88b_3_utilized"]["interest_amount"] = interest
-        dual_assessment["computations"]["basis_a_rule_88b_3_utilized"]["days_utilized"] = days
-        dual_assessment["computations"]["basis_a_rule_88b_3_utilized"]["utilized_shortfall"] = utilised
-
-    return {
-        "reversal_tax": rev_tax,
-        "ecl_minimum_balance": ecl_minimum_balance if ecl_minimum_balance is not None else relevant_ecl,
-        "relevant_ecl_balance": relevant_ecl,
-        "tax_head": t_head,
-        "cess_excluded": cess_excluded,
-        "utilised_amount": utilised,
-        "utilized_amount": utilised,
-        "utilisation_date": computed_u_date,
-        "reversal_date": rev_dt,
-        "days_utilised": days,
-        "interest_rate_pct": rate,
-        "interest_amount": interest,
-        "is_utilised": utilised > Decimal("0.00"),
-        "statutory_basis": statutory_basis,
-        "explanation": exp,
-        "source_ecl_transactions": ecl_transactions,
-        "dual_assessment": dual_assessment
-    }
-
 
 def simulate_sequential_ecl_cross_utilization(
     opening_balances: Optional[Dict[str, Any]] = None,
@@ -686,8 +532,8 @@ def simulate_sequential_ecl_cross_utilization(
             rem_igst_bal -= igst_used_for_cgst
             rem_cgst_liab -= igst_used_for_cgst
         elif isinstance(offset_order, dict):
-            cgst_req = Decimal(str(igst_offset_order.get("cgst") or 0))
-            sgst_req = Decimal(str(igst_offset_order.get("sgst") or 0))
+            cgst_req = Decimal(str(offset_order.get("cgst") or offset_order.get("CGST") or 0))
+            sgst_req = Decimal(str(offset_order.get("sgst") or offset_order.get("SGST") or 0))
             igst_used_for_cgst = min(min(rem_igst_bal, cgst_req), rem_cgst_liab)
             rem_igst_bal -= igst_used_for_cgst
             rem_cgst_liab -= igst_used_for_cgst
@@ -2694,7 +2540,26 @@ class StatutoryITCRiskEngine:
         # 2. Section 16(2)(b): Receipt of Goods or Services Evidence
         # -------------------------------------------------------------
         goods_receipt_date = purchase_doc.get("goods_receipt_date")
-        if not goods_receipt_date:
+        service_completion_date = purchase_doc.get("service_completion_date")
+        service_cert = purchase_doc.get("service_acceptance_cert_ref")
+        rec_status_norm = str(purchase_doc.get("receipt_status") or "").strip().upper()
+        srv_type_norm = str(purchase_doc.get("goods_services_type") or "goods").strip().lower()
+        tot_lots_exp = int(purchase_doc.get("total_lots_expected") or 1)
+        last_lot_ok = bool(purchase_doc.get("is_last_lot_received", False))
+
+        partial_lots_pending = (rec_status_norm == "PARTIALLY_RECEIVED") or (tot_lots_exp > 1 and not last_lot_ok)
+        has_goods_evidence = bool(goods_receipt_date)
+        has_service_evidence = bool(service_completion_date and (service_cert or rec_status_norm == "RECEIVED"))
+        has_deemed_evidence = (rec_status_norm == "DEEMED_RECEIVED" and bool(purchase_doc.get("deemed_receipt_reason")))
+
+        receipt_ok = False
+        if not partial_lots_pending and rec_status_norm not in ("NOT_RECEIVED", "UNKNOWN"):
+            if srv_type_norm == "services":
+                receipt_ok = has_service_evidence or has_goods_evidence or has_deemed_evidence
+            else:
+                receipt_ok = has_goods_evidence or has_deemed_evidence
+
+        if not receipt_ok:
             assessments.append(ITCAssessmentOut(
                 purchase_doc_id=p_id,
                 gstr2b_doc_id=g_id,
@@ -2703,8 +2568,12 @@ class StatutoryITCRiskEngine:
                 eligibility_status=ITCEligibilityEnum.PENDING_GOODS_OR_SERVICE_RECEIPT,
                 potential_itc=total_tax,
                 risk_reversal_amount=Decimal("0.00"),
-                findings_explanation="Goods Receipt Note (GRN) or proof of delivery is pending.",
-                missing_evidence_required="Attach Good Receipt Note, delivery challan, or service completion sign-off.",
+                findings_explanation=(
+                    "Section 16(2)(b) First Proviso: Goods received in instalments awaiting final lot."
+                    if partial_lots_pending
+                    else "Goods Receipt Note (GRN), service completion certificate, or deemed receipt proof is pending."
+                ),
+                missing_evidence_required="Attach Good Receipt Note, delivery challan, final lot receipt, or service completion sign-off.",
                 evaluation_date=str(eval_dt)
             ))
 
@@ -2752,9 +2621,10 @@ class StatutoryITCRiskEngine:
 
         # Rule 37 applies only to forward charge supplies and where ITC was availed in GSTR-3B
         is_availed_in_3b = purchase_doc.get("is_availed_in_3b")
+        day_181 = p_date + timedelta(days=181)
         if is_availed_in_3b is False:
             logger.debug("Purchase doc %s not availed in GSTR-3B; Rule 37 reversal not triggered.", p_id)
-        elif not is_reverse_charge and days_elapsed > 180 and unpaid > Decimal("0.00"):
+        elif not is_reverse_charge and eval_dt >= day_181 and unpaid > Decimal("0.00"):
             # Proportionate reversal
             prop_ratio = unpaid / total_inv_val if total_inv_val > 0 else Decimal("1.00")
             reversal_tax = (total_tax * prop_ratio).quantize(Decimal("0.01"))
@@ -3065,6 +2935,68 @@ class StatutoryITCRiskEngine:
                         risk_reversal_amount=line_tax,
                         findings_explanation="Goods or services for personal consumption or gifts are blocked under Section 17(5)(g)." + (f" (Line allocated tax: ₹{line_tax})" if len(items) > 1 else ""),
                         missing_evidence_required="Proof of direct business nexus.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                continue
+
+            # Health / Fitness / Club Membership 17(5)(b)(ii) & Travel Benefits 17(5)(b)(iii)
+            elif any(k in item_desc for k in ["club membership", "health club", "fitness centre", "beauty treatment", "cosmetic surgery", "leave travel", "holiday home"]):
+                rule_c = "SEC_17_5_CLUB_TRAVEL"
+                sec_lbl = "Section 17(5)(b)"
+                if is_alloc_uncertain:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code=rule_c,
+                        statutory_section=sec_lbl,
+                        eligibility_status=ITCEligibilityEnum.REVIEW_REQUIRED,
+                        potential_itc=total_tax,
+                        risk_reversal_amount=Decimal("0.00"),
+                        findings_explanation=f"Club membership, fitness, or employee leave travel benefits are blocked under Section 17(5)(b). Multi-line invoice contains {len(items)} items requiring proportional allocation review.",
+                        missing_evidence_required="Provide line-level tax breakdown and employer statutory obligation proof.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                else:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code=rule_c,
+                        statutory_section=sec_lbl,
+                        eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
+                        potential_itc=line_tax,
+                        risk_reversal_amount=line_tax,
+                        findings_explanation="Club membership, health/fitness, or employee travel benefit blocked under Section 17(5)(b)(ii)/(iii)." + (f" (Line allocated tax: ₹{line_tax})" if len(items) > 1 else ""),
+                        missing_evidence_required="Provide proof of statutory employer obligation or identical taxable outward supply.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                continue
+
+            # Immovable Property Construction Own Account 17(5)(d) & Lost/Stolen/Free Samples 17(5)(h)
+            elif any(k in item_desc for k in ["free sample", "goods lost", "stolen goods", "destroyed goods", "written off", "gift sample"]):
+                if is_alloc_uncertain:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="SEC_17_5_LOST_SAMPLE",
+                        statutory_section="Section 17(5)(h)",
+                        eligibility_status=ITCEligibilityEnum.REVIEW_REQUIRED,
+                        potential_itc=total_tax,
+                        risk_reversal_amount=Decimal("0.00"),
+                        findings_explanation=f"Goods lost, stolen, destroyed, written off, or distributed as free samples are blocked under Section 17(5)(h). Multi-line allocation review required.",
+                        missing_evidence_required="Provide itemized disposal/write-off valuation.",
+                        evaluation_date=str(eval_dt)
+                    ))
+                else:
+                    assessments.append(ITCAssessmentOut(
+                        purchase_doc_id=p_id,
+                        gstr2b_doc_id=g_id,
+                        rule_code="SEC_17_5_LOST_SAMPLE",
+                        statutory_section="Section 17(5)(h)",
+                        eligibility_status=ITCEligibilityEnum.BLOCKED_CREDIT_INDICATOR,
+                        potential_itc=line_tax,
+                        risk_reversal_amount=line_tax,
+                        findings_explanation="Goods lost, stolen, destroyed, written off, or distributed as free samples blocked under Section 17(5)(h)." + (f" (Line allocated tax: ₹{line_tax})" if len(items) > 1 else ""),
+                        missing_evidence_required="Reversal entry in Table 4(B)(1) required.",
                         evaluation_date=str(eval_dt)
                     ))
                 continue

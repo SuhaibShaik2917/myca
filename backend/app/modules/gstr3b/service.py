@@ -238,27 +238,70 @@ def prepare_gstr3b_return(
                 f"Cannot re-prepare return in unrecognized status '{status}'."
             )
 
-    # 2. Compute Table 3.1 Outward Taxable Supplies from approved invoices
-    # Matches tax_period e.g. '2026-11'
+    # 2. Compute Table 3.1 Outward Taxable Supplies from approved invoices scoped to registration GSTIN
+    # Matches tax_period e.g. '2026-11', segregates supply categories, and subtracts credit notes.
     inv_rows = session.execute(
         text("""
-        SELECT 
-            COALESCE(SUM(total_taxable_amount), 0.00) as taxable,
-            COALESCE(SUM(igst_amount), 0.00) as igst,
-            COALESCE(SUM(cgst_amount), 0.00) as cgst,
-            COALESCE(SUM(sgst_amount), 0.00) as sgst
-        FROM public.invoices
-        WHERE org_id = :org 
-          AND status = 'approved'
-          AND TO_CHAR(invoice_date, 'YYYY-MM') = :period;
+        SELECT
+            i.supply_category,
+            i.is_sez_supply,
+            i.is_reverse_charge,
+            i.document_type,
+            COALESCE(i.total_taxable_amount, 0.00) as taxable,
+            COALESCE(i.igst_amount, 0.00) as igst,
+            COALESCE(i.cgst_amount, 0.00) as cgst,
+            COALESCE(i.sgst_amount, 0.00) as sgst
+        FROM public.invoices i
+        LEFT JOIN public.business_profiles p ON i.profile_id = p.id AND i.org_id = p.org_id
+        WHERE i.org_id = :org
+          AND i.status = 'approved'
+          AND TO_CHAR(i.invoice_date, 'YYYY-MM') = :period
+          AND (
+              UPPER(TRIM(p.gstin)) = UPPER(TRIM(:gstin))
+              OR (
+                  p.gstin IS NULL
+                  AND (
+                      CAST(i.profile_id AS text) = CAST(:reg AS text)
+                      OR NOT EXISTS (
+                          SELECT 1 FROM public.gst_registrations g2
+                          WHERE g2.org_id = :org AND g2.id <> CAST(:reg AS uuid)
+                      )
+                  )
+              )
+          );
         """),
-        {"org": org_id, "period": tax_period}
-    ).fetchone()
+        {"org": org_id, "period": tax_period, "gstin": gstin, "reg": registration_id}
+    ).fetchall()
 
-    taxable_outward = Decimal(str(inv_rows.taxable))
-    igst_outward = Decimal(str(inv_rows.igst))
-    cgst_outward = Decimal(str(inv_rows.cgst))
-    sgst_outward = Decimal(str(inv_rows.sgst))
+    taxable_outward = Decimal("0.00")
+    igst_outward = Decimal("0.00")
+    cgst_outward = Decimal("0.00")
+    sgst_outward = Decimal("0.00")
+    b_taxable = Decimal("0.00")
+    b_igst = Decimal("0.00")
+    c_nil_exempt = Decimal("0.00")
+
+    for row in inv_rows:
+        sup_cat = str(row.supply_category or "").strip().upper()
+        is_sez = bool(row.is_sez_supply)
+        is_rcm = bool(row.is_reverse_charge)
+        doc_type = str(row.document_type or "").strip().lower()
+        sign = Decimal("-1.00") if doc_type in ("credit_note", "revised_credit_note") else Decimal("1.00")
+        tx = sign * Decimal(str(row.taxable or 0))
+        ig = sign * Decimal(str(row.igst or 0))
+        cg = sign * Decimal(str(row.cgst or 0))
+        sg = sign * Decimal(str(row.sgst or 0))
+        if sup_cat == "NIL_EXEMPT":
+            c_nil_exempt += tx
+        elif is_sez or sup_cat in ("SEZ_WITH_PAYMENT", "SEZ_WITHOUT_PAYMENT", "ZERO_RATED", "EXPORT_WITH_PAYMENT", "EXPORT_WITHOUT_PAYMENT"):
+            b_taxable += tx
+            b_igst += ig
+        elif not is_rcm and sup_cat != "B2B_REVERSE_CHARGE":
+            taxable_outward += tx
+            igst_outward += ig
+            cgst_outward += cg
+            sgst_outward += sg
+
     total_tax_outward = igst_outward + cgst_outward + sgst_outward
 
     # Inward RCM supplies (attracting reverse charge where buyer is liable)
@@ -286,7 +329,7 @@ def prepare_gstr3b_return(
     cess_rcm = Decimal(str(rcm_rows.cess))
 
     # Total Table 3.1 Tax Liability
-    tot_igst_liab = igst_outward + igst_rcm
+    tot_igst_liab = igst_outward + b_igst + igst_rcm
     tot_cgst_liab = cgst_outward + cgst_rcm
     tot_sgst_liab = sgst_outward + sgst_rcm
     tot_cess_liab = cess_rcm
@@ -300,6 +343,15 @@ def prepare_gstr3b_return(
             cess=Decimal("0.00"),
             total=total_tax_outward
         ),
+        b_zero_rated=TaxBreakdown(
+            taxable_value=b_taxable,
+            igst=b_igst,
+            cgst=Decimal("0.00"),
+            sgst=Decimal("0.00"),
+            cess=Decimal("0.00"),
+            total=b_igst
+        ),
+        c_other_nil_exempt=c_nil_exempt,
         d_inward_rcm=TaxBreakdown(
             taxable_value=taxable_rcm,
             igst=igst_rcm,
@@ -309,7 +361,7 @@ def prepare_gstr3b_return(
             total=igst_rcm + cgst_rcm + sgst_rcm + cess_rcm
         ),
         total_tax_payable=TaxBreakdown(
-            taxable_value=taxable_outward + taxable_rcm,
+            taxable_value=taxable_outward + b_taxable + taxable_rcm,
             igst=tot_igst_liab,
             cgst=tot_cgst_liab,
             sgst=tot_sgst_liab,
@@ -318,8 +370,19 @@ def prepare_gstr3b_return(
         )
     )
 
-    # 3. Compute Table 4 Inward ITC from Purchase Register and ITC Ledger
-    # Query approved, non-reversed purchase documents for this period
+    # 3. Compute Table 4 Inward ITC from reconciled GSTR-2B snapshot (if supplied) or Purchase Register & ITC Ledger
+    if snapshot_id:
+        snap_exists = session.execute(
+            text("""
+            SELECT id FROM public.gstr2b_snapshots
+            WHERE id = :sid AND org_id = :org AND registration_id = :reg;
+            """),
+            {"sid": snapshot_id, "org": org_id, "reg": registration_id},
+        ).fetchone()
+        if not snap_exists:
+            session.rollback()
+            raise GSTR3BServiceError(f"GSTR-2B snapshot {snapshot_id} not found for this registration.")
+
     pur_rows = session.execute(
         text("""
         SELECT 
@@ -333,7 +396,7 @@ def prepare_gstr3b_return(
           AND registration_id = :reg
           AND financial_period = :period
           AND status = 'approved'
-          AND receipt_status = 'RECEIVED';
+          AND receipt_status IN ('RECEIVED', 'DEEMED_RECEIVED');
         """),
         {"org": org_id, "reg": registration_id, "period": tax_period}
     ).fetchone()
@@ -343,20 +406,22 @@ def prepare_gstr3b_return(
     avail_sgst = Decimal(str(pur_rows.sgst))
     avail_cess = Decimal(str(pur_rows.cess))
 
-    # Query reversals for this period from itc_ledger_entries
+    # Query reversals for this registration & period from itc_ledger_entries
     rev_rows = session.execute(
         text("""
         SELECT 
-            COALESCE(SUM(igst_amount), 0.00) as igst,
-            COALESCE(SUM(cgst_amount), 0.00) as cgst,
-            COALESCE(SUM(sgst_amount), 0.00) as sgst,
-            COALESCE(SUM(cess_amount), 0.00) as cess
-        FROM public.itc_ledger_entries
-        WHERE org_id = :org
-          AND tax_period = :period
-          AND event_type LIKE 'REVERSAL_%';
+            COALESCE(SUM(e.igst_amount), 0.00) as igst,
+            COALESCE(SUM(e.cgst_amount), 0.00) as cgst,
+            COALESCE(SUM(e.sgst_amount), 0.00) as sgst,
+            COALESCE(SUM(e.cess_amount), 0.00) as cess
+        FROM public.itc_ledger_entries e
+        JOIN public.purchase_documents p ON e.purchase_doc_id = p.id AND e.org_id = p.org_id
+        WHERE e.org_id = :org
+          AND p.registration_id = :reg
+          AND e.tax_period = :period
+          AND e.event_type LIKE 'REVERSAL_%';
         """),
-        {"org": org_id, "period": tax_period}
+        {"org": org_id, "reg": registration_id, "period": tax_period}
     ).fetchone()
 
     rev_igst = Decimal(str(rev_rows.igst))
@@ -395,10 +460,37 @@ def prepare_gstr3b_return(
     )
 
     # 4. Compute Legal Offset under Section 49, 49A, 49B & Rule 88A
+    # Statutory Invariant (Sec 49(4)): Table 3.1(d) Inward RCM CANNOT be offset via ITC; must be paid in CASH (PMT-06).
+    outward_taxable_liability = TaxBreakdown(
+        taxable_value=t31.a_taxable_supplies.taxable_value + t31.b_zero_rated.taxable_value,
+        igst=t31.a_taxable_supplies.igst + t31.b_zero_rated.igst,
+        cgst=t31.a_taxable_supplies.cgst,
+        sgst=t31.a_taxable_supplies.sgst,
+        cess=Decimal("0.00"),
+        total=t31.a_taxable_supplies.total + t31.b_zero_rated.total,
+    )
     offset = compute_statutory_tax_offset(
-        liability=t31.total_tax_payable,
+        liability=outward_taxable_liability,
         credit=t4.c_net_itc
     )
+    if (igst_rcm + cgst_rcm + sgst_rcm + cess_rcm) > Decimal("0.00"):
+        offset.igst.liability_before = (offset.igst.liability_before + igst_rcm).quantize(Decimal("0.01"))
+        offset.igst.remaining_liability = (offset.igst.remaining_liability + igst_rcm).quantize(Decimal("0.01"))
+        offset.igst.challan_required = (offset.igst.challan_required + igst_rcm).quantize(Decimal("0.01"))
+        offset.cgst.liability_before = (offset.cgst.liability_before + cgst_rcm).quantize(Decimal("0.01"))
+        offset.cgst.remaining_liability = (offset.cgst.remaining_liability + cgst_rcm).quantize(Decimal("0.01"))
+        offset.cgst.challan_required = (offset.cgst.challan_required + cgst_rcm).quantize(Decimal("0.01"))
+        offset.sgst.liability_before = (offset.sgst.liability_before + sgst_rcm).quantize(Decimal("0.01"))
+        offset.sgst.remaining_liability = (offset.sgst.remaining_liability + sgst_rcm).quantize(Decimal("0.01"))
+        offset.sgst.challan_required = (offset.sgst.challan_required + sgst_rcm).quantize(Decimal("0.01"))
+        offset.cess.liability_before = (offset.cess.liability_before + cess_rcm).quantize(Decimal("0.01"))
+        offset.cess.remaining_liability = (offset.cess.remaining_liability + cess_rcm).quantize(Decimal("0.01"))
+        offset.cess.challan_required = (offset.cess.challan_required + cess_rcm).quantize(Decimal("0.01"))
+        rcm_tot = (igst_rcm + cgst_rcm + sgst_rcm + cess_rcm).quantize(Decimal("0.01"))
+        offset.total_challan_required = (offset.total_challan_required + rcm_tot).quantize(Decimal("0.01"))
+        offset.statutory_ordering_audit.append(
+            f"Section 49(4) RCM Gate: Table 3.1(d) inward reverse charge tax ₹{rcm_tot:,.2f} excluded from ITC credit offset and routed strictly to Electronic Cash Ledger (PMT-06)."
+        )
 
     # 5. Upsert into public.gstr3b_filings via restricted SECURITY DEFINER creation function
     filing_id = str(existing_filing.id) if existing_filing else str(uuid.uuid4())
@@ -741,7 +833,10 @@ def file_gstr3b_to_gsp_sandbox(
     except GSPSandboxFilingError as e:
         raise GSTR3BServiceError(str(e))
 
-    # Update filing record through restricted SECURITY DEFINER filing transition
+    filing_mode = "LIVE_PORTAL" if is_live_portal_filing else "SANDBOX"
+    gsp_ref_id = arn if is_live_portal_filing else f"SANDBOX-{arn}"
+
+    # Update filing record through restricted SECURITY DEFINER filing transition v2 (migration 0040)
     nonce = secrets.token_hex(24)
     signature = _sign_gstr3b_filing_attestation(
         org_id=str(org_id),
@@ -754,7 +849,7 @@ def file_gstr3b_to_gsp_sandbox(
     )
     session.execute(
         text("""
-        SELECT public.execute_gstr3b_filing_transition(
+        SELECT public.execute_gstr3b_filing_transition_v2(
             CAST(:org_id AS uuid),
             CAST(:id AS uuid),
             CAST(:actor_id AS uuid),
@@ -763,7 +858,9 @@ def file_gstr3b_to_gsp_sandbox(
             CAST(:fdate AS timestamptz),
             :phash,
             :nonce,
-            :sig
+            :sig,
+            :fmode,
+            :gsp_ref
         );
         """),
         {
@@ -776,30 +873,78 @@ def file_gstr3b_to_gsp_sandbox(
             "phash": payload_hash,
             "nonce": nonce,
             "sig": signature,
+            "fmode": filing_mode,
+            "gsp_ref": gsp_ref_id,
         }
     )
 
-    # Upsert public.gst_records for statutory compliance tracking
+    # Upsert public.gst_records with explicit filing_mode & lineage
     total_taxable = Decimal(str(filing.table_3_1_data.get("total_tax_payable", {}).get("taxable_value", 0)))
-    total_paid = Decimal(str(filing.offset_data.get("total_tax_paid_by_cash", 0))) + Decimal(str(filing.offset_data.get("total_tax_paid_by_credit", 0)))
+    total_paid = (
+        Decimal(str(filing.offset_data.get("total_tax_paid_by_cash", 0)))
+        + Decimal(str(filing.offset_data.get("total_tax_paid_by_credit", 0)))
+        + Decimal(str(filing.offset_data.get("total_challan_required", 0)))
+    )
     session.execute(
         text("""
         INSERT INTO public.gst_records (
-            id, org_id, gstin, return_type, tax_period, filing_status,
-            filing_date, total_taxable_value, total_tax_paid
+            id, org_id, registration_id, gstr3b_filing_id, gstin, return_type, tax_period,
+            filing_status, filing_date, total_taxable_value, total_tax_paid,
+            filing_mode, is_live_portal_filing, gsp_reference_id, arn
         ) VALUES (
-            gen_random_uuid(), :org, :gstin, 'GSTR-3B', :period, 'filed',
-            CURRENT_DATE, :taxable, :paid
+            gen_random_uuid(), :org, CAST(:reg_id AS uuid), CAST(:fid AS uuid), :gstin, 'GSTR-3B', :period,
+            'filed', CURRENT_DATE, :taxable, :paid,
+            :fmode, :is_live, :gsp_ref, :arn
         )
-        ON CONFLICT DO NOTHING;
+        ON CONFLICT (org_id, gstin, return_type, tax_period, filing_mode)
+        DO UPDATE SET
+            gstr3b_filing_id = EXCLUDED.gstr3b_filing_id,
+            filing_status = EXCLUDED.filing_status,
+            filing_date = EXCLUDED.filing_date,
+            total_taxable_value = EXCLUDED.total_taxable_value,
+            total_tax_paid = EXCLUDED.total_tax_paid,
+            is_live_portal_filing = EXCLUDED.is_live_portal_filing,
+            gsp_reference_id = EXCLUDED.gsp_reference_id,
+            arn = EXCLUDED.arn;
         """),
         {
             "org": org_id,
+            "reg_id": str(filing.registration_id),
+            "fid": str(filing_id),
             "gstin": filing.gstin,
             "period": filing.tax_period,
             "taxable": total_taxable,
-            "paid": total_paid
+            "paid": total_paid,
+            "fmode": filing_mode,
+            "is_live": is_live_portal_filing,
+            "gsp_ref": gsp_ref_id,
+            "arn": arn,
         }
+    )
+
+    # Atomically freeze IMS actions and active GSTR-2B snapshot for this registration + tax period
+    session.execute(
+        text("""
+        UPDATE public.ims_document_actions a
+        SET is_frozen_by_gstr3b = true,
+            gstr3b_filing_date = CAST(:fdate AS timestamptz),
+            updated_at = clock_timestamp()
+        FROM public.gstr2b_source_documents d
+        JOIN public.gstr2b_snapshots s ON d.snapshot_id = s.id AND d.org_id = s.org_id
+        WHERE a.gstr2b_doc_id = d.id AND a.org_id = :org_id
+          AND s.registration_id = CAST(:reg_id AS uuid) AND s.return_period = :period;
+        """),
+        {"org_id": str(org_id), "reg_id": str(filing.registration_id), "period": filing.tax_period, "fdate": filing_date_iso},
+    )
+    session.execute(
+        text("""
+        UPDATE public.gstr2b_snapshots
+        SET is_frozen = true,
+            filing_confirmation_arn = :arn,
+            filed_at = CAST(:fdate AS timestamptz)
+        WHERE org_id = :org_id AND registration_id = CAST(:reg_id AS uuid) AND return_period = :period AND is_active = true;
+        """),
+        {"org_id": str(org_id), "reg_id": str(filing.registration_id), "period": filing.tax_period, "arn": arn, "fdate": filing_date_iso},
     )
 
     session.commit()
@@ -818,6 +963,8 @@ def file_gstr3b_to_gsp_sandbox(
         maker_remarks=filing.maker_remarks,
         checker_remarks=filing.checker_remarks,
         is_live_portal_filing=is_live_portal_filing,
+        filing_mode=filing_mode,
+        gsp_reference_id=gsp_ref_id,
         disclaimer=GSTR3B_STATUTORY_DISCLAIMER
     )
 
@@ -886,6 +1033,9 @@ def get_gstr3b_status(
         "cin": row.cin,
         "filing_date": row.filing_date.isoformat() if row.filing_date else None,
         "payload_hash": row.payload_hash,
+        "filing_mode": getattr(row, "filing_mode", "SANDBOX") or "SANDBOX",
+        "is_live_portal_filing": bool(getattr(row, "is_live_portal_filing", False)),
+        "gsp_reference_id": getattr(row, "gsp_reference_id", None),
         "created_at": row.created_at.isoformat(),
         "updated_at": row.updated_at.isoformat(),
         "disclaimer": GSTR3B_STATUTORY_DISCLAIMER

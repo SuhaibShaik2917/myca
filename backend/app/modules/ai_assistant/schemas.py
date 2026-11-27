@@ -1,13 +1,13 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Literal
 from decimal import Decimal
 from pydantic import BaseModel, Field
 
 class ChatMessageIn(BaseModel):
-    role: str = Field(..., description="'user' or 'assistant'")
-    content: str = Field(..., description="Message text")
+    role: Literal["user", "assistant"] = Field(..., description="'user' or 'assistant'")
+    content: str = Field(..., min_length=1, max_length=8000, description="Message text")
 
 class ChatConversationIn(BaseModel):
-    messages: List[ChatMessageIn]
+    messages: List[ChatMessageIn] = Field(..., min_length=1, max_length=30)
     include_gst_grounding: bool = True
 
 class GroundingContextSummary(BaseModel):

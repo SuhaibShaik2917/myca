@@ -44,13 +44,16 @@ def get_tenant_grounding_context(
         {"org": org_id}
     ).fetchone()
 
-    latest_period = filing_row.tax_period if filing_row else "102025"
+    latest_period = filing_row.tax_period if filing_row else None
     net_tax = Decimal("0.00")
     if filing_row and filing_row.offset_data:
         try:
             offset_dict = filing_row.offset_data if isinstance(filing_row.offset_data, dict) else json.loads(filing_row.offset_data)
-            pmt = offset_dict.get("pmt06_cash_required") or {}
-            net_tax = Decimal(str(pmt.get("total", "0.00")))
+            if "total_challan_required" in offset_dict:
+                net_tax = Decimal(str(offset_dict.get("total_challan_required", "0.00")))
+            else:
+                pmt = offset_dict.get("pmt06_cash_required") or {}
+                net_tax = Decimal(str(pmt.get("total", "0.00"))) if isinstance(pmt, dict) else Decimal(str(pmt or "0.00"))
         except Exception:
             net_tax = Decimal("0.00")
 
@@ -76,7 +79,12 @@ def get_tenant_grounding_context(
 
     # 5. MSME Credit Readiness Score
     prof_row = session.execute(
-        text("SELECT credit_score FROM public.business_profiles WHERE org_id = :org;"),
+        text("""
+        SELECT credit_score FROM public.business_profiles
+        WHERE org_id = :org
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT 1;
+        """),
         {"org": org_id}
     ).fetchone()
     credit_score = prof_row.credit_score if prof_row and prof_row.credit_score else None
@@ -93,7 +101,7 @@ def get_tenant_grounding_context(
         """),
         {"org": org_id}
     ).fetchone()
-    top_scheme = scheme_match_row.name if scheme_match_row else "CGTMSE Collateral-Free Guarantee"
+    top_scheme = scheme_match_row.name if scheme_match_row else None
 
     statutory_citations = [
         "CGST Act Sec 16(2) — Four conditions for valid ITC entitlement",
@@ -150,16 +158,27 @@ def generate_quick_insights(
         ))
 
     # 3. Credit Readiness & Loan Scheme
-    score_display = ctx.msme_readiness_score if ctx.msme_readiness_score else 680
-    insights.append(QuickInsightOut(
-        id=f"ins-{uuid.uuid4().hex[:8]}",
-        category="Credit & Financing",
-        title=f"MSME Readiness Index: {score_display}/900",
-        summary=f"Your verified cash flow regularity and GST compliance unlock eligibility for {ctx.top_recommended_scheme}.",
-        statutory_reference="RBI MSME Priority Sector Lending Guidelines",
-        severity="success" if score_display >= 650 else "info",
-        action_link="/credit-builder"
-    ))
+    if ctx.msme_readiness_score is not None:
+        scheme_note = f"unlocks eligibility for {ctx.top_recommended_scheme}" if ctx.top_recommended_scheme else "supports MSME lending readiness"
+        insights.append(QuickInsightOut(
+            id=f"ins-{uuid.uuid4().hex[:8]}",
+            category="Credit & Financing",
+            title=f"MSME Readiness Index: {ctx.msme_readiness_score}/900",
+            summary=f"Your verified cash flow regularity and GST compliance {scheme_note}.",
+            statutory_reference="RBI MSME Priority Sector Lending Guidelines",
+            severity="success" if ctx.msme_readiness_score >= 650 else "info",
+            action_link="/credit-builder"
+        ))
+    else:
+        insights.append(QuickInsightOut(
+            id=f"ins-{uuid.uuid4().hex[:8]}",
+            category="Credit & Financing",
+            title="MSME Readiness Index: Evaluation Pending",
+            summary="Upload bank/UPI statements in Credit Builder and run Scheme Navigator to compute your live readiness score.",
+            statutory_reference="RBI MSME Priority Sector Lending Guidelines",
+            severity="info",
+            action_link="/credit-builder"
+        ))
 
     # 4. Section 16(4) Filing Deadline Reminder
     insights.append(QuickInsightOut(

@@ -22,9 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create unprivileged application user
+# Create unprivileged application user & persistent storage directory
 RUN groupadd -g 1001 myca && \
-    useradd -u 1001 -g myca -m -s /bin/bash myca
+    useradd -u 1001 -g myca -m -s /bin/bash myca && \
+    mkdir -p /app/storage && \
+    chown -R myca:myca /app
 
 # Copy dependencies from builder
 COPY --from=builder /root/.local /home/myca/.local

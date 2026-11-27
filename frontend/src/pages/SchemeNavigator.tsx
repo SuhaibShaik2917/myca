@@ -1,310 +1,344 @@
 import React, { useState, useEffect } from "react";
-import { 
-  Award, 
-  CheckCircle2, 
-  XCircle, 
-  ExternalLink, 
-  FileText, 
-  Building2, 
-  RefreshCw, 
-  Filter, 
-  ChevronRight,
-  ShieldCheck,
-  AlertCircle
+import {
+  Compass,
+  CheckCircle2,
+  XCircle,
+  ExternalLink,
+  FileText,
+  Sparkles,
+  RefreshCw,
+  Building2,
+  BadgePercent,
+  AlertCircle,
 } from "lucide-react";
-import { 
-  listGovernmentSchemes, 
-  getBusinessProfile, 
-  updateBusinessProfile, 
-  evaluateSchemes, 
+import {
+  getBusinessProfile,
+  updateBusinessProfile,
+  evaluateSchemes,
   getSchemeChecklist,
-  GovernmentSchemeOut,
-  BusinessProfileOut,
-  SchemeMatchOut,
-  SchemeChecklistOut
+  BusinessProfile,
+  SchemeMatch,
+  SchemeChecklist,
 } from "../api";
 
-export function SchemeNavigator() {
-  const [schemes, setSchemes] = useState<GovernmentSchemeOut[]>([]);
-  const [matches, setMatches] = useState<SchemeMatchOut[]>([]);
-  const [profile, setProfile] = useState<BusinessProfileOut | null>(null);
-  const [selectedCategory, setSelectedCategory] = useState<string>("");
-  const [activeChecklist, setActiveChecklist] = useState<SchemeChecklistOut | null>(null);
+export default function SchemeNavigator() {
+  const [profile, setProfile] = useState<BusinessProfile | null>(null);
+  const [matches, setMatches] = useState<SchemeMatch[]>([]);
   const [loading, setLoading] = useState(false);
   const [evaluating, setEvaluating] = useState(false);
-  const [isEditingProfile, setIsEditingProfile] = useState(false);
-  const [notification, setNotification] = useState<string | null>(null);
+  const [activeChecklist, setActiveChecklist] = useState<SchemeChecklist | null>(null);
+  const [editMode, setEditMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notification, setNotification] = useState<string | null>(null);
 
-  // Edit profile state
-  const [editSector, setEditSector] = useState("Manufacturing");
-  const [editType, setEditType] = useState("Proprietorship");
-  const [editTurnover, setEditTurnover] = useState("2500000");
-  const [editUdyam, setEditUdyam] = useState("UDYAM-MH-12-0012345");
+  // Form states for profile update (all persisted fields bound to UI inputs)
+  const [bType, setBType] = useState("Proprietorship");
+  const [sector, setSector] = useState("Manufacturing");
+  const [bracket, setBracket] = useState("Micro (< 5 Cr)");
+  const [turnover, setTurnover] = useState("0");
+  const [udyam, setUdyam] = useState("");
+  const [vintageYears, setVintageYears] = useState("");
+  const [socialCategory, setSocialCategory] = useState("General");
+  const [hasUdyam, setHasUdyam] = useState(false);
 
-  const loadAll = async () => {
+  const syncForm = (prof: BusinessProfile) => {
+    setBType(prof.business_type || "Proprietorship");
+    setSector(prof.industry_sector || "Manufacturing");
+    setBracket(prof.turnover_bracket || "Micro (< 5 Cr)");
+    setTurnover(String(prof.annual_turnover ?? "0"));
+    setUdyam(prof.udyam_number || "");
+    setVintageYears(
+      prof.vintage_years !== null && prof.vintage_years !== undefined
+        ? String(prof.vintage_years)
+        : ""
+    );
+    setSocialCategory(prof.social_category || "General");
+    setHasUdyam(Boolean(prof.has_udyam ?? prof.udyam_number));
+  };
+
+  const loadData = async () => {
     setLoading(true);
     setError(null);
     try {
-      const [schList, prof] = await Promise.all([
-        listGovernmentSchemes(selectedCategory || undefined),
-        getBusinessProfile()
+      const [prof, evalResults] = await Promise.all([
+        getBusinessProfile(),
+        evaluateSchemes(),
       ]);
-      setSchemes(schList);
       setProfile(prof);
-      if (prof) {
-        setEditSector(prof.industry_sector);
-        setEditType(prof.business_type);
-        setEditTurnover(prof.annual_turnover ? String(prof.annual_turnover) : "2500000");
-        setEditUdyam(prof.udyam_number || "");
-      }
-      // Also evaluate
-      const matchResults = await evaluateSchemes();
-      setMatches(matchResults);
+      syncForm(prof);
+      setMatches(evalResults);
     } catch (err: any) {
-      setError(err?.message || "Failed to load scheme navigator data.");
+      setError(err.message || "Failed to load MSME scheme matching profile.");
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    loadAll();
-  }, [selectedCategory]);
+    loadData();
+  }, []);
 
-  const handleEvaluate = async () => {
+  const handleSaveProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
     setEvaluating(true);
     setError(null);
     try {
-      const matchResults = await evaluateSchemes();
-      setMatches(matchResults);
-      setNotification(`Evaluated ${matchResults.length} schemes against your business profile.`);
-      setTimeout(() => setNotification(null), 4000);
+      const parsedVintage = vintageYears.trim() === "" ? null : Number(vintageYears);
+      const updated = await updateBusinessProfile({
+        business_type: bType,
+        industry_sector: sector,
+        turnover_bracket: bracket,
+        annual_turnover: parseFloat(turnover) || 0,
+        udyam_number: udyam.trim() || null,
+        vintage_years: parsedVintage !== null && Number.isFinite(parsedVintage) ? parsedVintage : null,
+        social_category: socialCategory,
+        has_udyam: Boolean(udyam.trim()) || hasUdyam,
+      });
+      setProfile(updated);
+      syncForm(updated);
+      const evalResults = await evaluateSchemes();
+      setMatches(evalResults);
+      setEditMode(false);
+      setNotification("Enterprise profile updated and statutory eligibility recalculated.");
     } catch (err: any) {
-      setError(err?.message || "Evaluation failed.");
+      setError(err.message || "Profile update failed.");
     } finally {
       setEvaluating(false);
     }
   };
 
-  const handleSaveProfile = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
-    try {
-      const updated = await updateBusinessProfile({
-        business_type: editType,
-        industry_sector: editSector,
-        turnover_bracket: "Micro (< 5 Cr)",
-        annual_turnover: parseFloat(editTurnover) || 0,
-        udyam_number: editUdyam || null,
-        vintage_years: 3,
-        social_category: "General",
-        has_udyam: Boolean(editUdyam)
-      });
-      setProfile(updated);
-      setIsEditingProfile(false);
-      setNotification("Business profile updated. Re-evaluating eligibility...");
-      const matchResults = await evaluateSchemes();
-      setMatches(matchResults);
-      setTimeout(() => setNotification(null), 4000);
-    } catch (err: any) {
-      setError(err?.message || "Profile update failed.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const handleOpenChecklist = async (schemeCode: string) => {
+    setError(null);
     try {
       const chk = await getSchemeChecklist(schemeCode);
       setActiveChecklist(chk);
     } catch (err: any) {
-      setError(err?.message || "Could not retrieve scheme checklist.");
+      setError(err.message || "Failed to retrieve official scheme checklist.");
     }
   };
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+      <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2">
-            <Award className="w-6 h-6 text-indigo-600" />
-            Government Scheme Navigator
+          <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+            <Compass className="w-5 h-5 text-indigo-600" />
+            MSME Government Scheme Navigator
           </h2>
-          <p className="text-sm text-slate-500">
-            Deterministic Eligibility Matcher for Indian MSME Subsidies, Grants & Guarantee Schemes
+          <p className="text-sm text-slate-500 mt-1">
+            Automated deterministic eligibility evaluation across Central Ministry of MSME, SIDBI, and Credit Guarantee schemes.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setIsEditingProfile(!isEditingProfile)}
-            className="px-3 py-1.5 bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-lg text-xs font-semibold shadow-sm"
-          >
-            {isEditingProfile ? "Close Profile Editor" : "Edit MSME Profile"}
-          </button>
-          <button
-            onClick={handleEvaluate}
-            disabled={evaluating}
-            className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${evaluating ? "animate-spin" : ""}`} />
-            {evaluating ? "Evaluating..." : "Run Match Engine"}
-          </button>
-        </div>
+
+        <button
+          onClick={() => setEditMode(!editMode)}
+          className="px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition"
+        >
+          <Building2 className="w-3.5 h-3.5" />
+          <span>{editMode ? "Cancel Edit" : "Edit Enterprise Profile"}</span>
+        </button>
       </div>
 
-      {/* Notifications */}
-      {notification && (
-        <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-sm flex items-center gap-2">
-          <CheckCircle2 className="w-5 h-5 flex-shrink-0 text-emerald-600" />
-          <span>{notification}</span>
-        </div>
-      )}
-
       {error && (
-        <div className="p-4 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-sm flex items-center gap-2">
-          <AlertCircle className="w-5 h-5 flex-shrink-0 text-rose-600" />
+        <div className="p-4 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0" />
           <span>{error}</span>
         </div>
       )}
+      {notification && (
+        <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-700">
+          {notification}
+        </div>
+      )}
 
-      {/* Profile Overview Bar / Editor */}
-      <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
-        {isEditingProfile ? (
+      {/* Profile Summary / Edit Card */}
+      <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+        {editMode ? (
           <form onSubmit={handleSaveProfile} className="space-y-4">
-            <div className="text-sm font-bold text-slate-800 border-b border-slate-100 pb-2">
-              Update MSME Eligibility Parameters
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
-              <label className="text-xs font-semibold text-slate-600">
-                Industry Sector
+            <h3 className="text-sm font-bold text-slate-800 border-b border-slate-100 pb-2">
+              Update Enterprise Statutory Attributes
+            </h3>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Entity Constitution</label>
                 <select
-                  value={editSector}
-                  onChange={(e) => setEditSector(e.target.value)}
-                  className="mt-1 w-full p-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                >
-                  <option value="Manufacturing">Manufacturing</option>
-                  <option value="Services">Services</option>
-                  <option value="Retail">Retail</option>
-                  <option value="Trading">Trading</option>
-                </select>
-              </label>
-
-              <label className="text-xs font-semibold text-slate-600">
-                Business Constitution
-                <select
-                  value={editType}
-                  onChange={(e) => setEditType(e.target.value)}
-                  className="mt-1 w-full p-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs"
+                  value={bType}
+                  onChange={(e) => setBType(e.target.value)}
                 >
                   <option value="Proprietorship">Proprietorship</option>
                   <option value="Partnership">Partnership</option>
-                  <option value="Private Limited">Private Limited</option>
-                  <option value="LLP">LLP</option>
-                  <option value="Self Help Group">Self Help Group</option>
+                  <option value="Private Limited">Private Limited / LLP</option>
+                  <option value="Individual">Individual Artisan</option>
                 </select>
-              </label>
-
-              <label className="text-xs font-semibold text-slate-600">
-                Annual Turnover (₹)
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Industry Sector</label>
+                <select
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs"
+                  value={sector}
+                  onChange={(e) => setSector(e.target.value)}
+                >
+                  <option value="Manufacturing">Manufacturing</option>
+                  <option value="Services">Services &amp; Consulting</option>
+                  <option value="Trading">Wholesale / Trading</option>
+                  <option value="Retail">Retail / Street Vendor</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">MSME Category Bracket</label>
+                <select
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs"
+                  value={bracket}
+                  onChange={(e) => setBracket(e.target.value)}
+                >
+                  <option value="Micro (< 5 Cr)">Micro (&lt; ₹5 Cr)</option>
+                  <option value="Small (5-50 Cr)">Small (₹5–50 Cr)</option>
+                  <option value="Medium (50-250 Cr)">Medium (₹50–250 Cr)</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Annual Turnover (INR)</label>
                 <input
                   type="number"
-                  value={editTurnover}
-                  onChange={(e) => setEditTurnover(e.target.value)}
-                  className="mt-1 w-full p-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
-                  placeholder="e.g. 2500000"
+                  step="0.01"
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs"
+                  value={turnover}
+                  onChange={(e) => setTurnover(e.target.value)}
                 />
-              </label>
-
-              <label className="text-xs font-semibold text-slate-600">
-                Udyam Registration No.
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Udyam Registration Number</label>
                 <input
                   type="text"
-                  value={editUdyam}
-                  onChange={(e) => setEditUdyam(e.target.value)}
-                  className="mt-1 w-full p-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
-                  placeholder="UDYAM-MH-12-0012345"
+                  placeholder="UDYAM-MH-01-0001234"
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs font-mono"
+                  value={udyam}
+                  onChange={(e) => {
+                    const v = e.target.value.toUpperCase();
+                    setUdyam(v);
+                    if (v.trim()) setHasUdyam(true);
+                  }}
                 />
-              </label>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Business Vintage (Years)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  placeholder="e.g. 2"
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs font-mono"
+                  value={vintageYears}
+                  onChange={(e) => setVintageYears(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Promoter Category</label>
+                <select
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs"
+                  value={socialCategory}
+                  onChange={(e) => setSocialCategory(e.target.value)}
+                >
+                  <option value="General">General</option>
+                  <option value="OBC">OBC</option>
+                  <option value="SC">SC</option>
+                  <option value="ST">ST</option>
+                  <option value="Women">Women Entrepreneur</option>
+                  <option value="Minority">Minority</option>
+                </select>
+              </div>
+              <div className="flex items-end pb-2">
+                <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={hasUdyam}
+                    onChange={(e) => setHasUdyam(e.target.checked)}
+                    className="rounded border-slate-300 text-indigo-600"
+                  />
+                  <span>Active Udyam Registration</span>
+                </label>
+              </div>
             </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setIsEditingProfile(false)}
-                className="px-3 py-1.5 text-xs text-slate-600 font-semibold"
-              >
-                Cancel
-              </button>
+
+            <div className="flex justify-end gap-2">
               <button
                 type="submit"
-                className="px-4 py-1.5 bg-indigo-600 text-white rounded-lg text-xs font-semibold shadow-sm"
+                disabled={evaluating}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs font-semibold flex items-center gap-2"
               >
-                Save & Recalculate Matches
+                <RefreshCw className={`w-3.5 h-3.5 ${evaluating ? "animate-spin" : ""}`} />
+                <span>{evaluating ? "Evaluating Rules..." : "Save & Recalculate Eligibility"}</span>
               </button>
             </div>
           </form>
         ) : (
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-            <div className="flex flex-wrap items-center gap-6 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex flex-wrap gap-6 text-xs">
               <div>
-                <span className="text-slate-400 font-medium">Sector:</span>{" "}
-                <strong className="text-slate-800">{profile?.industry_sector || "Manufacturing"}</strong>
+                <span className="text-slate-400 block mb-0.5">Constitution</span>
+                <span className="font-bold text-slate-800">{profile?.business_type || "Not Configured"}</span>
               </div>
               <div>
-                <span className="text-slate-400 font-medium">Structure:</span>{" "}
-                <strong className="text-slate-800">{profile?.business_type || "Proprietorship"}</strong>
+                <span className="text-slate-400 block mb-0.5">Industry Sector</span>
+                <span className="font-bold text-slate-800">{profile?.industry_sector || "Not Configured"}</span>
               </div>
               <div>
-                <span className="text-slate-400 font-medium">Turnover:</span>{" "}
-                <strong className="text-slate-800">₹{profile?.annual_turnover || "25,00,000"}</strong>
+                <span className="text-slate-400 block mb-0.5">Turnover Scale</span>
+                <span className="font-bold text-slate-800">
+                  {profile?.turnover_bracket || "Micro (< 5 Cr)"} (
+                  {profile?.annual_turnover !== undefined && profile?.annual_turnover !== null
+                    ? `₹${Number(profile.annual_turnover).toLocaleString("en-IN")}`
+                    : "Not Set"}
+                  )
+                </span>
               </div>
               <div>
-                <span className="text-slate-400 font-medium">Udyam No:</span>{" "}
-                <strong className="text-indigo-600 font-mono">{profile?.udyam_number || "Not Registered"}</strong>
+                <span className="text-slate-400 block mb-0.5">Vintage &amp; Category</span>
+                <span className="font-bold text-slate-800">
+                  {profile?.vintage_years !== null && profile?.vintage_years !== undefined
+                    ? `${profile.vintage_years} yrs`
+                    : "Vintage unset"}{" "}
+                  • {profile?.social_category || "General"}
+                </span>
+              </div>
+              <div>
+                <span className="text-slate-400 block mb-0.5">Udyam Registration</span>
+                <span className="font-mono font-bold text-indigo-700">
+                  {profile?.udyam_number || (profile?.has_udyam ? "Registered" : "Not Registered")}
+                </span>
               </div>
             </div>
-            <div className="flex items-center gap-1.5 text-xs text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full font-semibold">
-              <ShieldCheck className="w-3.5 h-3.5" />
-              Verified MSME Profile
+
+            <div className="flex items-center gap-2 text-xs bg-emerald-50 text-emerald-700 px-3 py-1.5 rounded-full font-semibold">
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>{matches.filter((m) => Number(m.match_score) >= 75).length} Priority Matches Found</span>
             </div>
           </div>
         )}
       </div>
 
-      {/* Category Filter Pills */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-1">
-        <Filter className="w-4 h-4 text-slate-400 mr-1" />
-        {[
-          { label: "All Categories", value: "" },
-          { label: "Credit Guarantee", value: "credit_guarantee" },
-          { label: "Government Subsidy", value: "subsidy" },
-          { label: "Tech Upgradation", value: "technology_upgradation" },
-          { label: "Skill Development", value: "skill_development" }
-        ].map((cat) => (
-          <button
-            key={cat.value}
-            onClick={() => setSelectedCategory(cat.value)}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
-              selectedCategory === cat.value
-                ? "bg-indigo-600 text-white shadow-sm"
-                : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
-            }`}
-          >
-            {cat.label}
-          </button>
-        ))}
-      </div>
-
-      {/* Matched Schemes List */}
-      <div className="space-y-4">
+      {/* Matches Grid */}
+      <div className="grid grid-cols-1 gap-4">
+        {loading && matches.length === 0 ? (
+          <div className="p-8 text-center text-xs text-slate-500 bg-white rounded-xl border border-slate-200">
+            Evaluating statutory eligibility criteria across Central MSME schemes...
+          </div>
+        ) : matches.length === 0 ? (
+          <div className="p-8 text-center text-xs text-slate-500 bg-white rounded-xl border border-slate-200">
+            No scheme matches evaluated yet. Authenticate and save your enterprise profile to evaluate eligibility.
+          </div>
+        ) : null}
         {matches.map((m) => {
-          const scoreNum = typeof m.match_score === "string" ? parseFloat(m.match_score) : m.match_score;
+          const scoreNum = Number(m.match_score);
+          const isMatch = scoreNum >= 75;
           return (
-            <div 
-              key={m.scheme_id} 
-              className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm hover:border-indigo-200 transition"
+            <div
+              key={m.scheme_id}
+              className={`bg-white rounded-xl border p-5 shadow-sm transition hover:shadow-md ${
+                isMatch ? "border-emerald-200" : "border-slate-200"
+              }`}
             >
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                 <div>
@@ -312,9 +346,13 @@ export function SchemeNavigator() {
                     <span className="text-xs font-bold text-indigo-600 font-mono bg-indigo-50 px-2 py-0.5 rounded">
                       {m.scheme_code}
                     </span>
-                    <span className="text-xs text-slate-400 font-medium">
-                      {m.ministry}
-                    </span>
+                    <span className="text-xs text-slate-400 font-medium">{m.ministry}</span>
+                    {m.max_subsidy_amount && (
+                      <span className="text-[11px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded font-semibold flex items-center gap-1">
+                        <BadgePercent className="w-3 h-3" />
+                        Up to {m.max_subsidy_amount}
+                      </span>
+                    )}
                   </div>
                   <h3 className="text-base font-bold text-slate-900">{m.scheme_name}</h3>
                   <p className="text-xs text-slate-600 mt-1 max-w-2xl">{m.benefits_summary}</p>
@@ -323,20 +361,23 @@ export function SchemeNavigator() {
                 <div className="flex items-center gap-4 self-end sm:self-auto">
                   <div className="text-right">
                     <div className="text-[11px] text-slate-400 uppercase font-semibold">Match Score</div>
-                    <div className={`text-2xl font-black ${
-                      scoreNum >= 80 ? "text-emerald-600" :
-                      scoreNum >= 50 ? "text-indigo-600" :
-                      "text-slate-400"
-                    }`}>
+                    <div
+                      className={`text-2xl font-black ${
+                        scoreNum >= 80
+                          ? "text-emerald-600"
+                          : scoreNum >= 50
+                          ? "text-indigo-600"
+                          : "text-slate-400"
+                      }`}
+                    >
                       {scoreNum}%
                     </div>
                   </div>
                   <button
                     onClick={() => handleOpenChecklist(m.scheme_code)}
-                    className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
+                    className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-semibold transition shadow-sm"
                   >
-                    <span>Checklist & Apply</span>
-                    <ChevronRight className="w-3.5 h-3.5" />
+                    Checklist &amp; Apply
                   </button>
                 </div>
               </div>
@@ -344,11 +385,11 @@ export function SchemeNavigator() {
               {/* Criteria Tags */}
               <div className="mt-4 pt-3 border-t border-slate-100 flex flex-wrap gap-2">
                 {m.evaluated_criteria?.map((c, idx) => (
-                  <div 
+                  <div
                     key={idx}
                     className={`text-[11px] px-2.5 py-1 rounded-md font-medium flex items-center gap-1.5 ${
-                      c.passed 
-                        ? "bg-emerald-50 text-emerald-800 border border-emerald-100" 
+                      c.passed
+                        ? "bg-emerald-50 text-emerald-800 border border-emerald-100"
                         : "bg-rose-50 text-rose-700 border border-rose-100"
                     }`}
                   >
@@ -372,11 +413,13 @@ export function SchemeNavigator() {
           <div className="bg-white rounded-2xl border border-slate-200 max-w-2xl w-full p-6 shadow-xl max-h-[90vh] overflow-y-auto space-y-5">
             <div className="flex justify-between items-start">
               <div>
-                <span className="text-xs font-bold text-indigo-600 uppercase tracking-wider">{activeChecklist.scheme_code}</span>
+                <span className="text-xs font-bold text-indigo-600 uppercase tracking-wider">
+                  {activeChecklist.scheme_code}
+                </span>
                 <h3 className="text-lg font-bold text-slate-900 mt-1">{activeChecklist.name}</h3>
                 <p className="text-xs text-slate-500">{activeChecklist.ministry}</p>
               </div>
-              <button 
+              <button
                 onClick={() => setActiveChecklist(null)}
                 className="text-slate-400 hover:text-slate-600 text-lg font-bold p-1"
               >
@@ -388,7 +431,6 @@ export function SchemeNavigator() {
               <strong>Eligibility Criteria:</strong> {activeChecklist.eligibility_summary}
             </div>
 
-            {/* Required Documents */}
             <div>
               <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                 <FileText className="w-4 h-4 text-slate-600" />
@@ -396,7 +438,10 @@ export function SchemeNavigator() {
               </h4>
               <ul className="space-y-2">
                 {activeChecklist.required_documents.map((doc, idx) => (
-                  <li key={idx} className="p-2.5 bg-slate-50 rounded-lg border border-slate-100 text-xs text-slate-700 flex items-center gap-2">
+                  <li
+                    key={idx}
+                    className="p-2.5 bg-slate-50 rounded-lg border border-slate-100 text-xs text-slate-700 flex items-center gap-2"
+                  >
                     <CheckCircle2 className="w-3.5 h-3.5 text-indigo-600 flex-shrink-0" />
                     <span>{doc}</span>
                   </li>
@@ -404,7 +449,6 @@ export function SchemeNavigator() {
               </ul>
             </div>
 
-            {/* Application Steps */}
             <div>
               <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider mb-2">
                 Official Application Workflow
@@ -418,7 +462,6 @@ export function SchemeNavigator() {
               </ol>
             </div>
 
-            {/* Modal Actions */}
             <div className="pt-4 border-t border-slate-100 flex justify-between items-center">
               <a
                 href={activeChecklist.portal_url}

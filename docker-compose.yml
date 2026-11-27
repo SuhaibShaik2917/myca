@@ -4,17 +4,18 @@ services:
   db:
     image: postgres:16-alpine
     container_name: myca_postgres
-    restart: always
+    restart: unless-stopped
+    env_file:
+      - path: .env.production
+        required: false
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_change_me}
       POSTGRES_DB: ${POSTGRES_DB:-myca}
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d myca"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-myca}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -26,18 +27,46 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: myca_backend
-    restart: always
+    restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
+    env_file:
+      - path: .env.production
+        required: false
     environment:
-      DATABASE_URL: postgresql://app_service_user:app_secure_password_2026@db:5432/myca
-      MIGRATION_DATABASE_URL: postgresql://postgres:postgres@db:5432/myca
-      SECRET_KEY: ${SECRET_KEY:-prod_ultra_secure_jwt_secret_key_2026_myca}
-      ENVIRONMENT: production
-      CORS_ORIGINS: '["http://localhost", "http://localhost:80", "http://localhost:5173", "http://127.0.0.1"]'
-      GSP_SANDBOX_MODE: "true"
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://app_service_user:secret@db:5432/myca}
+      DATABASE_WORKER_URL: ${DATABASE_WORKER_URL:-postgresql+psycopg://worker_service_user:secret@db:5432/myca}
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql+psycopg://postgres:postgres_change_me@db:5432/myca}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      SECRET_KEY: ${SECRET_KEY:?Set strong >=32 char SECRET_KEY}
+      GSTR3B_REVIEW_ATTESTATION_KEY: ${GSTR3B_REVIEW_ATTESTATION_KEY:?Set distinct >=32 char GSTR3B_REVIEW_ATTESTATION_KEY}
+      STATUTORY_AUDIT_SIGNING_KEY: ${STATUTORY_AUDIT_SIGNING_KEY:?Set distinct >=32 char STATUTORY_AUDIT_SIGNING_KEY}
+      ALLOW_DEMO_TOKENS: "false"
+      ALLOW_DEV_HEADER_AUTH: "false"
+      CORS_ORIGINS: ${CORS_ORIGINS:-["https://localhost"]}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-["127.0.0.1","::1"]}
+      MYCA_IDP_PROVIDER: ${MYCA_IDP_PROVIDER:-}
+      MYCA_IDP_ISSUER: ${MYCA_IDP_ISSUER:-}
+      MYCA_IDP_AUDIENCE: ${MYCA_IDP_AUDIENCE:-}
+      MYCA_IDP_JWKS_URL: ${MYCA_IDP_JWKS_URL:-}
+      MYCA_IDP_TOKEN_URL: ${MYCA_IDP_TOKEN_URL:-}
+      MYCA_IDP_CLIENT_SECRET: ${MYCA_IDP_CLIENT_SECRET:-}
+      MYCA_IDP_REDIRECT_URIS: ${MYCA_IDP_REDIRECT_URIS:-[]}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      STORAGE_LOCAL_ROOT: /app/storage
+      AWS_S3_BUCKET_NAME: ${AWS_S3_BUCKET_NAME:-}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_S3_KMS_KEY_ID: ${AWS_S3_KMS_KEY_ID:-}
+      GSP_MODE: ${GSP_MODE:-sandbox}
+      GSTN_GSP_BASE_URL: ${GSTN_GSP_BASE_URL:-}
+      GSTN_GSP_CLIENT_ID: ${GSTN_GSP_CLIENT_ID:-}
+      GSTN_GSP_CLIENT_SECRET: ${GSTN_GSP_CLIENT_SECRET:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      GEMINI_FALLBACK_MODEL: ${GEMINI_FALLBACK_MODEL:-gemini-3.5-flash-lite}
+    volumes:
+      - myca_storage:/app/storage
     ports:
       - "8000:8000"
     healthcheck:
@@ -48,12 +77,50 @@ services:
     networks:
       - myca_net
 
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: myca_worker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "worker.runner"]
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://app_service_user:secret@db:5432/myca}
+      DATABASE_WORKER_URL: ${DATABASE_WORKER_URL:-postgresql+psycopg://worker_service_user:secret@db:5432/myca}
+      WORKER_ORG_ID: ${WORKER_ORG_ID:?Set WORKER_ORG_ID for tenant worker polling}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      SECRET_KEY: ${SECRET_KEY:?Set strong >=32 char SECRET_KEY}
+      GSTR3B_REVIEW_ATTESTATION_KEY: ${GSTR3B_REVIEW_ATTESTATION_KEY:?Set distinct >=32 char GSTR3B_REVIEW_ATTESTATION_KEY}
+      STATUTORY_AUDIT_SIGNING_KEY: ${STATUTORY_AUDIT_SIGNING_KEY:?Set distinct >=32 char STATUTORY_AUDIT_SIGNING_KEY}
+      ALLOW_DEMO_TOKENS: "false"
+      ALLOW_DEV_HEADER_AUTH: "false"
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      STORAGE_LOCAL_ROOT: /app/storage
+      AWS_S3_BUCKET_NAME: ${AWS_S3_BUCKET_NAME:-}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_S3_KMS_KEY_ID: ${AWS_S3_KMS_KEY_ID:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      GEMINI_FALLBACK_MODEL: ${GEMINI_FALLBACK_MODEL:-gemini-3.5-flash-lite}
+    volumes:
+      - myca_storage:/app/storage
+    networks:
+      - myca_net
+
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: myca_frontend
-    restart: always
+    restart: unless-stopped
     depends_on:
       backend:
         condition: service_healthy
@@ -69,6 +136,8 @@ services:
 
 volumes:
   pgdata:
+    driver: local
+  myca_storage:
     driver: local
 
 networks:

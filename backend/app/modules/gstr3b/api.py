@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_tenant_db, validate_tenant_identity
+from app.core.dependencies import get_tenant_db, validate_tenant_identity, require_roles
 from app.modules.gstr3b.schemas import (
     GSTR3BPrepareRequest, MakerCheckerSubmitRequest, MakerCheckerDecisionRequest,
     GSTR3BFilingResponse, GSTR3BStatusResponse
@@ -20,7 +20,7 @@ def prepare_return_endpoint(
     payload: GSTR3BPrepareRequest,
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant"))
 ):
     """
     Stage 1: Prepares GSTR-3B Table 3.1 & Table 4 and executes Rule 88A tax offset.
@@ -51,7 +51,7 @@ def get_return_status_endpoint(
     registration_id: str = Query(...),
     tax_period: str = Query(...),
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant", "viewer"))
 ):
     """Retrieves current return state for a registration and tax period."""
     effective_org, _ = validate_tenant_identity(db, x_org_id, None)
@@ -76,7 +76,7 @@ def submit_for_review_endpoint(
     payload: MakerCheckerSubmitRequest = MakerCheckerSubmitRequest(),
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant"))
 ):
     """
     Maker-Checker Stage 2: Maker submits return for checker statutory review.
@@ -106,7 +106,7 @@ def review_decision_endpoint(
     payload: MakerCheckerDecisionRequest,
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant"))
 ):
     """
     Maker-Checker Stage 3: Checker / CA approves or rejects the return.
@@ -136,7 +136,7 @@ def file_to_gsp_sandbox_endpoint(
     filing_id: str,
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin"))
 ):
     """
     Maker-Checker Stage 4: Submits checker-approved return to GSP/GSTN Sandbox.
@@ -166,7 +166,7 @@ def file_to_gsp_sandbox_endpoint(
 def get_revision_history_endpoint(
     filing_id: str,
     x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
-    db: Session = Depends(get_tenant_db)
+    db: Session = Depends(require_roles("owner", "admin", "accountant", "viewer"))
 ):
     """Retrieves durable append-only revision history for a GSTR-3B filing."""
     effective_org, _ = validate_tenant_identity(db, x_org_id, None)

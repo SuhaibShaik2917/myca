@@ -374,8 +374,10 @@ def audit_m1_m5_cross_tenant_isolation():
 
         db.commit()
         print("  --> Seeded Org A records across all core tenant domains (M1-M5 & IdP Nonces).")
+        db.close()
 
-        # Step B: Switch to Org B context and test read isolation across ALL domain tables
+        # Step B: Use a fresh Org B session (never reusing Org A session across tenants)
+        db = SessionLocal()
         set_tenant_context(db, org_id=org_b, user_id=user_b)
 
         domain_checks = [
@@ -516,63 +518,75 @@ def audit_m1_m5_cross_tenant_isolation():
         ]
 
         for tbl, sql, param_gen in insert_tamper_targets:
-            # Phase 1: Prove positive INSERT succeeds under Tenant Alpha context
-            set_tenant_context(db, org_id=org_a, user_id=user_a)
-            alpha_params = param_gen(org_a)
-            if tbl == "gstr3b_filings":
-                prep_pos = prepare_gstr3b_return(db, org_a, reg_id_a, alpha_params["tax_period"], user_id=user_a)
-                alpha_params["id"] = prep_pos["id"]
-                set_tenant_context(db, org_id=org_a, user_id=user_a)
-            else:
-                sp_a = db.begin_nested()
-                db.execute(text(sql), alpha_params)
-                sp_a.commit()
-            # Verify row actually exists in table
-            pk_col = "nonce" if tbl == "idp_authentication_nonces" else "id"
-            pk_val = alpha_params.get(pk_col)
-            row_chk = db.execute(text(f"SELECT {pk_col} FROM public.{tbl} WHERE {pk_col} = :val"), {"val": pk_val}).fetchone()
-            assert row_chk is not None, f"Failed positive baseline: row not found in {tbl} after Alpha insert!"
-
-            # Phase 2: Switch to Tenant Beta and attempt spoofed INSERT with org_a
-            set_tenant_context(db, org_id=org_b, user_id=user_b)
-            spoofed_params = param_gen(org_a)  # Spoofing Tenant Alpha's org_id
-            sp_b = db.begin_nested()
-            spoofed_blocked = False
-            sqlstate = None
-            classification = None
-            err_msg = ""
+            # Phase 1: Prove positive INSERT succeeds under a fresh Tenant Alpha session
+            db_alpha = SessionLocal()
             try:
-                db.execute(text(sql), spoofed_params)
-                sp_b.commit()
-            except Exception as e:
-                spoofed_blocked = True
-                sp_b.rollback()
-                orig = getattr(e, "orig", e)
-                sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
-                err_msg = str(orig) or str(e)
-                err_lower = err_msg.lower()
-                if sqlstate == "42501" and ("violates row-level security policy" in err_lower or "row-level security policy" in err_lower):
-                    classification = "RLS_WITH_CHECK_VIOLATION"
-                elif sqlstate == "42501" and "permission denied for table" in err_lower:
-                    classification = "LEAST_PRIVILEGE_IMMUTABLE_DENIAL"
+                set_tenant_context(db_alpha, org_id=org_a, user_id=user_a)
+                alpha_params = param_gen(org_a)
+                if tbl == "gstr3b_filings":
+                    prep_pos = prepare_gstr3b_return(db_alpha, org_a, reg_id_a, alpha_params["tax_period"], user_id=user_a)
+                    alpha_params["id"] = prep_pos["id"]
+                    set_tenant_context(db_alpha, org_id=org_a, user_id=user_a)
                 else:
-                    raise AssertionError(
-                        f"CRITICAL TEST FLAW on table {tbl}: Spoofed insert failed with unexpected error!\n"
-                        f"SQLSTATE: {sqlstate}\n"
-                        f"Error: {err_msg}\n"
-                        f"Expected SQLSTATE 42501 (RLS policy violation or permission denial)."
-                    )
+                    sp_a = db_alpha.begin_nested()
+                    db_alpha.execute(text(sql), alpha_params)
+                    sp_a.commit()
+                pk_col = "nonce" if tbl == "idp_authentication_nonces" else "id"
+                pk_val = alpha_params.get(pk_col)
+                row_chk = db_alpha.execute(text(f"SELECT {pk_col} FROM public.{tbl} WHERE {pk_col} = :val"), {"val": pk_val}).fetchone()
+                assert row_chk is not None, f"Failed positive baseline: row not found in {tbl} after Alpha insert!"
+                db_alpha.commit()
+            finally:
+                db_alpha.close()
 
-            assert spoofed_blocked, f"CRITICAL RLS BREACH: Org B was able to insert records into Org A's {tbl}!"
-            assert classification in ("RLS_WITH_CHECK_VIOLATION", "LEAST_PRIVILEGE_IMMUTABLE_DENIAL")
-            print(f"  [Cross-Tenant INSERT] PASS: {tbl:<24} | Alpha positive insert OK | Beta spoof rejected (SQLSTATE {sqlstate}: {classification})")
+            # Phase 2: Under a fresh Tenant Beta session, attempt spoofed INSERT with org_a
+            db_beta = SessionLocal()
+            try:
+                set_tenant_context(db_beta, org_id=org_b, user_id=user_b)
+                spoofed_params = param_gen(org_a)  # Spoofing Tenant Alpha's org_id
+                sp_b = db_beta.begin_nested()
+                spoofed_blocked = False
+                sqlstate = None
+                classification = None
+                err_msg = ""
+                try:
+                    db_beta.execute(text(sql), spoofed_params)
+                    sp_b.commit()
+                except Exception as e:
+                    spoofed_blocked = True
+                    sp_b.rollback()
+                    orig = getattr(e, "orig", e)
+                    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+                    err_msg = str(orig) or str(e)
+                    err_lower = err_msg.lower()
+                    if sqlstate == "42501" and ("violates row-level security policy" in err_lower or "row-level security policy" in err_lower):
+                        classification = "RLS_WITH_CHECK_VIOLATION"
+                    elif sqlstate == "42501" and "permission denied for table" in err_lower:
+                        classification = "LEAST_PRIVILEGE_IMMUTABLE_DENIAL"
+                    else:
+                        raise AssertionError(
+                            f"CRITICAL TEST FLAW on table {tbl}: Spoofed insert failed with unexpected error!\n"
+                            f"SQLSTATE: {sqlstate}\n"
+                            f"Error: {err_msg}\n"
+                            f"Expected SQLSTATE 42501 (RLS policy violation or permission denial)."
+                        )
+
+                assert spoofed_blocked, f"CRITICAL RLS BREACH: Org B was able to insert records into Org A's {tbl}!"
+                assert classification in ("RLS_WITH_CHECK_VIOLATION", "LEAST_PRIVILEGE_IMMUTABLE_DENIAL")
+                print(f"  [Cross-Tenant INSERT] PASS: {tbl:<24} | Alpha positive insert OK | Beta spoof rejected (SQLSTATE {sqlstate}: {classification})")
+            finally:
+                db_beta.close()
 
         # Step E: Null tenant context isolation
-        db.execute(text("SELECT set_config('app.current_org', '', false), set_config('app.current_user', '', false);"))
-        for tbl in ["invoices", "documents", "gst_registrations", "purchase_documents", "itc_ledger_entries", "gst_records", "financial_transactions", "gstr3b_filings", "financial_summaries", "business_profiles", "scheme_matches"]:
-            assert len(db.execute(text(f"SELECT id FROM public.{tbl};")).fetchall()) == 0, f"Leak in {tbl} under null context!"
-        assert len(db.execute(text("SELECT nonce FROM public.idp_authentication_nonces;")).fetchall()) == 0, "Leak in idp_authentication_nonces under null context!"
-        print("  [Null Context Isolation] PASS: Under null context, all 12 tested tenant tables return 0 rows.")
+        db_null = SessionLocal()
+        try:
+            db_null.execute(text("SELECT set_config('app.current_org', '', false), set_config('app.current_user', '', false);"))
+            for tbl in ["invoices", "documents", "gst_registrations", "purchase_documents", "itc_ledger_entries", "gst_records", "financial_transactions", "gstr3b_filings", "financial_summaries", "business_profiles", "scheme_matches"]:
+                assert len(db_null.execute(text(f"SELECT id FROM public.{tbl};")).fetchall()) == 0, f"Leak in {tbl} under null context!"
+            assert len(db_null.execute(text("SELECT nonce FROM public.idp_authentication_nonces;")).fetchall()) == 0, "Leak in idp_authentication_nonces under null context!"
+            print("  [Null Context Isolation] PASS: Under null context, all 12 tested tenant tables return 0 rows.")
+        finally:
+            db_null.close()
 
     finally:
         db.close()
@@ -609,15 +623,24 @@ def audit_api_layer_token_security():
         assert res.status_code == 401, f"Expected 401 for unauthenticated {ep}, got {res.status_code}"
         print(f"  Unauthenticated {ep:42} -> {res.status_code} Unauthorized [PASS]")
 
-    # 2. Token spoofing test: Client passes Token A in Authorization header but claims org_id = org_b in custom header
-    spoof_headers = {
+    # 2. Token spoofing test: Client passes Token A in Authorization header but claims org_id = org_b in X-Org-Id
+    spoof_org_headers = {
         "Authorization": f"Bearer {token_a}",
-        "X-Organization-Id": org_b,
-        "X-User-Id": user_b
+        "X-Org-Id": org_b,
+        "X-User-Id": user_a,
     }
-    res = client.get("/api/v1/credit-builder/summary", headers=spoof_headers)
-    print(f"  Spoofed Header Call -> HTTP {res.status_code} (Active Tamper Protection Enforced)")
-    assert res.status_code == 403, f"Expected 403 Forbidden for spoofed headers, got {res.status_code}"
+    res_org = client.get("/api/v1/credit-builder/summary", headers=spoof_org_headers)
+    print(f"  Spoofed X-Org-Id Call -> HTTP {res_org.status_code} (Active Org Tamper Protection Enforced)")
+    assert res_org.status_code == 403, f"Expected 403 Forbidden for spoofed X-Org-Id, got {res_org.status_code}"
+
+    spoof_user_headers = {
+        "Authorization": f"Bearer {token_a}",
+        "X-Org-Id": org_a,
+        "X-User-Id": user_b,
+    }
+    res_user = client.get("/api/v1/credit-builder/summary", headers=spoof_user_headers)
+    print(f"  Spoofed X-User-Id Call -> HTTP {res_user.status_code} (Active User Tamper Protection Enforced)")
+    assert res_user.status_code == 403, f"Expected 403 Forbidden for spoofed X-User-Id, got {res_user.status_code}"
 
     print("=== [4] API Layer Security: 100% VERIFIED SECURE ===\n")
 

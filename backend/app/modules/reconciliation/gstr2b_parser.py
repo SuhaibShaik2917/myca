@@ -31,25 +31,31 @@ def parse_gstr2b_json(content: bytes) -> GSTR2BParsedStatement:
     data = json.loads(content.decode("utf-8"))
     
     # Root level structure
-    recipient_gstin = data.get("gstin", "")
-    raw_fp = str(data.get("fp", ""))
-    
-    # Normalize return period YYYY-MM
-    if len(raw_fp) == 6:  # MMYYYY (e.g. '112026')
+    doc_data = data.get("data", data)
+    recipient_gstin = data.get("gstin") or (doc_data.get("gstin") if isinstance(doc_data, dict) else "") or ""
+    raw_fp = str(data.get("fp") or (doc_data.get("rtnprd") if isinstance(doc_data, dict) else "") or "").strip()
+
+    # Normalize return period YYYY-MM (leave empty when absent so upload endpoint uses form return_period)
+    if len(raw_fp) == 6 and raw_fp.isdigit():  # MMYYYY (e.g. '112026')
         return_period = f"{raw_fp[2:]}-{raw_fp[:2]}"
     elif "-" in raw_fp:
         return_period = raw_fp
     else:
-        return_period = "2026-11"
+        return_period = ""
 
-    fy = data.get("fy", f"{return_period[:4]}-{int(return_period[:4])+1}")
+    fy = data.get("fy") or (
+        f"{return_period[:4]}-{int(return_period[:4]) + 1}"
+        if len(return_period) >= 4 and return_period[:4].isdigit()
+        else ""
+    )
     gen_date = data.get("genDate") or data.get("gendt")
 
     parsed_docs: List[GSTR2BDocumentItem] = []
     total_itc_avail = Decimal("0.00")
     total_itc_not_avail = Decimal("0.00")
 
-    doc_data = data.get("data", data)
+    nested_docs = doc_data.get("docdata", doc_data) if isinstance(doc_data, dict) else doc_data
+    doc_data = nested_docs if isinstance(nested_docs, dict) else doc_data
 
     # 1. B2B Invoices & B2BA Amendments
     for section_key, is_amended in [("b2b", False), ("b2ba", True)]:
@@ -110,11 +116,12 @@ def parse_gstr2b_json(content: bytes) -> GSTR2BParsedStatement:
                     raw_payload=inv
                 )
                 parsed_docs.append(doc_item)
-                tax_sum = iamt + camt + samt + csamt
+                sign = Decimal("-1.00") if doc_item.document_type == "CRN" else Decimal("1.00")
+                signed_tax = sign * (iamt + camt + samt + csamt)
                 if itc_avail == "available":
-                    total_itc_avail += tax_sum
+                    total_itc_avail += signed_tax
                 else:
-                    total_itc_not_avail += tax_sum
+                    total_itc_not_avail += signed_tax
 
     # 2. CDNR & CDNRA (Credit/Debit Notes)
     for section_key, is_amended in [("cdnr", False), ("cdnra", True)]:
@@ -167,11 +174,12 @@ def parse_gstr2b_json(content: bytes) -> GSTR2BParsedStatement:
                     raw_payload=nt
                 )
                 parsed_docs.append(doc_item)
-                tax_sum = iamt + camt + samt + csamt
+                sign = Decimal("-1.00") if doc_item.document_type == "CRN" else Decimal("1.00")
+                signed_tax = sign * (iamt + camt + samt + csamt)
                 if itc_avail == "available":
-                    total_itc_avail += tax_sum
+                    total_itc_avail += signed_tax
                 else:
-                    total_itc_not_avail += tax_sum
+                    total_itc_not_avail += signed_tax
 
     # 3. ISD Invoices & ISDA Amendments (GSTR-6 Source)
     for section_key, is_amended in [("isd", False), ("isda", True)]:
@@ -269,80 +277,144 @@ def parse_gstr2b_json(content: bytes) -> GSTR2BParsedStatement:
 
 def parse_gstr2b_excel(content: bytes) -> GSTR2BParsedStatement:
     """
-    Parses official GST Portal GSTR-2B Excel spreadsheet.
+    Parses official GST Portal GSTR-2B Excel spreadsheet in streaming read-only mode.
     Extracts sheets: B2B, B2BA, CDNR, CDNRA, ISD, IMPG.
     """
-    wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+    wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True, read_only=True)
     parsed_docs: List[GSTR2BDocumentItem] = []
     total_itc_avail = Decimal("0.00")
     total_itc_not_avail = Decimal("0.00")
 
     recipient_gstin = ""
-    return_period = "2026-11"
+    return_period = ""
 
-    # Read summary sheet if available
-    if "ITC Available" in wb.sheetnames:
-        ws_sum = wb["ITC Available"]
-        # Typically header rows contain GSTIN and Period
-        for r in range(1, 8):
-            cell_val = str(ws_sum.cell(row=r, column=1).value or "")
-            if "GSTIN" in cell_val.upper() and ":" in cell_val:
-                recipient_gstin = cell_val.split(":")[-1].strip()
-            if "Period" in cell_val and ":" in cell_val:
-                return_period = cell_val.split(":")[-1].strip()
+    try:
+        # Read summary sheet if available
+        if "ITC Available" in wb.sheetnames:
+            ws_sum = wb["ITC Available"]
+            for row_vals in ws_sum.iter_rows(min_row=1, max_row=8, values_only=True):
+                cell_val = str((row_vals[0] if row_vals else None) or "")
+                if "GSTIN" in cell_val.upper() and ":" in cell_val:
+                    recipient_gstin = cell_val.split(":")[-1].strip()
+                if "Period" in cell_val and ":" in cell_val:
+                    raw_period = cell_val.split(":")[-1].strip()
+                    if len(raw_period) == 6 and raw_period.isdigit():
+                        return_period = f"{raw_period[2:]}-{raw_period[:2]}"
+                    elif "-" in raw_period:
+                        return_period = raw_period
 
-    # Read B2B Sheet
-    if "B2B" in wb.sheetnames:
-        ws_b2b = wb["B2B"]
-        header_idx = None
-        for r in range(1, 10):
-            val1 = str(ws_b2b.cell(row=r, column=1).value or "").strip().lower()
-            if "gstin" in val1:
-                header_idx = r
-                break
-        
-        if header_idx:
-            for r in range(header_idx + 1, ws_b2b.max_row + 1):
-                supp_gstin = ws_b2b.cell(row=r, column=1).value
-                if not supp_gstin or len(str(supp_gstin).strip()) < 15:
-                    continue
-                supp_name = str(ws_b2b.cell(row=r, column=2).value or "Supplier")
-                inv_num = str(ws_b2b.cell(row=r, column=3).value or "").strip()
-                inv_dt = str(ws_b2b.cell(row=r, column=4).value or "2026-11-01")[:10]
-                inv_val = Decimal(str(ws_b2b.cell(row=r, column=5).value or 0))
-                pos = str(ws_b2b.cell(row=r, column=6).value or "27")[:2]
-                rchrg = (str(ws_b2b.cell(row=r, column=7).value or "N").upper() == "Y")
-                taxable = Decimal(str(ws_b2b.cell(row=r, column=9).value or 0))
-                igst = Decimal(str(ws_b2b.cell(row=r, column=10).value or 0))
-                cgst = Decimal(str(ws_b2b.cell(row=r, column=11).value or 0))
-                sgst = Decimal(str(ws_b2b.cell(row=r, column=12).value or 0))
-                cess = Decimal(str(ws_b2b.cell(row=r, column=13).value or 0))
+        def _dec(val: Any) -> Decimal:
+            try:
+                return Decimal(str(val or 0))
+            except Exception:
+                return Decimal("0.00")
 
-                doc_item = GSTR2BDocumentItem(
-                    section_name="B2B",
-                    itc_availability="available",
-                    source_form="GSTR-1",
-                    supplier_gstin=str(supp_gstin).strip(),
-                    supplier_name=supp_name,
-                    document_type="INV",
-                    document_number=inv_num,
-                    document_date=inv_dt,
-                    invoice_value=inv_val,
-                    place_of_supply=pos,
-                    supply_attract_reverse_charge=rchrg,
-                    taxable_value=taxable,
-                    integrated_tax=igst,
-                    central_tax=cgst,
-                    state_ut_tax=sgst,
-                    cess_amount=cess
-                )
+        sheet_specs = (
+            ("B2B", "GSTR-1", "INV", False),
+            ("B2BA", "GSTR-1", "INV", True),
+            ("CDNR", "GSTR-1", "CRN", False),
+            ("CDNRA", "GSTR-1", "CRN", True),
+            ("ISD", "GSTR-6", "ISD_INV", False),
+            ("IMPG", "ICEGATE", "BOE", False),
+        )
+
+        for sheet_name, source_form, default_doc_type, is_amended in sheet_specs:
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            rows_iter = ws.iter_rows(values_only=True)
+            header_found = False
+            for row_idx, row_vals in enumerate(rows_iter, start=1):
+                first_cell = str((row_vals[0] if row_vals else None) or "").strip().lower()
+                if row_idx <= 10 and ("gstin" in first_cell or "boe" in first_cell or "bill of entry" in first_cell or "note" in first_cell):
+                    header_found = True
+                    break
+            if not header_found:
+                continue
+
+            for row_vals in rows_iter:
+                vals = list(row_vals) + [None] * max(0, 14 - len(row_vals))
+                if sheet_name == "IMPG":
+                    boe_num = str(vals[1] or vals[0] or "").strip()
+                    if not boe_num:
+                        continue
+                    taxable = _dec(vals[4])
+                    igst = _dec(vals[5])
+                    cess = _dec(vals[6])
+                    doc_item = GSTR2BDocumentItem(
+                        section_name="IMPG",
+                        itc_availability="available",
+                        source_form="ICEGATE",
+                        supplier_gstin="IMPORT_CUSTOMS",
+                        supplier_name=f"ICEGATE {str(vals[0] or 'CUSTOMS').strip()}",
+                        document_type="BOE",
+                        document_number=boe_num,
+                        document_date=str(vals[2] or "2026-11-01")[:10],
+                        invoice_value=taxable + igst + cess,
+                        place_of_supply="96",
+                        supply_attract_reverse_charge=False,
+                        taxable_value=taxable,
+                        integrated_tax=igst,
+                        central_tax=Decimal("0.00"),
+                        state_ut_tax=Decimal("0.00"),
+                        cess_amount=cess,
+                        boe_number=boe_num,
+                        boe_date=str(vals[2] or "2026-11-01")[:10],
+                        port_code=str(vals[0] or "").strip() or None,
+                    )
+                else:
+                    supp_gstin = vals[0]
+                    if not supp_gstin or len(str(supp_gstin).strip()) < 15:
+                        continue
+                    supp_name = str(vals[1] or "Supplier")
+                    doc_num = str(vals[2] or "").strip()
+                    doc_dt = str(vals[3] or "2026-11-01")[:10]
+                    doc_val = _dec(vals[4])
+                    pos = str(vals[5] or "27")[:2]
+                    rchrg = str(vals[6] or "N").strip().upper() == "Y"
+                    note_or_inv_type = str(vals[7] or "").strip().lower()
+                    doc_type = default_doc_type
+                    if sheet_name in ("CDNR", "CDNRA"):
+                        doc_type = "DBN" if ("debit" in note_or_inv_type or note_or_inv_type in ("d", "dbn")) else "CRN"
+                    taxable = _dec(vals[8])
+                    igst = _dec(vals[9])
+                    cgst = _dec(vals[10])
+                    sgst = _dec(vals[11])
+                    cess = _dec(vals[12])
+                    doc_item = GSTR2BDocumentItem(
+                        section_name=sheet_name,
+                        itc_availability="available",
+                        source_form=source_form,
+                        supplier_gstin=str(supp_gstin).strip(),
+                        supplier_name=supp_name,
+                        document_type=doc_type,
+                        document_number=doc_num,
+                        document_date=doc_dt,
+                        invoice_value=doc_val,
+                        place_of_supply=pos,
+                        supply_attract_reverse_charge=rchrg,
+                        taxable_value=taxable,
+                        integrated_tax=igst,
+                        central_tax=cgst,
+                        state_ut_tax=sgst,
+                        cess_amount=cess,
+                        is_amended=is_amended,
+                    )
                 parsed_docs.append(doc_item)
-                total_itc_avail += (igst + cgst + sgst + cess)
+                sign = Decimal("-1.00") if doc_item.document_type == "CRN" else Decimal("1.00")
+                total_itc_avail += sign * (doc_item.integrated_tax + doc_item.central_tax + doc_item.state_ut_tax + doc_item.cess_amount)
+    finally:
+        wb.close()
 
+    derived_fy = (
+        f"{return_period[:4]}-{int(return_period[:4]) + 1}"
+        if len(return_period) >= 4 and return_period[:4].isdigit()
+        else ""
+    )
     return GSTR2BParsedStatement(
-        recipient_gstin=recipient_gstin or "27AABCB1234M1ZT",
+        recipient_gstin=recipient_gstin,
         return_period=return_period,
-        financial_year="2026-2027",
+        financial_year=derived_fy,
         total_itc_available=total_itc_avail,
         total_itc_not_available=total_itc_not_avail,
         documents=parsed_docs,

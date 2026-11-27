@@ -55,11 +55,17 @@ class InvoicePatch(BaseModel):
     due_date: Optional[date] = None
     counterparty_name: Optional[str] = None
     counterparty_gstin: Optional[str] = None
-    total_taxable_amount: Optional[Decimal] = None
-    cgst_amount: Optional[Decimal] = None
-    sgst_amount: Optional[Decimal] = None
-    igst_amount: Optional[Decimal] = None
-    total_amount: Optional[Decimal] = None
+    total_taxable_amount: Optional[Decimal] = Field(None, ge=0)
+    cgst_amount: Optional[Decimal] = Field(None, ge=0)
+    sgst_amount: Optional[Decimal] = Field(None, ge=0)
+    igst_amount: Optional[Decimal] = Field(None, ge=0)
+    total_amount: Optional[Decimal] = Field(None, ge=0)
+    supply_category: Optional[str] = None
+    document_type: Optional[str] = None
+    is_sez_supply: Optional[bool] = None
+    is_deemed_export: Optional[bool] = None
+    is_reverse_charge: Optional[bool] = None
+    recipient_registration_type: Optional[str] = None
 
 class InvoiceApprovalRequest(BaseModel):
     notes: Optional[str] = None

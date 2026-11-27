@@ -71,7 +71,7 @@ def clear_test_gateway_trust_store() -> None:
 def load_official_icai_trust_store() -> Dict[str, Dict[str, Any]]:
     """
     Loads and parses official ICAI trust anchor keys from configured JWKS path
-    or environment public key. Returns mapping of KID -> Key Metadata.
+    or environment public key. Strictly rejects symmetric ('oct') or malformed keys.
     """
     registry: Dict[str, Dict[str, Any]] = {}
     jwks_path = os.environ.get("ICAI_GATEWAY_JWKS_PATH")
@@ -79,27 +79,36 @@ def load_official_icai_trust_store() -> Dict[str, Dict[str, Any]]:
         try:
             with open(jwks_path, "r", encoding="utf-8") as f:
                 jwks_data = json.load(f)
-            keys = jwks_data.get("keys", [])
+            keys = jwks_data.get("keys", []) if isinstance(jwks_data, dict) else []
             for k in keys:
+                if not isinstance(k, dict):
+                    continue
+                kty = str(k.get("kty") or "").upper()
+                if kty not in ("RSA", "EC"):
+                    continue
                 kid = k.get("kid")
-                if kid:
-                    try:
-                        key_obj = jwk.construct(k)
-                        pem_key = key_obj.to_pem(is_private=False).decode("utf-8")
-                    except Exception:
-                        pem_key = k
-                    registry[kid] = {
-                        "kid": kid,
-                        "key": pem_key,
-                        "algorithm": k.get("alg", "RS256"),
-                        "issuer": OFFICIAL_ICAI_GATEWAY_ISSUER,
-                        "valid_from": datetime(2025, 1, 1, tzinfo=timezone.utc),
-                        "valid_until": datetime(2035, 1, 1, tzinfo=timezone.utc),
-                        "is_revoked": False,
-                        "is_test_key": False
-                    }
-        except Exception:
-            pass
+                if not kid:
+                    continue
+                alg = str(k.get("alg") or "RS256").upper()
+                if alg == "NONE" or alg.startswith("HS"):
+                    continue
+                try:
+                    key_obj = jwk.construct(k)
+                    pem_key = key_obj.to_pem(is_private=False).decode("utf-8")
+                except Exception:
+                    continue
+                registry[str(kid)] = {
+                    "kid": str(kid),
+                    "key": pem_key,
+                    "algorithm": alg,
+                    "issuer": OFFICIAL_ICAI_GATEWAY_ISSUER,
+                    "valid_from": datetime(2025, 1, 1, tzinfo=timezone.utc),
+                    "valid_until": datetime(2035, 1, 1, tzinfo=timezone.utc),
+                    "is_revoked": False,
+                    "is_test_key": False,
+                }
+        except Exception as exc:
+            raise ValueError(f"MALFORMED_ICAI_JWKS_FILE: Failed to parse ICAI_GATEWAY_JWKS_PATH: {exc}") from exc
 
     prod_key = os.environ.get("ICAI_GATEWAY_PUBLIC_KEY")
     if prod_key and prod_key.strip():
@@ -312,11 +321,13 @@ def verify_icai_gateway_signed_response(
     except JWTError as ex:
         return False, f"CRYPTOGRAPHIC_VERIFICATION_FAILED: Signature or claim verification failed: {ex}", {}
 
-    # 7. Freshness policy: token must not be older than 24 hours
+    # 7. Freshness policy: reject future-dated (> 5m clock skew) or > 24h stale tokens
     iat_ts = claims.get("iat")
     if not iat_ts:
         return False, "MISSING_TIMESTAMP: Token lacks issued-at ('iat') claim.", {}
     iat_dt = datetime.fromtimestamp(iat_ts, tz=timezone.utc)
+    if iat_dt > now_utc + timedelta(minutes=5):
+        return False, f"FUTURE_TIMESTAMP: Gateway response iat {iat_dt.isoformat()} exceeds 5-minute clock skew.", {}
     if now_utc - iat_dt > timedelta(hours=24):
         return False, f"STALE_VERIFICATION: Gateway response was issued at {iat_dt.isoformat()}, exceeding maximum 24-hour freshness window.", {}
 

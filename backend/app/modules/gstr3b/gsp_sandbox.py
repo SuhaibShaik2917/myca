@@ -60,10 +60,14 @@ def simulate_gsp_gstn_filing(
     # 2. State code from GSTIN
     state_code = gstin[:2] if len(gstin) >= 2 else "27"
 
-    # 3. Generate ARN and CIN
+    # 3. Generate unique collision-resistant ARN and CIN
     now_ts = datetime.now(timezone.utc)
     filing_date_iso = now_ts.isoformat()
-    arn = generate_arn(state_code, tax_period, sequence_id=1)
+    seq_entropy = int(
+        hashlib.sha256(f"{gstin}:{tax_period}:{filing_date_iso}:{payload_hash}".encode("utf-8")).hexdigest()[:7],
+        16,
+    ) % 9000000 + 1
+    arn = generate_arn(state_code, tax_period, sequence_id=seq_entropy)
     cin = generate_cin("SBIN", int(payload_hash[:6], 16))
 
     return arn, cin, filing_date_iso, payload_hash
